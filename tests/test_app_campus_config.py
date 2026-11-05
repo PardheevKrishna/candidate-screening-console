@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - tests/ imported as rootdir-relative mo
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
 FP = "fake-fingerprint"
+KEY_ENV = AppConfig().llm.api_key_env  # env var / secret name of the LLM API key, from the config
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ def _patch(monkeypatch: pytest.MonkeyPatch, module: Any, name: str, value: Any) 
 
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv(KEY_ENV, raising=False)
     _patch(monkeypatch, pipeline, "DEFAULT_SAMPLE_DIR", tmp_path / "no-sample")
     _patch(monkeypatch, export, "to_csv_bytes", lambda df: df.to_csv(index=False).encode("utf-8-sig"))
 
@@ -67,7 +68,7 @@ def engine(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 def _app() -> AppTest:
     at = AppTest.from_file(APP, default_timeout=60)
-    at.secrets["NVIDIA_API_KEY"] = ""  # never read a real secrets.toml during tests
+    at.secrets[KEY_ENV] = ""  # never read a real secrets.toml during tests
     return at
 
 

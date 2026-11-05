@@ -11,7 +11,7 @@ This guide explains every screen, setting, export and calculation in the Candida
 1. [Start here](#start-here)
    - [What the app does](#what-the-app-does) · [Recommended workflow](#recommended-workflow) · [Ground rules](#ground-rules)
 2. [Screen layout and sidebar](#screen-layout-and-sidebar)
-   - [The screen at a glance](#the-screen-at-a-glance) · [Before your first run](#before-your-first-run) · [Header banner](#header-banner) · [KPI cards](#kpi-cards) · [Tab bar](#tab-bar) · [Optional tabs](#optional-tabs)
+   - [The screen at a glance](#the-screen-at-a-glance) · [Before your first run](#before-your-first-run) · [Header banner](#header-banner) · [KPI cards](#kpi-cards) · [Tab bar](#tab-bar) · [Compare, Campus Distribution, Ask the Data and Run History at a glance](#compare-campus-distribution-ask-the-data-and-run-history-at-a-glance)
    - [Data source](#data-source) · [Upload boxes and limits](#upload-boxes-and-limits) · [Review column mapping](#review-column-mapping) · [Run screening and Clear results](#run-screening-and-clear-results)
    - [LLM status badge](#llm-status-badge) · [Last run and data quality](#last-run-and-data-quality) · [What happens when you click Run screening](#what-happens-when-you-click-run-screening)
    - [What the app remembers](#what-the-app-remembers) · [Sessions and privacy](#sessions-and-privacy) · [Messages and toasts](#messages-and-toasts)
@@ -43,8 +43,8 @@ This guide explains every screen, setting, export and calculation in the Candida
 11. [FAQ and troubleshooting](#faq-and-troubleshooting)
     - [Data and runs](#data-and-runs) · [Scores and ranks](#scores-and-ranks) · [Integrity questions](#integrity-questions) · [LLM questions](#llm-questions)
 12. [Glossary](#glossary)
-13. [New features in detail](#new-features-in-detail)
-   - [Compare Candidates](#tab-compare-candidates) · [Campus Distribution](#tab-campus-distribution) · [Ask the Data](#tab-ask-the-data) · [Run History](#tab-run-history) · [College cap and What-if preview](#college-cap-and-what-if-preview-config-and-rubric-tuning) · [Deploying on a company VM](#deploying-on-a-company-vm-summary) · [FAQ: new features](#faq-new-features) · [Glossary: new terms](#glossary-new-terms)
+13. [Compare, Campus Distribution, Ask the Data and Run History in detail](#compare-campus-distribution-ask-the-data-and-run-history-in-detail)
+    - [Compare Candidates](#tab-compare-candidates) · [Campus Distribution](#tab-campus-distribution) · [Ask the Data](#tab-ask-the-data) · [Run History](#tab-run-history) · [College cap and What-if preview](#college-cap-and-what-if-preview-config-and-rubric-tuning) · [Deploying on a company VM](#deploying-on-a-company-vm-summary) · [FAQ: comparison, campus, questions and saved runs](#faq-comparison-campus-questions-and-saved-runs) · [Glossary: more terms](#glossary-more-terms)
 
 ---
 
@@ -56,7 +56,7 @@ This guide explains every screen, setting, export and calculation in the Candida
 2. **Scores every candidate out of 100** on a weighted rubric. The default is HackerRank 40, Skills 30, Experience 20 and Education 10, and every point can be traced on screen.
 3. **Builds the shortlist.** It applies eligibility rules, ranks eligible candidates and shortlists the top N (default 300). Every candidate gets a status and a plain-English reason.
 4. **Surfaces integrity-risk patterns**, mainly among perfect scorers: identical answers, synchronised sessions, shared networks or contact details, copied resume content and HackerRank's own proctoring flags. It shows the evidence, and by default flagged candidates stay on the shortlist for a recruiter to verify.
-5. **Assists and exports.** Optional LLM features re-check borderline candidates and draft rationales, interview questions and summaries. Everything can be exported to CSV, a multi-sheet Excel report and per-candidate evidence packs. Optional tabs compare candidates side by side, show the shortlist's spread across campuses, answer plain-English questions about the results, and save runs for later.
+5. **Assists and exports.** Optional LLM features re-check borderline candidates and draft rationales, interview questions and summaries. Everything can be exported to CSV, a multi-sheet Excel report and per-candidate evidence packs. Further tabs compare candidates side by side, show the shortlist's spread across campuses, answer plain-English questions about the results, and save runs for later.
 
 ### Recommended workflow
 
@@ -67,7 +67,7 @@ This guide explains every screen, setting, export and calculation in the Candida
 5. **Review integrity.** On **Integrity & Risk Intelligence**, work through the linked clusters, the evidence and the individual anomalies. See [Integrity and Risk Intelligence tab](#integrity-and-risk-intelligence-tab).
 6. **Deep-dive on individuals.** On **Individual Deep-Dive**, check the score breakdown, parsed resume and integrity evidence, and download an evidence pack where needed. See [Individual Deep-Dive tab](#individual-deep-dive-tab).
 7. **Use the LLM actions (optional).** Re-score candidates near the cutoff, draft rationales and interview questions, and summarise risk groups. Run **LLM: re-score near cutoff** after your final configuration change, because it can move candidates across the cutoff. See [LLM features](#llm-features).
-8. **Export.** Download the **Full Excel report**, CSV slices, evidence packs and your configuration profile before you close the browser tab, and save the run in **Run History** if you need to reopen it later. See [Exports](#exports) and [Optional tabs](#optional-tabs).
+8. **Export.** Download the **Full Excel report**, CSV slices, evidence packs and your configuration profile before you close the browser tab, and save the run in **Run History** if you need to reopen it later. See [Exports](#exports) and [Tab: Run History](#tab-run-history).
 
 > **You can still change the configuration after a run.** **Apply & re-score** recalculates scores, ranks, statuses and, when integrity settings changed, the integrity analysis. It does not re-read any files, and it takes under a second for about 3,000 candidates. **Preview impact** shows who would enter or leave the shortlist before you apply. See [Preview impact](#preview-impact).
 
@@ -97,9 +97,9 @@ This section covers everything around the edges of the app: the header banner, t
 |  [ Clear results ]          |  |   five headline numbers                                  |
 |-----------------------------|  +----------------------------------------------------------+
 | LLM status badge            |  | TABS                                                     |
-| Last run (after a run)      |  |   before a run: Getting started, Config (Run History)    |
-|   > Data quality details    |  |   after a run: Shortlist, Integrity, Deep-Dive,          |
-|   > Timings                 |  |   optional tabs, Config & Rubric Tuning                  |
+| Last run (after a run)      |  |   before a run: Getting started, Config, Run History     |
+|   > Data quality details    |  |   after a run: Shortlist, Integrity, Deep-Dive, Compare, |
+|   > Timings                 |  |   Campus, Ask the Data, Run History, Config (8 tabs)     |
 +-----------------------------+  +----------------------------------------------------------+
 ```
 
@@ -109,7 +109,7 @@ This section covers everything around the edges of the app: the header banner, t
 | Header banner | Shows which dataset is on screen and which rubric weights scored it | Always |
 | Toast messages | Short confirmations in the top-right corner that disappear after about 4 seconds | After an action finishes |
 | KPI cards | Five headline numbers for the current results | Only once results exist |
-| Tab bar | Switches between the working views | Always: 2 tabs before the first run (3 with **Run History**), 4 to 8 after, depending on the optional tabs available |
+| Tab bar | Switches between the working views | Always: 3 tabs before the first run, 8 after it |
 
 The browser tab is titled "Candidate Screening & Integrity Console" and shows a shield icon.
 
@@ -119,14 +119,14 @@ When you first open the app there are no results:
 
 - The header line reads "No dataset loaded - choose a data source in the sidebar to begin."
 - There are no KPI cards.
-- Two tabs are shown: **Getting started** (selected) and **Config & Rubric Tuning**, plus **Run History** where available, so a saved run can be opened without new files.
+- Three tabs are shown: **Getting started** (selected), **Config & Rubric Tuning** and **Run History**, so a saved run can be opened without new files.
 - The sidebar shows the data-source controls and the LLM badge. **Last run** appears only after a run.
 
 **Getting started tab.** A welcome card headed "Welcome — let's screen a hiring drive" summarises what the app does and lists four steps: set up the rubric in **Config & Rubric Tuning** (defaults HackerRank 40 / Skills 30 / Experience 20 / Education 10, top 300), choose a data source in the sidebar, run screening, then review and export.
 
 | Control | What it does | Availability | Gotchas |
 |---|---|---|---|
-| **Load synthetic sample & run** (red button) | Screens the built-in synthetic dataset straight away. Same as choosing **Synthetic sample dataset** in the sidebar and clicking **Run screening**. | Enabled only when the sample data is installed on the server. Otherwise it is greyed out and the caption reads "Sample data not found. Run `python generate_mock_data.py` from the project root, or upload your own files from the sidebar." | It does not change the sidebar's **Data source** choice. The progress box appears below the tabs. |
+| **Load synthetic sample & run** (red button) | Screens the synthetic sample dataset straight away. Same as choosing **Synthetic sample dataset** in the sidebar and clicking **Run screening**. | Enabled only when the synthetic sample has been generated on the server (it is not part of the code; see [Synthetic data and validation](#synthetic-data-and-validation)). Otherwise it is greyed out and the caption reads "Sample data not found. Run `python generate_mock_data.py` from the project root, or upload your own files from the sidebar." | It does not change the sidebar's **Data source** choice. The progress box appears below the tabs. |
 
 **Config & Rubric Tuning before a run.** This is the same form you get after a run (see [Config and Rubric Tuning tab](#config-and-rubric-tuning-tab)), with these differences:
 
@@ -140,7 +140,7 @@ When you first open the app there are no results:
 
 | Element | What it shows | Notes |
 |---|---|---|
-| Eyebrow | A small line of gold capitals above the title naming your organisation and team | Set by your administrator |
+| Eyebrow | A small line of gold text above the title. By default it reads "WELLS FARGO · TALENT ACQUISITION". | Your administrator can replace the text, for example with a team or environment name, through the `APP_BRAND_EYEBROW` environment variable on the server |
 | Title | "Candidate Screening & Integrity Console" | Also the browser-tab title |
 | Dataset summary line | Before a run: "No dataset loaded - choose a data source in the sidebar to begin." After a run: `<label> · <N> candidates · <R> resumes parsed · <mode> · rubric <H>/<S>/<E>/<Ed>` | Updates as soon as you apply a new configuration |
 
@@ -154,7 +154,7 @@ Example: `Synthetic sample · 3,000 candidates · 2,892 resumes parsed · TA fee
 | Mode | "TA feed + resumes": a TA feed plus at least one resume that reached parsing. "TA feed only": a TA feed but no usable resume file. "Resumes only": no TA feed. |
 | `rubric H/S/E/Ed` | The HackerRank / Skills / Experience / Education weights in use, rescaled to add up to 100 and rounded to whole numbers. Entering 50/30/20/10 (total 110) shows 45/27/18/9. |
 
-> **Under the hood:** the eyebrow text comes from the `APP_BRAND_EYEBROW` environment variable on the server. Each rubric weight is rescaled as weight × 100 ÷ (sum of the four weights).
+> **Under the hood:** the eyebrow shows the value of the `APP_BRAND_EYEBROW` environment variable when it is set on the server, and otherwise the built-in text "WELLS FARGO · TALENT ACQUISITION" from `ui/theme.py`. The running app reads the variable only once, so restart the app after changing it. Each rubric weight is rescaled as weight × 100 ÷ (sum of the four weights).
 
 ### KPI cards
 
@@ -179,21 +179,21 @@ After a run the tabs are, in order:
 | **Candidate Shortlist & Leaderboard** | Ranked table with filters, score histogram, downloads, LLM assist |
 | **Integrity & Risk Intelligence** | Patterns among perfect scorers, risk groups and the evidence behind them |
 | **Individual Deep-Dive** | One candidate's full profile and evidence |
-| **Compare Candidates** (optional) | Two to four candidates side by side |
-| **Campus Distribution** (optional) | How applicants and the shortlist spread across colleges, tiers, cities, degrees and branches |
-| **Ask the Data** (optional) | Plain-English questions about the current results, answered from the data |
-| **Run History** (optional) | Save the screening on the server, reopen saved runs and compare two of them |
+| **Compare Candidates** | Two to four candidates side by side |
+| **Campus Distribution** | How applicants and the shortlist spread across colleges, tiers, cities, degrees and branches |
+| **Ask the Data** | Plain-English questions about the current results, answered from the data |
+| **Run History** | Save the screening on the server, reopen saved runs and compare two of them |
 | **Config & Rubric Tuning** | Rubric, shortlist and integrity settings; applied changes re-score straight away |
 
-- The four optional tabs are described in [Optional tabs](#optional-tabs). An installation shows only the optional tabs that are available to it.
+- **Compare Candidates**, **Campus Distribution**, **Ask the Data** and **Run History** are summarised in [Compare, Campus Distribution, Ask the Data and Run History at a glance](#compare-campus-distribution-ask-the-data-and-run-history-at-a-glance).
+- If the code behind one of these four tabs fails to load on the server, that tab is hidden instead of breaking the app, and every other tab keeps working. Ask your administrator if one of them is missing.
 - Only the selected tab is computed, so a short pause when switching tabs on a large dataset is normal.
 - The selected tab stays selected while you work, for example when you apply new settings.
 - Selecting a row in the shortlist table loads that candidate into **Individual Deep-Dive**; the **Open profile** button then switches to that tab.
 
-### Optional tabs
+### Compare, Campus Distribution, Ask the Data and Run History at a glance
 
-Full details for each optional tab: [New features in detail](#new-features-in-detail).
-
+Short overviews of these four tabs. Full details for each: [Compare, Campus Distribution, Ask the Data and Run History in detail](#compare-campus-distribution-ask-the-data-and-run-history-in-detail).
 
 #### Compare Candidates
 
@@ -258,12 +258,12 @@ The sidebar contains, from top to bottom: **Data source** (two options and the c
 
 | Option | What it does | When to use it |
 |---|---|---|
-| **Synthetic sample dataset** (selected by default) | Uses the fictional sample installed with the app. Caption: "Synthetic TA/HackerRank export + resumes with planted integrity patterns (no real PII)." | Training, demos, trying out settings |
+| **Synthetic sample dataset** (selected by default) | Uses the fictional sample in `data/sample/`, which an administrator generates on the server with `python generate_mock_data.py` (the sample is not part of the code). Caption: "Synthetic TA/HackerRank export + resumes with planted integrity patterns (no real PII)." | Training, demos, trying out settings |
 | **Upload TA feed + resumes** | Shows two upload boxes and the **Review column mapping** panel | Real hiring drives |
 
 - Changing the option does not change what is on screen. The current results stay until you click **Run screening** or **Clear results**.
 - Switching away from **Upload TA feed + resumes**, even briefly, empties both upload boxes and discards any mapping edits.
-- If the sample is not installed, the sidebar shows "Sample data not found. Run `python generate_mock_data.py` in the project root, then click Run again." and **Run screening** is greyed out. Ask your administrator, or use Upload.
+- If the sample has not been generated, the sidebar shows "Sample data not found. Run `python generate_mock_data.py` in the project root, then click Run again." and **Run screening** is greyed out. Ask your administrator, or use Upload.
 
 ### Upload boxes and limits
 
@@ -348,7 +348,7 @@ This panel appears under the upload boxes as soon as a TA file is selected, and 
 
 | Button | Enabled when | What it does | Gotchas |
 |---|---|---|---|
-| **Run screening** (red, play icon) | Sample mode: the sample is installed. Upload mode: at least one file is selected. | Screens the source selected under **Data source**. See [What happens when you click Run screening](#what-happens-when-you-click-run-screening). | It never calls the LLM. LLM features run only from their own buttons. |
+| **Run screening** (red, play icon) | Sample mode: the sample has been generated. Upload mode: at least one file is selected. | Screens the source selected under **Data source**. See [What happens when you click Run screening](#what-happens-when-you-click-run-screening). | It never calls the LLM. LLM features run only from their own buttons. |
 | **Clear results** | Only when results exist | Forgets the current dataset and everything derived from it: results, LLM re-scores, rationales, risk-group summaries, executive summary and the Deep-Dive selection. The page returns to the **Getting started** view. | No confirmation and no undo. Your configuration and any files still in the upload boxes are kept. The next run repeats every step. |
 
 ### LLM status badge
@@ -1019,7 +1019,7 @@ The buttons work only when **LLM features enabled** is on in Config and an API k
 **Result panels** at the bottom of the tab:
 
 - **Status changes from LLM re-scoring (Z)**: shown when the last re-score changed at least one status, with the columns "candidate_id", "before" and "after". It is a snapshot of your last click: it does not update when you change settings afterwards, it can still be visible after you load a different dataset, and only your next click replaces it.
-- **LLM rationales (N)**: opens automatically, with the columns "candidate_id", "name", "status", "Summary", "strengths" and "gaps" (list items separated by "; "). A failure shows "(failed: reason)" in Summary. Candidates explained one at a time with **LLM: explain this candidate** in the Deep-Dive are listed here too.
+- **LLM rationales (N)**: opens automatically, with the columns "candidate_id", "name", "status", "Summary", "strengths" and "gaps" (list items separated by "; "). A failure shows "(failed: reason)" in Summary. Candidates explained one at a time with **LLM: explain this candidate** in the Deep-Dive are listed here too. The same summaries, strengths and gaps go into the **Full Excel report** as the "AI Notes (LLM)" column (see [Full Excel report](#full-excel-report)).
 
 ---
 
@@ -1511,7 +1511,7 @@ On screen: **Individual Deep-Dive**. A one-page profile of a single candidate: t
 - **Name line**: the candidate's name in large type (the candidate ID if no name is on file).
 - **Details line**: `Candidate ID · College · Degree Branch · Class of <graduation year> · City`, from the TA export (from the resume in a resumes-only run). Empty parts are skipped.
 - **Evidence pack (.md)** (top right): downloads a Markdown report for this candidate. See [Evidence pack](#evidence-pack).
-- **Add to compare** (under the evidence pack button): adds the candidate to the compare list (up to 4 candidates) shown side by side in the optional **Compare Candidates** tab (see [Optional tabs](#optional-tabs)). A toast confirms, for example "Added CAND-00123 to Compare Candidates (2/4).", and the button turns into a greyed-out **In compare list** whose tooltip shows how many are selected. With 4 already selected the toast reads "The compare list already holds 4 candidates. Remove one in Compare Candidates before adding <ID>." Candidates from an earlier dataset are dropped from the list automatically.
+- **Add to compare** (under the evidence pack button): adds the candidate to the compare list (up to 4 candidates) shown side by side in the **Compare Candidates** tab (see [Tab: Compare Candidates](#tab-compare-candidates)). A toast confirms, for example "Added CAND-00123 to Compare Candidates (2/4).", and the button turns into a greyed-out **In compare list** whose tooltip shows how many are selected. With 4 already selected the toast reads "The compare list already holds 4 candidates. Remove one in Compare Candidates before adding <ID>." Candidates from an earlier dataset are dropped from the list automatically.
 
 **Badges.** Every candidate has exactly one status badge and one risk badge; the others appear only when they apply.
 
@@ -1682,7 +1682,7 @@ This table lists every pair with any signal, including weak pairs below the link
 | "Integrity verification questions" | Numbered (3–5 requested), neutral questions that let the candidate show the work is their own; only when the risk level is High or Medium |
 | Failure | Yellow box: "LLM explanation failed: <reason>" |
 
-Treat it as a drafting aid for interview preparation; it can be wrong and never changes a score or status. The answer is kept for your session, and **LLM: write rationales for shortlist** fills the same store, so candidates covered there already show an assessment here. It is not refreshed automatically after a configuration change; click the button again. Details, including what is sent: [Rationales and explanations](#rationales-and-explanations) and [Privacy and safeguards](#privacy-and-safeguards).
+Treat it as a drafting aid for interview preparation; it can be wrong and never changes a score or status. The answer is kept for your session, and **LLM: write rationales for shortlist** fills the same store, so candidates covered there already show an assessment here. The summary, strengths and gaps also appear in the **Full Excel report** ("AI Notes (LLM)") when the candidate is on its Shortlist or Integrity Evidence sheet; the question lists stay in the app. It is not refreshed automatically after a configuration change; click the button again. Details, including what is sent: [Rationales and explanations](#rationales-and-explanations) and [Privacy and safeguards](#privacy-and-safeguards).
 
 ---
 
@@ -1700,11 +1700,11 @@ Treat it as a drafting aid for interview preparation; it can be wrong and never 
 | **Full Excel report** | Shortlist and Integrity tabs (same file) | `screening_report.xlsx` | Whole run, nine sheets | No |
 | **Evidence pack (.md)** | Deep-Dive, top right | `evidence_<Candidate ID>.md` | One candidate | No |
 | **Download current config (JSON)** | Config tab, **Profiles & connectivity** | `screening_config.json` | Every applied setting | n/a |
-| **Download comparison (CSV)** | Compare Candidates tab (optional) | `candidate_comparison.csv` | The 2–4 selected candidates, one column each | n/a |
-| **Distribution by <group> (CSV)** | Campus Distribution tab (optional) | `campus_distribution_by_<field>.csv` | One row per group | No |
-| **Download CSV** | Ask the Data tab (optional), under each answer | `ask_answer_<n>.csv` | The answer's table | No |
+| **Download comparison (CSV)** | Compare Candidates tab | `candidate_comparison.csv` | The 2–4 selected candidates, one column each | n/a |
+| **Distribution by <group> (CSV)** | Campus Distribution tab | `campus_distribution_by_<field>.csv` | One row per group | No |
+| **Download CSV** | Ask the Data tab, under each answer | `ask_answer_<n>.csv` | The answer's table | No |
 
-Each Integrity-tab CSV button shows its row count and is greyed out when the file would be empty. Every export is built at the moment you click, from the current results and settings, and downloading does not refresh the page. Saving a run in **Run History** is not an export: it stores the run on the server (see [Optional tabs](#optional-tabs)).
+Each Integrity-tab CSV button shows its row count and is greyed out when the file would be empty. Every export is built at the moment you click, from the current results, settings and LLM outputs, and downloading does not refresh the page. Saving a run in **Run History** is not an export: it stores the run on the server (see [Tab: Run History](#tab-run-history)).
 
 **Rules shared by the CSV and Excel exports**
 
@@ -1779,11 +1779,11 @@ Each Integrity-tab CSV button shows its row count and is greyed out when the fil
 
 | Sheet | Rows | Contents |
 |---|---|---|
-| **Summary** | – | Title "Candidate Screening & Integrity Report", the generation time (server local time), an "Important" box (integrity flags are evidence for human review, not findings of misconduct; verify with the candidate before any decision), then the four blocks below |
-| **Shortlist** | Shortlisted and Shortlisted (Integrity Review), by rank | Rank, Candidate ID, Name, Status, Final Score, HackerRank Pts, Skills Pts, Experience Pts, Education Pts, HackerRank %, Matched Skills, Missing Skills, College, College Tier, Degree, Branch, CGPA, Graduation Year, Email, Phone, Risk Level, Risk Score, Cluster, Risk Reasons, Status Reason, Experience Source, LLM Rationale, Score Notes. Rank, Candidate ID and Name stay visible when scrolling sideways. Status is coloured (Shortlisted green, Integrity Review amber, Integrity Hold red), as is Risk Level (High red, Medium amber). |
+| **Summary** | – | Title "Candidate Screening & Integrity Report", the generation time (server local time), an "Important" box (integrity flags are evidence for human review, not findings of misconduct; verify with the candidate before any decision), then the blocks below |
+| **Shortlist** | Shortlisted and Shortlisted (Integrity Review), by rank | Rank, Candidate ID, Name, Status, Final Score, HackerRank Pts, Skills Pts, Experience Pts, Education Pts, HackerRank %, Matched Skills, Missing Skills, College, College Tier, Degree, Branch, CGPA, Graduation Year, Email, Phone, Risk Level, Risk Score, Cluster, Risk Reasons, Status Reason, Experience Source, LLM Rationale, Score Notes, and AI Notes (LLM) when your session holds LLM rationales or explanations (see [LLM content in the Excel report](#llm-content-in-the-excel-report)). Rank, Candidate ID and Name stay visible when scrolling sideways. Status is coloured (Shortlisted green, Integrity Review amber, Integrity Hold red), as is Risk Level (High red, Medium amber). |
 | **All Candidates** | Everyone, in rank order, Ineligible last | Every column: the CSV columns with readable headers such as "HackerRank Sub", "JD Relevance", "Perfect Scorer", "Risk Links", "Has Resume", "Match Method", "Match Confidence", "Data Flags", "College Capped" |
-| **Integrity Evidence** | Every High- and Medium-risk candidate, shortlisted or not; also Low-risk candidates if Low is a review level, and anyone Shortlisted (Integrity Review) or on Integrity Hold. Sorted High, Medium, Low, then by risk score. | Candidate ID, Name, College, Status, Rank, Final Score, HackerRank %, Risk Level, Risk Score, Cluster, Risk Reasons (one per line), Individual Flags (one per line, "flag: detail"), Risk Links, Linked Candidates, Link Evidence (pair score: signals). Risk Links here counts every pair involving the candidate, so it can be higher than "Risk Links" on All Candidates, which counts only links. Link Evidence lists up to 10 linked candidates as "ID (Name; pair score N): signals", then "... and N more linked candidates (see Risk Pairs)". |
-| **Risk Clusters** | One row per cluster | Cluster, Size, Members, Member Names, Risk Level, Max Pair Score, Mean Pair Score, Density, Top Signals, Shared Traits, Colleges, # Colleges, Start Span (min), Submit Span (min), Summary |
+| **Integrity Evidence** | Every High- and Medium-risk candidate, shortlisted or not; also Low-risk candidates if Low is a review level, and anyone Shortlisted (Integrity Review) or on Integrity Hold. Sorted High, Medium, Low, then by risk score. | Candidate ID, Name, College, Status, Rank, Final Score, HackerRank %, Risk Level, Risk Score, Cluster, Risk Reasons (one per line), Individual Flags (one per line, "flag: detail"), Risk Links, Linked Candidates, Link Evidence (pair score: signals), and AI Notes (LLM) on the same condition as the Shortlist sheet. Risk Links here counts every pair involving the candidate, so it can be higher than "Risk Links" on All Candidates, which counts only links. Link Evidence lists up to 10 linked candidates as "ID (Name; pair score N): signals", then "... and N more linked candidates (see Risk Pairs)". |
+| **Risk Clusters** | One row per cluster | Cluster, Size, Members, Member Names, Risk Level, Max Pair Score, Mean Pair Score, Density, Top Signals, Shared Traits, Colleges, # Colleges, Start Span (min), Submit Span (min), Summary, and AI Headline (LLM), AI Summary (LLM) and AI Recommended Actions (LLM) when your session holds risk-group summaries |
 | **Risk Pairs** | One row per pair, strongest first | Candidate A, Name A, Candidate B, Name B, Pair Score, Signals, Signal Keys, Identical Answers, Resume Similarity, Shared Bullets, Shared Bullet Examples, Shared GitHub, Same IP, Same Subnet, Same College, Same Phone, Same Email, Start Gap (s), Submit Gap (s), Duration Gap (min), Sequential Gap (min). Signal Keys, Shared Bullet Examples, Same Subnet, Same Phone and Same Email are not in the CSV. |
 | **Commonality** | One row per attribute value | Attribute, Value, Focus Count, Focus Total, Focus Share, Population Count, Population Total, Population Share, Lift, p-value, q-value (BH), Significant (TRUE highlighted), Attribute Key |
 | **Data Quality** | One row per input issue: errors, then warnings, then info | Severity (errors red, warnings amber), Stage, Issue, Candidate ID, File Name. Two side panels: "Input summary" and "Column mapping (source -> field)". |
@@ -1795,11 +1795,22 @@ Each Integrity-tab CSV button shows its row count and is greyed out when the fil
 | Configuration highlights | "Rubric (points out of 100)"; "Skills scoring" ("per skill - full marks at 3 matched skills" or "coverage - matched / required"); "Required skills"; "Shortlist rule" (for example "Top 300 eligible candidates"); "Eligibility knock-outs"; "Integrity policy" (with the review levels); "Missing-resume policy" ("zero" = "Score resume components as 0", "renormalize" = "Rescale available components to 100"); "Risk focus group"; "Risk thresholds"; "LLM assist" (on or off, model, blend weight and band). The college cap is not listed here; see the Config sheet. |
 | Data quality | "TA rows (raw / clean)", "Duplicate IDs dropped", "Issues (errors / warnings / info)", "Missing optional fields", "Unmapped TA columns (kept as extra_*)" |
 | Processing time (s) | Seconds for each stage: ingest, parse, match, score, risk, shortlist |
+| AI executive summary (LLM-generated - verify before acting) | Only when **LLM: executive summary** produced a summary in your session: its text, one line per row (headings included), with the Markdown heading and bold marks removed and bullets shown as "•" |
 
-**LLM content in the Excel report**
+#### LLM content in the Excel report
 
-- **Included:** the effects of **LLM: re-score near cutoff**: the blended Experience and Final scores, "Experience Source" = hybrid, the "LLM Rationale" and "Score Notes" columns, and the "LLM re-scored (near cutoff)" count.
-- **Not included:** rationales from **LLM: write rationales for shortlist** or **LLM: explain this candidate**, risk-group summaries and the executive summary. To share those, copy them from the "LLM rationales" panel, the Deep-Dive or the Integrity tab.
+The report contains the LLM output your session holds at the moment you click. Exporting never calls the LLM, and every column or block written by the LLM has "LLM" in its name.
+
+| LLM action | Where its output appears in the report |
+|---|---|
+| **LLM: re-score near cutoff** | The blended Experience and Final scores (and the ranks and statuses that follow from them), "Experience Source" = hybrid, the "LLM Rationale" and "Score Notes" columns, and the "LLM re-scored (near cutoff)" count on the Summary sheet |
+| **LLM: write rationales for shortlist** and **LLM: explain this candidate** | "AI Notes (LLM)", the last column of the Shortlist and Integrity Evidence sheets: the summary, then "Strengths: …" and "Gaps: …" with items separated by "; ". It is blank for candidates on the sheet who have no rationale, or whose request failed. The column is left out when no rationale or explanation has been requested in the session. |
+| **LLM: summarize risk groups** | "AI Headline (LLM)", "AI Summary (LLM)" and "AI Recommended Actions (LLM)" (actions separated by "; "), the last three columns of the Risk Clusters sheet, matched to each cluster by its ID |
+| **LLM: executive summary** | The "AI executive summary (LLM-generated - verify before acting)" block at the bottom of the Summary sheet |
+
+- **Not in the report:** the interview questions and integrity verification questions (they stay in the Deep-Dive), the "Evidence" bullets of risk-group summaries, and Ask the Data answers (each has its own **Download CSV**). The "All Candidates" sheet, the CSV files and the evidence packs contain no LLM-written text apart from the re-score's "LLM Rationale" (`llm_rationale`).
+- **Refresh before you export.** LLM output is not updated when settings change: a rationale can mention an old rank or score, and risk-group summaries are matched by cluster ID, which can change after a settings change. Click the LLM buttons again before downloading.
+- Saved runs keep their LLM output, so a report downloaded after opening a run in **Run History** includes it as well.
 
 ### Evidence pack
 
@@ -1848,7 +1859,7 @@ The LLM (a large language model) is an optional, advisory assistant. It writes e
 | **LLM: explain this candidate** | Deep-Dive, "LLM assessment" | The same content for one candidate | 1 | About 20 s |
 | **LLM: summarize risk groups** | Integrity tab | Headline, summary, evidence and recommended actions per cluster | One per cluster | About 7 s each |
 | **LLM: executive summary** | Integrity tab | One-page summary of the run (under 350 words) | 1 | Varies with the model |
-| A question in **Ask the Data** (optional tab) | Ask the Data | A query plan only; the answer is computed in the app | 1 per question (an invalid plan gets one corrective re-ask) | Varies with the model |
+| A question in **Ask the Data** | Ask the Data tab | A query plan only; the answer is computed in the app | 1 per question (an invalid plan gets one corrective re-ask) | Varies with the model |
 | **Test LLM connection** | Config tab | "LLM connection OK: Connected to <model> (x.x s)." or the failure reason | 1 small request, never cached | Shown in the message |
 
 ### Re-score near cutoff
@@ -1914,7 +1925,7 @@ A second opinion on the Experience component for borderline candidates, where a 
 | Interview questions | 3–5, based on the candidate's own projects and internships and the required skills, probing the gaps |
 | Integrity verification questions | 3–5 neutral questions that let the candidate show the work is their own (for example a walk-through of a specific test question or project); only for Medium- or High-risk candidates |
 
-Where the results appear: the **LLM rationales (N)** panel on the Shortlist tab (Summary, strengths and gaps), and the full output, including both question lists, under "LLM assessment" in the Deep-Dive. They are not included in the Excel report.
+Where the results appear: the **LLM rationales (N)** panel on the Shortlist tab (Summary, strengths and gaps), and the full output, including both question lists, under "LLM assessment" in the Deep-Dive. The **Full Excel report** includes the summary, strengths and gaps as the "AI Notes (LLM)" column of its Shortlist and Integrity Evidence sheets; the question lists are not exported (see [LLM content in the Excel report](#llm-content-in-the-excel-report)).
 
 - Rationales never change a score, rank or status.
 - A rationale describes the candidate as they were when you clicked. After a settings change it may mention an old rank or score; click again to refresh it (the changed details make it a new request).
@@ -1928,8 +1939,8 @@ Where the results appear: the **LLM rationales (N)** panel on the Shortlist tab 
 | **LLM: executive summary** | A one-page summary of the whole run for senior TA stakeholders with four headings (Overview, Shortlist quality, Integrity findings, Recommended next steps), under 350 words. Progress box "Drafting the executive summary". | In the LLM box under the buttons | "Executive summary unavailable: ..." |
 
 - They are drafting aids; nothing here changes a score, risk level, cluster or status.
-- They are not refreshed automatically. After **Apply & re-score**, click again. Risk-group summaries are stored by cluster number (C01, C02, …), and numbering can change when settings change, so without a fresh run an old summary could appear under a different group.
-- They last for the session and are cleared by a new dataset or **Clear results**. They are not in the CSV files or the Excel report, so copy them out if you need to keep them.
+- They are not refreshed automatically. After **Apply & re-score**, click again. Risk-group summaries are stored by cluster number (C01, C02, …), and numbering can change when settings change, so without a fresh run an old summary could appear under a different group, on screen and in the Excel report.
+- They last for the session and are cleared by a new dataset or **Clear results**. The **Full Excel report** includes them: each risk group's headline, summary and recommended actions on the Risk Clusters sheet (the "Evidence" bullets stay on screen), and the executive summary at the bottom of the Summary sheet. The CSV files do not. Saving the run in **Run History** keeps them too.
 - Links, images and HTML in the model's output are removed before display.
 
 ### Time and cost
@@ -2408,18 +2419,20 @@ Final score: 74.73 / 100
 | `runs/` | Saved runs from **Run History** (or the folder set by `SCREENING_RUNS_DIR`); contains candidate personal data |
 | `generate_mock_data.py` | Synthetic data generator (see [Synthetic data and validation](#synthetic-data-and-validation)) |
 | `scripts/run_e2e.py` | End-to-end check against the synthetic ground truth |
-| `data/sample/` | The synthetic dataset used by the sample buttons. Real feeds and resumes must never be stored in the project. |
+| `data/sample/` | The synthetic dataset used by the sample buttons. It is not in the repository: `python generate_mock_data.py` writes it on the machine that runs the app. Everything under `data/` except `data/README.md` is excluded from version control, and real feeds and resumes must never be stored in the project. |
 | `.cache/llm/` | LLM answer cache (safe to delete) |
-| `.streamlit/config.toml` | Theme, the 1,024 MB upload limit, usage statistics switched off |
+| `.streamlit/config.toml` | Theme, listen address `127.0.0.1` (this machine only), the 1,024 MB upload limit, XSRF and CORS protection on, usage statistics switched off |
 | `.streamlit/secrets.toml` | The LLM API key (start from `.streamlit/secrets.toml.example`) |
 | `docs/ARCHITECTURE.md` | Technical design notes |
+| `docs/DEPLOYMENT.md` | Installing and running the app on a company VM |
+| `docs/SWITCH_TO_TACHYON.md` | Checklist for moving the LLM features to the internal TachyonClient |
 | `docs/HACKERRANK_DATA_REFERENCE.md` | Reference for the HackerRank export fields |
 
 ---
 
 ## Synthetic data and validation
 
-The bundled sample is entirely fictional: people are random combinations of common first and last names, colleges and companies are invented, email addresses use only the reserved `example.com`, `example.org`, `example.net` and `mail.example.com` domains, and phone numbers and IP addresses are random. Use it for training, demos and trying settings, never for hiring decisions.
+The synthetic sample is not part of the code or the repository: generate it on the machine that runs the app with `python generate_mock_data.py` (see [Generator options](#generator-options)). It is entirely fictional: people are random combinations of common first and last names, colleges and companies are invented, email addresses use only the reserved `example.com`, `example.org`, `example.net` and `mail.example.com` domains, and phone numbers and IP addresses are random. Use it for training, demos and trying settings, never for hiring decisions.
 
 ### What the sample contains
 
@@ -2429,7 +2442,7 @@ The default sample lives in `data/sample/`:
 |---|---|
 | `ta_feed.csv` | 3,008 rows for 3,000 candidates (8 duplicate re-exports) and 46 columns in HackerRank-export style, plus campus details. Two test versions: Set A out of 100 (about 90% of rows) and Set B out of 150. |
 | `resumes/` | 2,892 files: 1,739 PDF (including 1 corrupt and 1 scanned image-only), 822 DOCX (including 1 empty) and 331 TXT. Three layouts and four file-naming styles: `CAND-00012_<First>_<Last>.pdf`, `<First>_<Last>_Resume.docx`, `<first><last>_cv.pdf` and `Resume (12).pdf`. |
-| `resumes.zip` | The same files, for trying the ZIP upload |
+| `resumes.zip` | The same files, for trying the ZIP upload (not written with `--no-zip`) |
 | `job_description.txt` | The sample role; running the sample uses it automatically if your job description is still the default |
 | `README.md` | Column-by-column description of the sample |
 | `_ground_truth/labels.csv` | One row per candidate: `candidate_id`, `label` (colluder / decoy / normal), `cluster_key`, `pattern`, `expected_min_level` |
@@ -2522,8 +2535,8 @@ Results on the default sample (seed 42, 3,000 candidates, default configuration;
 
 | You notice … | Likely cause | What to do |
 |---|---|---|
-| **Run screening** is greyed out | Upload mode with no file selected, or the sample is not installed | Select a file, or switch to Upload |
-| **Load synthetic sample & run** is greyed out | The sample is not installed on the server | Upload your own files, or ask the administrator to generate the sample |
+| **Run screening** is greyed out | Upload mode with no file selected, or the sample has not been generated on the server | Select a file, or switch to Upload |
+| **Load synthetic sample & run** is greyed out | The sample has not been generated on the server (it is not part of the code) | Upload your own files, or ask the administrator to run `python generate_mock_data.py` |
 | The banner says "TA feed only" although you uploaded resumes | No resume file passed the checks (unsupported type, too large, inside a nested ZIP) | Look for stage "upload" in **Data quality details** |
 | Many "Resume could not be linked to any TA candidate." warnings | File names carry no Candidate ID, and the emails or phones on the CVs differ from the feed | Put the Candidate ID in file names, add a Resume File column to the feed, or map the email column candidates actually use on their CVs |
 | One particular resume is not linked | The email or phone on the resume disagrees with the feed, so the name-only safeguard blocked a name match; or the Candidate ID is all digits and shorter than 5 digits (never matched inside file names or text); or another file for the same candidate won ("Duplicate resume…"); or it is a walk-in with no TA row | Confirm the owner and correct the data, use a Resume File column, or leave walk-ins unmatched. See [Resume matching](#resume-matching). |
@@ -2598,7 +2611,7 @@ On the synthetic sample, every decoy at Medium got there through HackerRank's ow
 | A candidate was not re-scored by the LLM | Only eligible candidates with a linked resume inside the re-score band of the rules-only ranking are re-scored | Widen **Re-score band (± ranks around cutoff)** if needed |
 | A rationale mentions an old rank | It was written before a settings change | Click **LLM: write rationales for shortlist** (or **LLM: explain this candidate**) again |
 | The "Status changes from LLM re-scoring" panel shows candidates from an earlier dataset | The panel is a snapshot of your last re-score click | Click **LLM: re-score near cutoff** again to replace it |
-| LLM text is missing from the Excel report | Rationales, risk-group summaries and the executive summary are not exported | Copy them from the "LLM rationales" panel, the Deep-Dive or the Integrity tab, or save the run in **Run History**, which keeps them |
+| LLM text is missing from the Excel report | The report holds only the LLM output in your session when you click: nothing was generated yet, the request failed, or the candidate is on neither the Shortlist nor the Integrity Evidence sheet (the only sheets with "AI Notes (LLM)"). Interview and integrity questions and the risk-group "Evidence" bullets are never exported. | Run the LLM action, then download the report again; copy questions from the Deep-Dive. See [LLM content in the Excel report](#llm-content-in-the-excel-report). |
 | **Ask the Data** gives an explanation instead of an answer | The question cannot be expressed with the allowed filters, groupings and figures | Rephrase it as a count, average or list, for example "Average final score by college tier" |
 | **Ask the Data** shows an older answer with "Answered before the latest re-scoring" | The configuration or LLM re-scores changed after the question was asked | Ask the question again |
 
@@ -2663,9 +2676,9 @@ On the synthetic sample, every decoy at Medium got there through HackerRank's ow
 | Trait chip | A gold pill on a cluster card naming something the members share, such as a college, an IP or identical answers |
 | Walk-in | A resume with no matching TA row; it stays unmatched in a TA-feed run |
 
-## New features in detail
+## Compare, Campus Distribution, Ask the Data and Run History in detail
 
-Full reference for the **Compare Candidates**, **Campus Distribution**, **Ask the Data** and **Run History** tabs, the college cap and **Preview impact** in **Config & Rubric Tuning**, and deployment on a company virtual machine. Short overviews are in [Optional tabs](#optional-tabs).
+Full reference for the **Compare Candidates**, **Campus Distribution**, **Ask the Data** and **Run History** tabs, the college cap and **Preview impact** in **Config & Rubric Tuning**, and deployment on a company virtual machine. Short overviews are in [Compare, Campus Distribution, Ask the Data and Run History at a glance](#compare-campus-distribution-ask-the-data-and-run-history-at-a-glance).
 
 ### Tab: Compare Candidates
 
@@ -3074,7 +3087,7 @@ Candidates are matched by Candidate ID, and "shortlist" means "Shortlisted" plus
 
 ### College cap and What-if preview (Config and Rubric Tuning)
 
-Two additions to Config & Rubric Tuning: a **college cap** that stops any single college from taking more than a set share of the shortlist, and **"Preview impact"**, which shows who would enter or leave the shortlist before you apply new settings.
+Two Config & Rubric Tuning features: a **college cap** that stops any single college from taking more than a set share of the shortlist, and **"Preview impact"**, which shows who would enter or leave the shortlist before you apply new settings.
 
 #### College cap
 
@@ -3175,17 +3188,17 @@ Before the first screening the button is greyed out, and the caption reads "Prev
 The app runs as one Python process on a Windows Server or Linux VM inside the company network, and recruiters open it in their browsers. This is a summary; [docs/DEPLOYMENT.md](DEPLOYMENT.md) has the complete procedure, including offline installs, proxies and certificates, running as a service, the reverse proxy, health check, retention, backups, upgrades and troubleshooting.
 
 - **Prerequisites:** Windows Server 2019 or later, or 64-bit Linux; **Python 3.11 (64-bit)** installed for all users; 4 vCPU and 8 GB of memory (16 GB when several recruiters process drives at the same time); a dedicated service account without administrator rights.
-- **Copy the code** with Git or a clean archive. Never copy `data/`, `runs/`, `.cache/`, `.streamlit/secrets.toml` or a virtual environment from another machine.
+- **Copy the code** with Git or a clean archive. Never copy `data/`, `runs/`, `.cache/`, `.streamlit/secrets.toml` or a virtual environment from another machine. The synthetic sample is not in the repository; if you want it on the VM, generate it there with `python generate_mock_data.py` (add `--quick` for a 300-candidate version).
 - **Install, then start.** The setup script finds Python 3.11, creates the virtual environment outside the project folder, installs the pinned packages and runs `pip check` and the test suite. The examples use the folder layout from DEPLOYMENT.md:
 
 ```powershell
-## Windows, from the project folder
+# Windows, from the project folder
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1 -VenvPath C:\apps\venvs\hiring-screening
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_app.ps1 -VenvPath C:\apps\venvs\hiring-screening
 ```
 
 ```bash
-## Linux, from the project folder
+# Linux, from the project folder
 sudo bash scripts/setup.sh --venv /opt/venvs/hiring-screening
 bash scripts/run_app.sh --venv /opt/venvs/hiring-screening
 ```
@@ -3197,15 +3210,15 @@ bash scripts/run_app.sh --venv /opt/venvs/hiring-screening
 **Security notes**
 
 - **No built-in login.** Anyone who can open the URL can upload data, run screenings and open, rename or delete every saved run, so access control has to come from the network.
-- **Bind address.** By default the start scripts listen on `127.0.0.1`, which only the VM itself can reach. Use `-Address 0.0.0.0` / `--address 0.0.0.0` only together with a firewall rule limited to the recruiters' subnets or the VPN.
+- **Bind address.** By default the app listens on `127.0.0.1`, which only the VM itself can reach: that is the `address` setting in the `[server]` section of `.streamlit/config.toml` and the start scripts' default. To make it reachable from the intranet, start it with `-Address 0.0.0.0` / `--address 0.0.0.0`, or set the `STREAMLIT_SERVER_ADDRESS` environment variable to `0.0.0.0` when you start Streamlit without the scripts (the scripts always pass their own address, which takes precedence). Do this only together with a firewall rule limited to the recruiters' subnets or the VPN.
 - **Reverse proxy and SSO.** When several recruiters share the app, keep it on `127.0.0.1` behind the company reverse proxy, which terminates TLS and enforces single sign-on (ideally limited to the recruiting group). The proxy must pass WebSocket upgrades, allow long idle timeouts and accept uploads of at least 1 GB.
 - **Data.** Saved runs and downloaded exports contain candidate personal data: apply the retention policy, and use only an LLM provider the company's data policy approves.
 
-### FAQ: new features
+### FAQ: comparison, campus, questions and saved runs
 
 #### Why does Campus Distribution show a college "Over cap" when a college cap is set?
 
-The cap limits how many places each college may take, worked out from the number of slots the shortlist rule aims for, while "Over cap" compares those places with the shortlist that actually resulted. A college can be over when there were not enough eligible candidates from other colleges to fill the slots, when the cap rounds up to its minimum of one place, or when a "Score threshold" shortlist shrinks because capped candidates are not replaced. No college ever holds more than its allowed number of places. See "Why a college can show "Over cap"" under Tab: Campus Distribution.
+The cap limits how many places each college may take, worked out from the number of slots the shortlist rule aims for, while "Over cap" compares those places with the shortlist that actually resulted. A college can be over when there were not enough eligible candidates from other colleges to fill the slots, when the cap rounds up to its minimum of one place, or when a "Score threshold" shortlist shrinks because capped candidates are not replaced. No college ever holds more than its allowed number of places. See [Why a college can show "Over cap"](#why-a-college-can-show-over-cap) under Tab: Campus Distribution.
 
 #### Does the college cap change anyone's score or rank?
 
@@ -3243,13 +3256,13 @@ Either nothing has been screened yet ("Run a screening first, or open a saved ru
 
 "Apply & re-score" makes the form's settings active straight away. "Preview impact" scores the proposed settings on the side and shows who would enter or leave the shortlist, status changes and rank moves, without changing anything; you then choose "Apply these changes" or "Discard preview". "Preview impact" is available after the first screening run.
 
-### Glossary: new terms
+### Glossary: more terms
 
 | Term | Meaning |
 |---|---|
 | Backfill | Filling a shortlist slot left by a college-capped candidate or an integrity hold with the next-best eligible candidate. Happens with "Top N" and "Top % of eligible", never with "Score threshold". |
 | Best-value highlight | The pale-yellow cell in Compare Candidates marking the best value of a numeric row (lowest for rank and risk score, highest otherwise). A reading aid, not a recommendation. |
-| Bind address | The network address the app listens on. The start scripts use `127.0.0.1` (the VM only) unless told otherwise; `0.0.0.0` accepts connections from other machines. |
+| Bind address | The network address the app listens on. It is `127.0.0.1` (the server itself only) unless set otherwise with `-Address` / `--address` on the start scripts or the `STREAMLIT_SERVER_ADDRESS` environment variable; `0.0.0.0` accepts connections from other machines. |
 | Cap places | The number of shortlist places one college may hold: max(1, floor(cap % × slots ÷ 100)). |
 | Capped out | A candidate who would have been shortlisted but whose college had already used all of its cap places. Status "Not Shortlisted"; `college_capped` is True. |
 | College cap | The setting "Max share of shortlist per college (%)" in Config & Rubric Tuning; 0 means no cap. |

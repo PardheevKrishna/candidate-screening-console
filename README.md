@@ -11,7 +11,7 @@ A Streamlit app for campus hiring that:
    solutions, proxy test-takers, synchronized sessions, leaked-paper speed runs, plagiarised
    resumes. For each pattern it shows **what the perfect scorers have in common** and the
    evidence for recruiter review.
-4. Uses an **LLM** (NVIDIA NIM today; switchable to the internal TachyonClient, see
+4. Uses an **LLM** (NVIDIA NIM by default; switchable to the internal TachyonClient, see
    [docs/SWITCH_TO_TACHYON.md](docs/SWITCH_TO_TACHYON.md)) for rationales, interview and
    integrity questions, risk-group summaries, an executive summary, and a 50/50 re-score of
    candidates near the cutoff.
@@ -30,14 +30,15 @@ py -3.11 -m venv $env:USERPROFILE\.venvs\hiring-screening
 & $env:USERPROFILE\.venvs\hiring-screening\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-# 2. Generate the synthetic dataset (3,000 candidates + ~2,900 resumes, ~2-4 min)
+# 2. Generate the synthetic dataset into data\sample\ (3,000 candidates + ~2,900 resumes, ~2-4 min).
+#    It is not in the repository; it is created locally. Writes resumes.zip too unless --no-zip.
 python generate_mock_data.py            # --quick for 300 candidates
 
 # 3. LLM key (optional - everything except LLM features works offline)
 copy .streamlit\secrets.toml.example .streamlit\secrets.toml   # then paste your key
 #    or: $env:NVIDIA_API_KEY = "nvapi-..."
 
-# 4. Run
+# 4. Run (listens on 127.0.0.1 only; open http://127.0.0.1:8501)
 streamlit run app.py
 ```
 
@@ -52,6 +53,13 @@ Tests: `python -m pytest` (~690 tests, ~40 s)  ·  End-to-end + ground-truth che
 ```
 
 Then click **Load synthetic sample & run** (about 30–40 s for 3,000 candidates and 2,892 resumes).
+
+**Who can reach it.** The app listens on `127.0.0.1` by default (`address` in the `[server]` section of
+`.streamlit/config.toml`), so only this machine can open it. To make it reachable from the intranet, start
+it with the run script and `-Address 0.0.0.0` (Windows) or `--address 0.0.0.0` (Linux), as shown in
+[Deploying on a company VM](#deploying-on-a-company-vm), or set the environment variable
+`STREAMLIT_SERVER_ADDRESS=0.0.0.0` before `streamlit run app.py`. The app has no login of its own, so
+restrict the port with the firewall first ([docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), section 8).
 
 ### Validation on the synthetic dataset
 
@@ -71,7 +79,8 @@ Then click **Load synthetic sample & run** (about 30–40 s for 3,000 candidates
 ## Using the app
 
 **Sidebar → Data source**
-* *Synthetic sample dataset*: loads `data/sample/` (created by `generate_mock_data.py`).
+* *Synthetic sample dataset*: loads `data/sample/` (created locally by `python generate_mock_data.py`;
+  the button is unavailable until the sample exists).
 * *Upload*: the TA feed (CSV/XLSX) plus resumes (multi-select PDF/DOCX/TXT, or one ZIP).
   Headers are auto-mapped (for example "Email ID", "Percentage Score", "Out of Window Events",
   "Q3 Score (Coding - DP)"). Open **Review column mapping** to fix any mapping before you run.
@@ -133,15 +142,18 @@ plain-English reasons that name the evidence and the linked candidates.
 
 ## Synthetic dataset
 
-`generate_mock_data.py` writes `data/sample/`:
+The sample is not part of the repository (everything under `data/` except `data/README.md` is gitignored).
+Generate it locally with `python generate_mock_data.py`, which writes `data/sample/` (`--quick` for 300
+candidates, `--no-zip` to skip `resumes.zip`; every option is listed under "Generator options" in
+[docs/USER_GUIDE.md](docs/USER_GUIDE.md#generator-options)):
 
 * `ta_feed.csv`: a HackerRank for Work-style export (attempt times, score, max score,
   percentage, per-question scores, code similarity, plagiarism status, out-of-window events
   and duration, editor paste count, secure-mode exits, IP, AI-proctoring integrity status)
   plus the candidate-details columns a campus drive collects (college, degree, branch, CGPA,
   year of passing, city) and TA fields (tier, test mode, source).
-* `resumes/` + `resumes.zip`: PDF, DOCX and TXT resumes in three layouts with skills,
-  projects, internships, education and certifications, using realistic file-name variety.
+* `resumes/` + `resumes.zip` (the ZIP unless `--no-zip`): PDF, DOCX and TXT resumes in three layouts
+  with skills, projects, internships, education and certifications, using realistic file-name variety.
 * `job_description.txt`, `README.md`.
 * `_ground_truth/`: planted integrity patterns, decoys, and injected data-quality issues, used by
   `scripts/run_e2e.py` and the tests. The app never reads it.
@@ -155,10 +167,11 @@ All people, colleges and companies are fictional. Emails use reserved `example.*
 | | |
 |---|---|
 | Default provider | NVIDIA NIM (`https://integrate.api.nvidia.com/v1`), model `nvidia/nemotron-3-ultra-550b-a55b`, with its hidden "thinking" switched off (`request_extras`). Measured 2026-11-05: re-score about 2 s per candidate, explanation about 20 s, risk-group summary about 7 s |
-| Fallbacks | `nvidia/nemotron-3.5-bolt-e4b`, `meta/llama-3.3-70b-instruct`, `google/gemma-4-31b-it`. `meta/llama-3.3-70b-instruct` (the earlier default) now returns **HTTP 410 (retired)** on NVIDIA's API. On 404/410 the client moves to the next model automatically |
+| Fallbacks | `nvidia/nemotron-3.5-bolt-e4b`, `meta/llama-3.3-70b-instruct`, `google/gemma-4-31b-it`. `meta/llama-3.3-70b-instruct` returns **HTTP 410 (retired)** on NVIDIA's API. On 404/410 the client moves to the next model automatically |
 | What the LLM does | (1) rationale for each shortlisted candidate; (2) any candidate on click; (3) plain-English summary of each risk group with verification steps; (4) executive summary of the run; (5) interview questions that probe each candidate's gaps; (6) integrity questions for Medium/High-risk candidates; (7) re-scores Experience & Projects only for the ±50 ranks around the cutoff, blended 50/50 with the rule-based score |
 | Switch to the internal TachyonClient | Follow [docs/SWITCH_TO_TACHYON.md](docs/SWITCH_TO_TACHYON.md). It is a file-by-file checklist, and when you finish there are no NVIDIA references left |
 | Key lookup | Environment variable first, then `st.secrets`. The UI only ever shows "configured" |
+| In the Excel report | The **Full Excel report** includes the session's LLM output: rationales and explanations as "AI Notes (LLM)" on the Shortlist and Integrity Evidence sheets, risk-group summaries on Risk Clusters, the executive summary on Summary, and the re-score's "LLM Rationale" |
 | Privacy | Emails, phone numbers, URLs and candidate names are redacted before any text leaves the machine. Prompts tell the model to ignore protected attributes |
 | Cost/time control | Only explicit button actions call the LLM. Re-scoring is limited to the ±50 ranks around the cutoff. Responses are cached on disk (`.cache/llm/`, gitignored) |
 
@@ -171,6 +184,8 @@ All people, colleges and companies are fictional. Emails use reserved `example.*
 * **Candidate PII:** everything under `data/` is gitignored, except the README. Process real TA data
   only on approved company infrastructure, and only with LLM providers your data policy allows.
 * **Exports** neutralise spreadsheet formula injection (cells starting with `= + - @`).
+* **Network:** the app listens on `127.0.0.1` (this machine only) unless you start it with another
+  address, and has no login of its own (see "Who can reach it" under Quick start).
 * **Telemetry:** Streamlit usage stats are disabled in `.streamlit/config.toml`.
 * **Fairness:** the rubric uses only job-relevant evidence. Protected attributes are never used. You can
   set institution tier to 0. Integrity flags require human review before any decision.
@@ -210,7 +225,8 @@ ui/                    Streamlit components: theme, sidebar, state, charts and o
 screening/             Engine (no Streamlit imports): schema, config, models, ingest, resume_parser,
                        skills, matching, scoring, risk, analytics, ask, runs, llm, llm_backends,
                        export, pipeline
-generate_mock_data.py  Synthetic HackerRank/TA export + resumes + ground truth
+generate_mock_data.py  Synthetic HackerRank/TA export + resumes + ground truth (writes data/sample/)
+data/                  Only README.md is in the repository; the generated sample goes to data/sample/ (gitignored)
 scripts/               run_e2e.py (headless check), setup.ps1|sh and run_app.ps1|sh (VM setup/run)
 tests/                 pytest suite
 docs/                  ARCHITECTURE, USER_GUIDE, DEPLOYMENT, SWITCH_TO_TACHYON, HACKERRANK_DATA_REFERENCE

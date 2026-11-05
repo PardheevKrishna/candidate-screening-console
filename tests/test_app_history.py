@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - tests/ imported as rootdir-relative mo
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
 FP = "fake-fingerprint"
+KEY_ENV = AppConfig().llm.api_key_env  # env var / secret name of the LLM API key, from the config
 ENABLE_HISTORY = ('try:\n    ENABLED_FEATURE_TABS[state.TAB_HISTORY] = "ui.tab_history"\n'
                   "except (NameError, TypeError):  # app.py no longer gates feature tabs\n    pass\n")
 
@@ -41,7 +42,7 @@ def _app_script() -> str:
 def runs_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     folder = tmp_path / "runs"
     monkeypatch.setenv(runs.ENV_RUNS_DIR, str(folder))
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv(KEY_ENV, raising=False)
     monkeypatch.setitem(vars(pipeline), "DEFAULT_SAMPLE_DIR", tmp_path / "no-sample")
     return folder
 
@@ -61,7 +62,7 @@ def evaluate_calls(monkeypatch: pytest.MonkeyPatch) -> list[AppConfig]:
 
 def _app() -> AppTest:
     at = AppTest.from_string(_app_script(), default_timeout=60)
-    at.secrets["NVIDIA_API_KEY"] = ""  # never read a real secrets.toml during tests
+    at.secrets[KEY_ENV] = ""  # never read a real secrets.toml during tests
     return at
 
 

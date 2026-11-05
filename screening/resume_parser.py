@@ -7,13 +7,21 @@ Flow: ``expand_uploads`` (in-memory ZIP expansion with size / member / zip-bomb 
 Nothing here raises for a bad file. Upload problems become DataQualityReport-style
 issue dicts; extraction / parsing problems become ``ParsedResume.parse_status``,
 ``parse_error`` and ``warnings``. No resume content is ever logged.
+
+Decompression bombs: ZIP uploads, DOCX parts and PDF streams are size-limited before or
+while they are inflated (``ZIP_MAX_RATIO``, ``DOCX_*`` and ``PDF_*`` constants below).
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import contextlib
+import dataclasses
 import io
 import re
 import unicodedata
 import zipfile
+import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -44,8 +52,17 @@ PRESENT_DATE = date(2026, 11, 1)   # what "Present" / "Current" means in date ra
 MIN_TEXT_CHARS = 30                # less extracted text than this -> parse_status "empty"
 ZIP_MAX_RATIO = 200.0              # uncompressed / compressed above this -> zip-bomb guard
 PDF_FALLBACK_CHARS = 100           # pypdf output shorter than this -> retry with pdfplumber
+# Decompression-bomb limits for one resume file (real resumes stay far below them).
+DOCX_MAX_UNPACKED_MB = 30          # DOCX: all parts together may unpack to at most this
+DOCX_MAX_PARTS = 2000              # DOCX: at most this many ZIP members
+DOCX_RATIO_MIN_MB = 1              # DOCX: ZIP_MAX_RATIO is checked for parts larger than this
+PDF_MAX_DECODED_MB = 30            # PDF: pypdf decompresses a stream to at most this
+PDF_MAX_PAGES = 50                 # PDF: longer files are not read
 
 _MB = 1024 * 1024
+# zipfile inflates these methods in bounded steps; bzip2 / LZMA members are inflated in one
+# unbounded call, so a few KB can expand to gigabytes before any size check applies.
+_ZIP_BOUNDED_METHODS = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
 _STAGE_UPLOAD = "upload"
 _JUNK_FILE_NAMES = {"thumbs.db", "desktop.ini", ".ds_store"}
 _OCR_HINT = "No extractable text: the PDF looks image-only/scanned - OCR is required"
@@ -145,6 +162,10 @@ def _expand_zip(archive: str, content: bytes, cfg: ProcessingConfig,
             if info.flag_bits & 0x1:
                 issues.append(_issue("warning", f"Encrypted file inside '{archive}' skipped", name))
                 continue
+            if info.compress_type not in _ZIP_BOUNDED_METHODS:
+                issues.append(_issue("warning", f"File inside '{archive}' uses an unsupported compression "
+                                                "method - skipped (re-create the ZIP with standard settings)", name))
+                continue
             if info.file_size > max_file:
                 issues.append(_issue("warning", f"File is larger than {cfg.max_file_mb:g} MB - skipped", name))
                 continue
@@ -241,6 +262,10 @@ def _extract(doc: ResumeDoc) -> tuple[str, list[str], str | None]:
         return "", [], f"Could not extract text ({type(exc).__name__})"
 
 
+_PDF_LIMIT_NOTE = (f"exceeds the safety limits for a resume (over {PDF_MAX_DECODED_MB} MB when decompressed, "
+                   "or too complex; possible decompression bomb)")
+
+
 def _pdf_text(content: bytes) -> tuple[str, list[str], str | None]:
     if b"%PDF-" not in content[:1024]:
         # Checked here so pypdf never logs "invalid pdf header: <first bytes of the file>".
@@ -249,34 +274,252 @@ def _pdf_text(content: bytes) -> tuple[str, list[str], str | None]:
     error: str | None = None
     text = ""
     links: list[str] = []
+    page_count: int | None = None
+    limit_hit = False   # pypdf stopped at a size limit: the file never goes to pdfminer either
+    limit_errors = _pdf_limit_errors()
     try:
         from pypdf import PdfReader
 
-        reader = PdfReader(io.BytesIO(content), strict=False)
-        if reader.is_encrypted:
-            try:
-                reader.decrypt("")
-            except Exception:
-                return "", [], "PDF is password-protected"
-        pages: list[str] = []
-        for i, page in enumerate(reader.pages, start=1):
-            try:
-                pages.append(page.extract_text() or "")
-            except Exception:
-                warnings.append(f"Could not extract text from PDF page {i}")
-            links.extend(_pdf_page_links(page))
-        text = "\n".join(pages)
+        with _pdf_limits():
+            reader = PdfReader(io.BytesIO(content), strict=False)
+            if reader.is_encrypted:
+                try:
+                    reader.decrypt("")
+                except Exception:
+                    return "", [], "PDF is password-protected"
+            page_count = len(reader.pages)
+            if page_count > PDF_MAX_PAGES:
+                return "", [], (f"PDF has {page_count:,} pages - files longer than {PDF_MAX_PAGES} pages "
+                                "are not read as resumes")
+            pages: list[str] = []
+            for i, page in enumerate(reader.pages, start=1):
+                try:
+                    pages.append(page.extract_text() or "")
+                except limit_errors:
+                    limit_hit = True
+                    warnings.append(f"PDF page {i} {_PDF_LIMIT_NOTE} - this and any later pages were skipped")
+                    break
+                except Exception:
+                    warnings.append(f"Could not extract text from PDF page {i}")
+                links.extend(_pdf_page_links(page))
+            text = "\n".join(pages)
+    except limit_errors:
+        limit_hit = True
     except Exception as exc:
         error = f"Could not read PDF ({type(exc).__name__}) - the file may be corrupted"
 
-    if len(text.strip()) < PDF_FALLBACK_CHARS:
+    if len(text.strip()) < PDF_FALLBACK_CHARS and not limit_hit and _pdf_fallback_allowed(content, page_count):
         alt = _pdfplumber_text(content)
         ours, theirs = _alnum_count(text), _alnum_count(alt)
         if theirs > ours and (ours < 30 or theirs > 1.5 * ours):
             text, error = alt, None
+    if limit_hit and error is None:
+        error = f"PDF {_PDF_LIMIT_NOTE} - not read"
     if not text.strip() and error is None:
         warnings.append(_OCR_HINT)
     return _append_links(text, links), warnings, (error if not text.strip() else None)
+
+
+_PDF_LIMIT_FIELDS = (  # pypdf Configuration fields capped at PDF_MAX_DECODED_MB while a resume is read
+    "zlib_maximum_output_length", "lzw_maximum_output_length", "run_length_maximum_output_length",
+    "brotli_maximum_output_length", "jbig2_maximum_output_length",
+    "array_based_stream_maximum_output_length", "maximum_declared_stream_length",
+)
+
+
+def _pdf_limits() -> contextlib.AbstractContextManager[Any]:
+    """Tighter pypdf size limits for the calling thread while it reads one resume.
+
+    pypdf 6 keeps its limits in a context variable (``pypdf.apply_configuration``), so this
+    never changes them for other threads or other pypdf users in the process; limits that
+    are already lower are kept. pypdf releases without that API get their module-level zlib
+    cap lowered instead (one idempotent assignment).
+    """
+    cap = PDF_MAX_DECODED_MB * _MB
+    try:
+        import pypdf
+
+        if hasattr(pypdf, "apply_configuration"):
+            current = pypdf.get_configuration()
+            known = {f.name for f in dataclasses.fields(current)}
+            return pypdf.apply_configuration(**{
+                name: min(getattr(current, name) or cap, cap) for name in _PDF_LIMIT_FIELDS if name in known
+            })
+        from pypdf import filters
+
+        if not 0 < getattr(filters, "ZLIB_MAX_OUTPUT_LENGTH", cap) <= cap:   # 0 means "no limit"
+            filters.ZLIB_MAX_OUTPUT_LENGTH = cap
+    except Exception:
+        pass
+    return contextlib.nullcontext()
+
+
+def _pdf_limit_errors() -> tuple[type[BaseException], ...]:
+    """Exceptions meaning pypdf stopped at a size limit or could not decompress a stream."""
+    try:
+        from pypdf.errors import LimitReachedError
+    except ImportError:
+        return (zlib.error, MemoryError)
+    return (LimitReachedError, zlib.error, MemoryError)
+
+
+# ---- pre-check before the pdfplumber / pdfminer fallback -------------------
+_PDF_KEYWORD_AFTER = frozenset(b" \t\r\n\f\x00()<>[]{}")   # bytes that may precede the "stream" keyword
+_PDF_STREAM_EOL = re.compile(rb"[ \t]*(?:\r\n|\r|\n)")
+_PDF_BLANK = re.compile(rb"[ \t\r\n\f\x00]*")
+_PDF_NAME_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
+_PDF_FILTER = re.compile(rb"/Filter\s*(\[[^\]]*\]|/[^\s/\[\]()<>{}%]*|\d+\s+\d+\s+R)")
+_PDF_NAME = re.compile(rb"/([^\s/\[\]()<>{}%]*)")
+_PDF_LENGTH = re.compile(rb"/Length\s+(\d+)")
+_PDF_PAGE = re.compile(rb"/Type\s*/Page(?![A-Za-z0-9])")
+_PDF_A85_START = re.compile(rb"\s*<?\s*~\s*")
+_PDF_FLATE = frozenset({b"FlateDecode", b"Fl"})
+_PDF_A85 = frozenset({b"ASCII85Decode", b"A85"})
+_PDF_AHX = frozenset({b"ASCIIHexDecode", b"AHx"})
+_PDF_PASS_THROUGH = frozenset({b"DCTDecode", b"DCT", b"JPXDecode", b"JBIG2Decode"})  # images pdfminer leaves encoded
+_PDF_DICT_WINDOW = 64 * 1024   # a stream dictionary longer than this is not inspected (fallback refused)
+_PDF_MAX_STREAMS = 5000        # more streams than this: fallback refused
+
+
+def _pdf_fallback_allowed(content: bytes, page_count: int | None) -> bool:
+    """Whether the pdfplumber fallback may read ``content`` (pdfminer has no size limits).
+
+    Every stream in the file is decoded here first, the way pdfminer would but bounded.
+    The fallback is refused when a declared /Length, or all streams decoded together,
+    exceed PDF_MAX_DECODED_MB, when a stream is corrupt or uses a filter that cannot be
+    checked cheaply (LZW, RunLength, CCITT, encryption, ...), or when the file has more
+    than PDF_MAX_PAGES pages (counted from page objects when pypdf could not count them).
+    """
+    try:
+        pages = _pdf_scan(content)
+    except Exception:  # defensive: a failed check must never open the fallback
+        return False
+    return pages is not None and (page_count if page_count is not None else pages) <= PDF_MAX_PAGES
+
+
+def _pdf_scan(content: bytes) -> int | None:
+    """Number of page objects in ``content`` if all its streams decode within the limit, else None."""
+    budget = PDF_MAX_DECODED_MB * _MB
+    pages = len(_PDF_PAGE.findall(content))
+    streams = pos = 0
+    while (kw := content.find(b"stream", pos)) >= 0:
+        pos = kw + 6
+        eol = _PDF_STREAM_EOL.match(content, pos)
+        if eol is None or (kw and content[kw - 1] not in _PDF_KEYWORD_AFTER):
+            continue   # "endstream", a name or plain text rather than the stream keyword
+        streams += 1
+        head = _pdf_stream_head(content, kw)
+        if streams > _PDF_MAX_STREAMS or head is None:
+            return None
+        if any(len(n) > 9 or int(n) > budget for n in _PDF_LENGTH.findall(head)):
+            return None
+        filters = _pdf_filters(head)
+        data = None if filters is None else _pdf_stream_data(content, eol.end(), filters, budget)
+        if data is None:
+            return None
+        budget -= len(data)
+        if isinstance(data, bytes):
+            pages += len(_PDF_PAGE.findall(data))   # page objects inside compressed object streams
+    return pages
+
+
+def _pdf_stream_head(content: bytes, kw: int) -> bytes | None:
+    """Bytes from the end of the previous object to the "stream" keyword at ``kw`` (the
+    stream dictionary), #xx name escapes decoded; None when implausibly long."""
+    lo = max(0, kw - _PDF_DICT_WINDOW)
+    start = max(content.rfind(b"endobj", lo, kw), content.rfind(b"endstream", lo, kw))
+    if start < 0 < lo:
+        return None
+    return _PDF_NAME_ESCAPE.sub(lambda m: bytes((int(m.group(1), 16),)), content[max(start, 0):kw])
+
+
+def _pdf_filters(head: bytes) -> list[bytes] | None:
+    """Filter names declared in a stream dictionary ([] for none); None when unreadable."""
+    values = set(_PDF_FILTER.findall(head))
+    if len(values) > 1:
+        return None
+    if not values:
+        return []
+    value = values.pop()
+    if value.startswith(b"/"):
+        return [value[1:]]
+    if value.startswith(b"[") and not re.search(rb"\bR\b", value):
+        return _PDF_NAME.findall(value)
+    return None   # indirect reference
+
+
+def _pdf_stream_data(content: bytes, start: int, filters: list[bytes],
+                     limit: int) -> bytes | memoryview | None:
+    """The stream whose data begins at ``start``, decoded as pdfminer would; None when that
+    takes more than ``limit`` bytes or fails. pdfminer reads up to /Length or "endstream";
+    the first decoder here reads on to where its encoding ends, an upper bound of both."""
+    end = content.find(b"endstream", start)
+    end = len(content) if end < 0 else end
+    data: bytes | memoryview | None = memoryview(content)[start:end]
+    buf, pos, hint = content, start, end
+    for name in filters:
+        if name in _PDF_PASS_THROUGH:
+            break
+        if name in _PDF_FLATE:
+            data = _pdf_inflate(buf, pos, hint, limit)
+        elif name in _PDF_A85:
+            data = _pdf_a85(buf, pos, limit)
+        elif name in _PDF_AHX:
+            data = _pdf_ahx(buf, pos)
+        else:
+            return None   # LZW, RunLength, CCITT, Crypt, ...: not checked, so not allowed
+        if data is None:
+            return None
+        buf, pos, hint = data, 0, len(data)
+    return data if len(data) <= limit else None
+
+
+def _pdf_inflate(buf: bytes, pos: int, hint: int, limit: int) -> bytes | None:
+    """Inflate the zlib stream at buf[pos:], reading past ``hint`` only while it continues;
+    None if the output exceeds ``limit`` or the stream is corrupt or cut short (pdfminer's
+    recovery for broken streams is quadratic)."""
+    if _PDF_BLANK.match(buf, pos, hint).end() >= hint:
+        return b""   # empty: whatever follows starts with "endstream", which is not zlib data
+    view = memoryview(buf)
+    inflater = zlib.decompressobj()
+    out: list[bytes] = []
+    size = 0
+    stop = hint
+    try:
+        while not inflater.eof and pos < len(buf):
+            piece = inflater.decompress(view[pos:stop], limit - size + 1)
+            pos, stop = stop, stop + 64 * 1024
+            size += len(piece)
+            if size > limit:
+                return None
+            out.append(piece)
+    except zlib.error:
+        return None
+    return b"".join(out) if inflater.eof else None
+
+
+def _pdf_a85(buf: bytes, pos: int, limit: int) -> bytes | None:
+    """ASCII85-decode buf[pos:] up to its "~>" end marker, like pdfminer; None if invalid or over ``limit``."""
+    lead = _PDF_A85_START.match(buf, pos)
+    pos = lead.end() if lead else pos
+    end = buf.find(b"~", pos)
+    text = buf[pos:len(buf) if end < 0 else end]
+    if 4 * text.count(b"z") + len(text) > limit:   # upper bound of the decoded size
+        return None
+    try:
+        return base64.a85decode(text)
+    except ValueError:
+        return None
+
+
+def _pdf_ahx(buf: bytes, pos: int) -> bytes | None:
+    """ASCIIHex-decode buf[pos:] up to its ">" end marker, like pdfminer; None if invalid."""
+    end = buf.find(b">", pos)
+    digits = re.sub(rb"\s", b"", buf[pos:len(buf) if end < 0 else end])
+    try:
+        return binascii.unhexlify(digits + b"0" * (len(digits) % 2))
+    except (binascii.Error, ValueError):
+        return None
 
 
 def _alnum_count(text: str) -> int:
@@ -325,7 +568,59 @@ def _append_links(text: str, links: list[str]) -> str:
     return text + ("\n\nHyperlinks\n" + "\n".join(extra) if extra else "")
 
 
+def _docx_for_reading(content: bytes) -> tuple[bytes, str | None]:
+    """(bytes to hand to python-docx, error): the DOCX zip-bomb guard. Never raises.
+
+    python-docx inflates each part with a single ``ZipFile.read`` call, trusting the sizes
+    in the ZIP directory, so a crafted file could expand to gigabytes. The directory is
+    checked first (part count, total size, compression ratio and method, aligned with the
+    ZIP-upload guard); the parts are then inflated here in 1 MB steps - zipfile never
+    returns more than a part's declared size, even when the directory lies - and repacked
+    uncompressed, so python-docx only copies bytes. Input that is not a ZIP at all is
+    returned unchanged for python-docx to report as corrupted.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except Exception:
+        return content, None
+    budget = DOCX_MAX_UNPACKED_MB * _MB
+    too_big = f"DOCX unpacks to more than {DOCX_MAX_UNPACKED_MB:g} MB (possible zip bomb) - not read"
+    with archive:
+        infos = archive.infolist()
+        if len(infos) > DOCX_MAX_PARTS:
+            return b"", f"DOCX has more than {DOCX_MAX_PARTS:,} internal parts (possible zip bomb) - not read"
+        if sum(info.file_size for info in infos) > budget:
+            return b"", too_big
+        for info in infos:
+            if (info.file_size > DOCX_RATIO_MIN_MB * _MB
+                    and info.file_size / max(info.compress_size, 1) > ZIP_MAX_RATIO):
+                return b"", "Suspicious compression ratio inside the DOCX (possible zip bomb) - not read"
+            if info.compress_type not in _ZIP_BOUNDED_METHODS:
+                return b"", "DOCX uses an unsupported compression method - not read"
+        out = io.BytesIO()
+        unpacked = 0
+        try:
+            with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as copy:
+                for info in infos:
+                    if info.is_dir() or archive.getinfo(info.filename) is not info:
+                        continue   # folders, and older entries shadowed by a duplicate name, are never read
+                    chunks: list[bytes] = []
+                    with archive.open(info) as part:
+                        while chunk := part.read(_MB):
+                            unpacked += len(chunk)
+                            if unpacked > budget:
+                                return b"", too_big
+                            chunks.append(chunk)
+                    copy.writestr(info.filename, b"".join(chunks))
+        except Exception as exc:
+            return b"", f"Could not read DOCX ({type(exc).__name__}) - the file may be corrupted"
+    return out.getvalue(), None
+
+
 def _docx_text(content: bytes) -> tuple[str, list[str], str | None]:
+    content, problem = _docx_for_reading(content)
+    if problem:
+        return "", [], problem
     try:
         import docx
         from docx.opc.constants import RELATIONSHIP_TYPE as RT

@@ -16,6 +16,7 @@ from streamlit.testing.v1 import AppTest
 
 from screening import export, llm, pipeline, scoring
 from screening import schema as S
+from screening.config import LLMConfig
 from screening.models import PipelineResult, ResumeDoc, RiskResult, DataQualityReport
 from ui import charts, state, tab_deepdive, tab_shortlist
 
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - tests/ imported as rootdir-relative mo
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
 FP = "fake-fingerprint"
+KEY_ENV = LLMConfig().api_key_env  # env var / secret name of the LLM API key, from the config
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +40,7 @@ def _patch(monkeypatch: pytest.MonkeyPatch, module: Any, name: str, value: Any) 
 
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv(KEY_ENV, raising=False)
     _patch(monkeypatch, pipeline, "DEFAULT_SAMPLE_DIR", tmp_path / "no-sample")
 
 
@@ -67,7 +69,7 @@ def engine(monkeypatch: pytest.MonkeyPatch, fake: tuple[pipeline.PreparedData, P
 
 def _app() -> AppTest:
     at = AppTest.from_file(APP, default_timeout=60)
-    at.secrets["NVIDIA_API_KEY"] = ""  # never read a real secrets.toml during tests
+    at.secrets[KEY_ENV] = ""  # never read a real secrets.toml during tests
     return at
 
 
@@ -177,7 +179,7 @@ def test_config_form_applies_and_rescored(engine: dict[str, Any]) -> None:
 
 
 def test_llm_actions_with_fake_client(engine: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("NVIDIA_API_KEY", "dummy-test-value")
+    monkeypatch.setenv(KEY_ENV, "dummy-test-value")
 
     class FakeClient:
         def __init__(self, cfg: Any, api_key: str, client: Any = None) -> None:

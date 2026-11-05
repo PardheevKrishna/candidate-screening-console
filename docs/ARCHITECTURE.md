@@ -6,30 +6,41 @@ a weighted rubric (default 40/30/20/10), shortlists the top N, and runs an integ
 explains what candidates who scored 100% have in common.
 
 ```
-app.py                      Streamlit entry (thin): page config, theme, sidebar, tabs
+app.py                      Streamlit entry (thin): page config, theme, sidebar, tabs; a feature tab
+                            whose module fails to import is hidden instead of breaking the app
 ui/                         Streamlit-only code (imports streamlit)
   theme.py                  brand CSS, header banner, KPI cards, badges
-  state.py                  session_state keys, config get/set, cached pipeline calls
+  state.py                  session_state keys, config get/set, cached pipeline calls, LLM readiness
   sidebar.py                data sources, column mapping, run button, LLM status
   charts.py                 plotly figure builders (pure functions -> go.Figure)
-  tab_shortlist.py          Tab 1 Candidate Shortlist & Leaderboard
+  tab_shortlist.py          Tab 1 Candidate Shortlist & Leaderboard (+ Excel download with LLM notes)
   tab_risk.py               Tab 2 Integrity & Risk Intelligence
   tab_deepdive.py           Tab 3 Individual Deep-Dive
-  tab_config.py             Tab 4 Config & Rubric Tuning
+  tab_compare.py            Tab 4 Compare Candidates
+  tab_campus.py             Tab 5 Campus Distribution
+  tab_ask.py                Tab 6 Ask the Data
+  tab_history.py            Tab 7 Run History (also shown before the first run)
+  tab_config.py             Tab 8 Config & Rubric Tuning
 screening/                  engine (NO streamlit imports; unit-testable)
-  schema.py               canonical column names, aliases, vocab
-  config.py               AppConfig dataclasses
-  models.py               ResumeDoc, ParsedResume, DataQualityReport, RiskResult, PipelineResult
+  schema.py                 canonical column names, aliases, vocab
+  config.py                 AppConfig dataclasses, LLM_PROVIDERS preset
+  models.py                 ResumeDoc, ParsedResume, DataQualityReport, RiskResult, PipelineResult
   pipeline.py               prepare_data / evaluate / run_llm_rescore / run_pipeline / load_sample_dataset
   ingest.py                 TA feed loading, header auto-mapping, normalisation
   resume_parser.py          text extraction + section/entity parsing
   skills.py                 skill taxonomy, extraction, required-skill matching
   matching.py               resume <-> candidate linkage
-  scoring.py                rubric scoring, shortlist/status, cutoff band
+  scoring.py                rubric scoring, shortlist/status, cutoff band, college cap
   risk.py                   integrity & anomaly engine
-  llm.py                    NVIDIA NIM client + LLM features (rescore, rationales, summaries)
+  analytics.py              campus distribution, shortlist diff (preview impact, run comparison)
+  ask.py                    Ask the Data: query-plan prompt, validation, local execution
+  runs.py                   saved runs (RunStore)
+  llm.py                    LLMClient (retries, model fallback, JSON, disk cache) + LLM features
+  llm_backends.py           provider adapter: chat client (NVIDIA endpoint through the openai SDK
+                            by default), error classification, key masking, TachyonShim
   export.py                 CSV / Excel / evidence-pack exports
-generate_mock_data.py       synthetic TA/HackerRank export + resumes + ground truth
+generate_mock_data.py       synthetic TA/HackerRank export + resumes + ground truth (-> data/sample/,
+                            generated locally; data/ is gitignored except data/README.md)
 tests/                      pytest (pytest.ini sets pythonpath=.)
 ```
 
@@ -327,21 +338,25 @@ All signals degrade gracefully when columns are missing (skip + RiskResult.warni
 Risk flags are **review evidence, not verdicts**: wording must say "pattern consistent with ..."
 not "cheated".
 
-## screening/llm.py (NVIDIA NIM, OpenAI-compatible)
+## screening/llm.py (OpenAI-compatible chat client; NVIDIA endpoint by default)
 
 ```python
-def resolve_api_key(explicit: str | None = None) -> str | None   # explicit > env NVIDIA_API_KEY
+def resolve_api_key(explicit: str | None = None, env_name: str | None = None) -> str | None
+    # explicit > env var env_name (default LLMConfig().api_key_env, i.e. NVIDIA_API_KEY)
 def redact_pii(text: str, names: list[str] | None = None) -> str  # emails, phones, URLs, names -> [REDACTED_*]
 class LLMError(Exception)
-class NIMClient:
-    def __init__(self, cfg: LLMConfig, api_key: str, client: Any | None = None)  # client injectable for tests
+class LLMClient:
+    def __init__(self, cfg: LLMConfig, api_key: str | None, client: Any | None = None)  # client injectable for tests
     def test_connection(self) -> tuple[bool, str]
-    def chat_json(self, system: str, user: str, *, max_tokens: int | None = None) -> dict
+    def chat_json(self, system: str, user: str, *, max_tokens: int | None = None,
+                  required_keys: tuple[str, ...] = ()) -> dict
         # retries w/ exponential backoff + jitter on 429/5xx/timeouts/connection errors and on
-        # unparseable JSON (re-ask once with "Return ONLY valid JSON"); disk cache keyed by
+        # unparseable JSON (re-ask once with "Return ONLY valid JSON"); moves to the next
+        # cfg.fallback_models entry on 404/410; disk cache keyed by
         # sha256(model|PROMPT_VERSION|system|user) under cfg.cache_dir; temperature from cfg.
+def create_client(cfg: LLMConfig, api_key: str | None = None) -> LLMClient | None
 def rescore_candidates(candidate_ids, candidates: pd.DataFrame, parsed_by_candidate, cfg: AppConfig,
-                       client: NIMClient, progress_cb=None) -> dict[str, dict]
+                       client: LLMClient | None, progress_cb=None) -> dict[str, dict]
     # -> {id: {"ok": bool, "score": 0..1, "rationale": str, "highlights": [str], "source": "llm"|"cache", "error": str}}
 def explain_candidates(candidate_ids, candidates, parsed_by_candidate, risk_result, cfg, client,
                        progress_cb=None) -> dict[str, dict]
@@ -352,8 +367,12 @@ def summarize_clusters(risk_result, candidates, cfg, client, progress_cb=None) -
 def executive_summary(result: PipelineResult, client) -> dict   # {"ok", "markdown", "error"}
 ```
 
-* Uses `openai.OpenAI(base_url=cfg.base_url, api_key=..., timeout=cfg.timeout_sec, max_retries=0)`
-  and `client.chat.completions.create(model=..., messages=..., temperature=..., max_tokens=...)`.
+* The chat client comes from `llm_backends.build_chat_client(cfg, api_key)`: for the default provider
+  `openai.OpenAI(base_url=cfg.base_url, api_key=..., timeout=cfg.timeout_sec, max_retries=0)`, with
+  `cfg.request_extras` added to every request; for provider "tachyon", `TachyonShim`. llm.py only
+  calls `client.chat.completions.create(model=..., messages=..., temperature=..., max_tokens=...)`;
+  `llm_backends.classify_error` / `describe_error` turn client exceptions into retry, model
+  fallback or fatal, with key-free messages.
 * Concurrency: ThreadPoolExecutor(cfg.max_concurrency); progress_cb(done, total, detail) from the
   calling thread; one failure never aborts the batch.
 * Every prompt: redacted resume text (truncate to max_input_chars), no names/emails/phones,
@@ -369,6 +388,13 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes                      # utf-8-sig for
 def build_excel_report(result: PipelineResult, llm_notes: dict | None = None) -> bytes
     # sheets: Summary, Shortlist, All Candidates, Integrity Evidence (flagged candidates with
     # reasons + linked candidates), Risk Clusters, Risk Pairs, Commonality, Data Quality, Config
+    # llm_notes (built by ui/tab_shortlist.export_llm_notes from the session; every key optional):
+    #   "candidates": {id: {"summary", "strengths", "gaps"}} -> "AI Notes (LLM)" column on
+    #                 Shortlist and Integrity Evidence
+    #   "clusters": {cluster_id: {"headline", "summary", "recommended_actions"}} -> "AI Headline
+    #               (LLM)", "AI Summary (LLM)", "AI Recommended Actions (LLM)" on Risk Clusters
+    #   "executive_summary": {"ok", "markdown"} -> "AI executive summary (LLM-generated - verify
+    #                        before acting)" block on Summary
 def build_evidence_pack(result: PipelineResult, candidate_id: str) -> str   # markdown for recruiters
 ```
 
@@ -389,13 +415,19 @@ college_capped, data_flags, extra_*.
 ## UI (app.py + ui/)
 
 Brand palette: red `#D71E28` / `#BA0C2F`, gold `#FFCD00` / `#F1B521`, slate `#1A1A1A` /
-`#333333`, background `#F9F9F9`. Header banner (red gradient + gold rule), KPI cards
-(Total Processed, Shortlisted, Risk Flags (High/Medium), Average Score, Perfect Scorers),
-4 tabs: Candidate Shortlist & Leaderboard; Integrity & Risk Intelligence; Individual Deep-Dive;
-Config & Rubric Tuning. Heavy work cached (`st.cache_data` keyed by file hashes + config
-fingerprint). LLM actions are explicit buttons with progress and graceful "no API key" state;
-API key resolved as env `NVIDIA_API_KEY`, then `st.secrets["NVIDIA_API_KEY"]` (guard missing
-secrets file), shown only as "configured" (never the value).
+`#333333`, background `#F9F9F9`. Header banner (red gradient + gold rule; eyebrow text from env
+`APP_BRAND_EYEBROW`, else the built-in `BRAND_EYEBROW` default in theme.py), KPI cards
+(Total Processed, Shortlisted, Risk Flags (High/Medium), Average Score, Perfect Scorers).
+Tabs before the first run: Getting started; Config & Rubric Tuning; Run History. After a run, 8 tabs
+in `state.TAB_LABELS` order: Candidate Shortlist & Leaderboard; Integrity & Risk Intelligence;
+Individual Deep-Dive; Compare Candidates; Campus Distribution; Ask the Data; Run History;
+Config & Rubric Tuning. The four feature tabs are imported lazily (`app.ENABLED_FEATURE_TABS`); one
+that fails to import is hidden instead of breaking the app. Heavy work is cached per session in
+`st.session_state` (`prepare_data` once per input fingerprint; `evaluate` memoised on inputs, config
+and LLM results); the column-mapping preview uses `st.cache_data`. LLM actions are explicit buttons
+with progress and graceful "no API key" state; API key resolved as env `cfg.llm.api_key_env`
+(default `NVIDIA_API_KEY`), then `st.secrets` under the same name (guard missing secrets file),
+shown only as "configured" (never the value).
 
 ## HackerRank for Work fields (addendum)
 
@@ -438,9 +470,9 @@ Risk usage (in addition to the signals above):
   direction) -> weight cfg.risk.pair_weights["plagiarism_match"]; included when at least one
   side is in the focus group (the matched "source" may have scored < 100%).
 
-## v1.1 features (shortlist controls, compare, ask-the-data, run history, deployment)
+## Shortlist controls, comparison, ask-the-data, run history and deployment
 
-Wiring already in place: `ui/state.py` has `TAB_COMPARE`, `TAB_CAMPUS`, `TAB_ASK`, `TAB_HISTORY`,
+Wiring: `ui/state.py` has `TAB_COMPARE`, `TAB_CAMPUS`, `TAB_ASK`, `TAB_HISTORY`,
 `K_COMPARE_IDS`, `K_ASK_HISTORY`, `K_LOADED_RUN`; `app.py` renders `ui/tab_compare.py`,
 `ui/tab_campus.py`, `ui/tab_ask.py`, `ui/tab_history.py` (each `render(result: PipelineResult | None)`;
 `tab_history.render(None)` also runs before the first screening). `ShortlistConfig.college_cap_pct`
@@ -465,12 +497,12 @@ a candidate whose college already holds cap_n shortlist places (Shortlisted + In
 don't count) is not shortlisted: STATUS_NOT, COLLEGE_CAPPED True, reason "College cap reached: <college>
 already has <n> shortlisted (cap <pct>%)"; the next-best candidates fill the slots (top_n / top_pct).
 Threshold method: capped candidates are excluded, no backfill below the threshold. Unknown college is
-never capped. cap 0 -> identical behaviour to before (COLLEGE_CAPPED False everywhere).
+never capped. cap 0 -> no cap at all (COLLEGE_CAPPED False everywhere).
 
 ### What-if preview (ui/tab_config.py)
-Form gets a second submit button "Preview impact": evaluate(prepared, candidate_cfg) and show
+The form has a second submit button "Preview impact": evaluate(prepared, candidate_cfg) and show
 analytics.shortlist_diff(current, preview) (summary metrics, entering, leaving, status changes, rank moves)
-with "Apply these changes" / "Discard". Disabled before the first run.
+with "Apply these changes" / "Discard preview". Disabled before the first run.
 
 ### Compare (ui/tab_compare.py) - 2-4 candidates side by side; "Add to compare" button in ui/tab_deepdive.py.
 ### Ask the Data (screening/ask.py + ui/tab_ask.py)
@@ -483,3 +515,6 @@ RunStore(base_dir = env SCREENING_RUNS_DIR or <project>/runs): save / list_runs 
 compare_runs. JSON + Parquet + JSON.gz only (never pickle); run_id validated (no path traversal); atomic
 writes. Loading restores PreparedData + PipelineResult + config + LLM stores so the run can be re-tuned.
 ### Deployment (docs/DEPLOYMENT.md + scripts/setup.ps1|.sh, scripts/run_app.ps1|.sh) for a company VM.
+Listens on 127.0.0.1 by default (`[server] address` in .streamlit/config.toml and the run scripts'
+default); `-Address 0.0.0.0` / `--address 0.0.0.0` (or `STREAMLIT_SERVER_ADDRESS` without the scripts)
+exposes it on the intranet. The synthetic sample is generated on each machine (data/ is gitignored).

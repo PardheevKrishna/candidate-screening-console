@@ -98,7 +98,9 @@ until its browser tab has been closed for about two minutes.
 
 **Option A: Git (preferred).** Clone or pull from the internal repository into
 `C:\apps\hiring-screening` or `/opt/hiring-screening`. Ignored files (data, secrets, caches,
-virtual environments) are never in the repository, so nothing unwanted comes along.
+virtual environments) are never in the repository, so nothing unwanted comes along. That includes the
+synthetic sample: everything under `data/` except `data/README.md` is ignored, so generate the sample
+on the VM when you need it (section 14).
 
 **Option B: an archive.** Build it from a clean copy that contains only what the app needs:
 
@@ -110,7 +112,7 @@ virtual environments) are never in the repository, so nothing unwanted comes alo
 
 | Path | Why |
 |---|---|
-| `data/` | Candidate data (real TA feeds and resumes are personal data); the synthetic sample can be regenerated on the VM |
+| `data/` | Candidate data (real TA feeds and resumes are personal data); the synthetic sample is generated on the VM with `python generate_mock_data.py` (section 14) |
 | `runs/` | Saved runs contain candidate personal data and belong to the machine that created them |
 | `.cache/` | LLM response cache; machine-specific and rebuilt automatically |
 | `.streamlit/secrets.toml` | API keys; create a new one on the VM (section 5.2) |
@@ -277,13 +279,13 @@ python3.11 -m venv /opt/venvs/hiring-screening
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `NVIDIA_API_KEY` | API key for the hosted LLM provider configured today. Leave it unset to run without LLM features. Takes precedence over `.streamlit/secrets.toml`. | unset |
+| `NVIDIA_API_KEY` | API key for the hosted LLM provider of the default configuration. Leave it unset to run without LLM features. Takes precedence over `.streamlit/secrets.toml`. | unset |
 | `TACHYON_API_KEY` (or the name set in `api_key_env`) | Replaces `NVIDIA_API_KEY` after switching to the internal LLM wrapper ([SWITCH_TO_TACHYON.md](SWITCH_TO_TACHYON.md)). No key is needed if the wrapper authenticates by itself. | unset |
 | `SCREENING_RUNS_DIR` | Folder for saved runs (Run History). Put it on a data disk with backups and restricted access. | `<project>/runs` |
-| `APP_BRAND_EYEBROW` | The small line of text above the title in the header banner, for example a team or environment name | built-in brand text |
+| `APP_BRAND_EYEBROW` | The small line of text above the title in the header banner, for example a team or environment name. The app reads it once, so restart it after a change. | `WELLS FARGO · TALENT ACQUISITION` (built into `ui/theme.py`) |
 | `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | Outbound proxy for LLM calls (pip uses them as well). List internal hosts, such as an internal LLM gateway, in `NO_PROXY`. | unset |
 | `SSL_CERT_FILE` / `SSL_CERT_DIR` | CA bundle for LLM calls. Without it, the Windows certificate store or the Linux system CA bundle is used. | unset |
-| `STREAMLIT_<SECTION>_<OPTION>` | Any Streamlit setting, for example `STREAMLIT_BROWSER_SERVER_ADDRESS` (5.3) | unset |
+| `STREAMLIT_<SECTION>_<OPTION>` | Any Streamlit setting, for example `STREAMLIT_BROWSER_SERVER_ADDRESS` or `STREAMLIT_SERVER_ADDRESS` (5.3) | unset |
 
 Set them in the shell before an interactive start (`$env:NAME = 'value'` in PowerShell,
 `export NAME=value` in bash), or in the service definition (section 7). Keep API keys out of
@@ -312,16 +314,18 @@ The UI only ever shows "LLM: configured", never the key. Rotate any key that may
 
 ### 5.3 Streamlit settings
 
-`.streamlit/config.toml` in the project holds the settings that are the same everywhere. The run
-scripts add the per-machine ones. To change anything per machine, use command-line options of the
-run scripts or `STREAMLIT_*` environment variables, so upgrades never overwrite your changes.
-Precedence: command-line flag, then `STREAMLIT_*` environment variable, then the project's
-`.streamlit/config.toml`, then the service account's `~/.streamlit/config.toml`.
+`.streamlit/config.toml` in the project holds the settings that are the same everywhere, including
+the safe default listen address `127.0.0.1`: even `streamlit run app.py` started without the run
+scripts accepts connections from the same machine only. The run scripts add the per-machine settings.
+To change anything per machine, use command-line options of the run scripts or `STREAMLIT_*`
+environment variables, so upgrades never overwrite your changes. Precedence: command-line flag, then
+`STREAMLIT_*` environment variable, then the project's `.streamlit/config.toml`, then the service
+account's `~/.streamlit/config.toml`.
 
 | Setting | Value | Where it is set | Notes |
 |---|---|---|---|
 | `server.port` | `8501` | run scripts (`-Port` / `--port`) | The scripts never move to another port silently; a busy port is an error |
-| `server.address` | `127.0.0.1` | run scripts (`-Address` / `--address`) | `127.0.0.1` = this machine only (behind a reverse proxy); `0.0.0.0` = all interfaces (section 8) |
+| `server.address` | `127.0.0.1` | config.toml (`[server] address`, the default); run scripts (`-Address` / `--address`); `STREAMLIT_SERVER_ADDRESS` | `127.0.0.1` = this machine only (behind a reverse proxy); `0.0.0.0` = all interfaces (section 8). The run scripts always pass an address (default `127.0.0.1`), which overrides `STREAMLIT_SERVER_ADDRESS`, so with the scripts use `-Address` / `--address`; the variable applies when Streamlit is started directly |
 | `server.headless` | `true` | run scripts | No browser window and no first-run prompt; required for services |
 | `server.fileWatcherType` | `none` | run scripts | No reloads when files change; restart after an upgrade |
 | `browser.gatherUsageStats` | `false` | config.toml and run scripts | No usage statistics are sent |
@@ -379,7 +383,14 @@ bash /opt/hiring-screening/scripts/run_app.sh --venv /opt/venvs/hiring-screening
 
 The scripts always start the app from the project folder, because `.streamlit/` and `.cache/`
 are resolved from the working directory. The app is ready when it prints its URL, usually within
-a few seconds. Then open `http://<vm-name>:8501` and run the smoke test (section 14).
+a few seconds. Then open `http://<vm-name>:8501` (or `http://127.0.0.1:8501` on the VM itself when
+it listens on `127.0.0.1`) and run the smoke test (section 14).
+
+Started without the scripts (`python -m streamlit run app.py` from the project folder), the app also
+listens on `127.0.0.1` only, because `.streamlit/config.toml` sets that address. To expose it on the
+intranet that way, set `STREAMLIT_SERVER_ADDRESS=0.0.0.0` (or pass `--server.address 0.0.0.0`). Prefer
+the scripts for anything beyond a quick check: they also set headless mode, switch off file watching
+and check the port.
 
 ## 7. Run as a service
 
@@ -764,9 +775,10 @@ Run these from the project folder with the virtual environment's Python
 
 1. **Tests:** `python -m pytest -p no:cacheprovider`. All tests pass (several hundred, about a minute).
    The setup scripts already ran them unless `-NoTests` / `--no-tests` was used.
-2. **Synthetic data:** `python generate_mock_data.py --quick` writes 300 fictional candidates and
-   about 290 resumes to `data/sample/` in a few seconds. Without `--quick` it writes the full
-   3,000-candidate dataset (a few minutes, about 90 MB).
+2. **Synthetic data:** the sample is not part of the repository or a release archive, so generate it
+   on the VM. `python generate_mock_data.py --quick` writes 300 fictional candidates and about 290
+   resumes to `data/sample/` in a few seconds, plus `resumes.zip` (used in step 4) unless you add
+   `--no-zip`. Without `--quick` it writes the full 3,000-candidate dataset (a few minutes, about 90 MB).
 3. **UI:** start the app (section 6 or 7), open it in a browser from a recruiter's machine and click
    **Load synthetic sample & run**. Expect the KPI cards, a ranked shortlist, risk clusters in
    Integrity & Risk Intelligence and a candidate profile in Individual Deep-Dive. Download the CSV
@@ -786,6 +798,7 @@ Run these from the project folder with the virtual environment's Python
 | Symptom | Cause and fix |
 |---|---|
 | `Port 8501 is already in use ...` or `Port 8501 is not available` | Another program (often a second copy of the app) listens on that port. Find it with `Get-NetTCPConnection -LocalPort 8501 -State Listen` and `Get-Process -Id <pid>` (Windows) or `sudo ss -ltnp 'sport = :8501'` (Linux). Stop it or choose another `-Port` / `--port` (and update the proxy and firewall). |
+| The app works in a browser on the VM itself, but other machines cannot connect | It listens on `127.0.0.1`, the default from `.streamlit/config.toml` and the run scripts. Start it with `-Address 0.0.0.0` / `--address 0.0.0.0` (or `STREAMLIT_SERVER_ADDRESS=0.0.0.0` without the scripts) and allow the port in the firewall, or publish it through the reverse proxy (section 8). |
 | `Python 3.11 (64-bit) is required` | Install Python 3.11 64-bit for all users (section 2), check with `py -0p` (Windows) or `python3.11 --version`, or pass `-PythonExe` / `--python`. 32-bit Python cannot install the pinned packages. |
 | `ensurepip is not available` (Debian/Ubuntu) | `sudo apt install python3.11-venv` (or `python3-venv` on Debian 12), then run setup again. |
 | pip: `ProxyError`, `Connection timed out`, `Could not fetch URL` | No route to the index. Set `HTTPS_PROXY`, or use the internal mirror (`-IndexUrl`) or an offline wheelhouse (4.4). |

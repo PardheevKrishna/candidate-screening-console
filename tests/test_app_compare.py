@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - tests/ imported as rootdir-relative mo
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
 FP = "fake-fingerprint"
+KEY_ENV = AppConfig().llm.api_key_env  # env var / secret name of the LLM API key, from the config
 PAGE = "_compare_test_page"
 SPEC_ROWS = ["Rank", "Status", "Final score", "HackerRank %", "HackerRank pts", "Skills pts", "Experience pts",
              "Education pts", "Required skills matched", "Internships", "Experience months", "Projects",
@@ -60,7 +61,7 @@ def _page() -> None:
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv(KEY_ENV, raising=False)
     monkeypatch.setitem(vars(pipeline), "DEFAULT_SAMPLE_DIR", tmp_path / "no-sample")
 
 
@@ -85,7 +86,7 @@ def engine(monkeypatch: pytest.MonkeyPatch, fake: tuple[pipeline.PreparedData, P
 
 
 def _inject(at: AppTest, prepared: Any, result: PipelineResult, **values: Any) -> AppTest:
-    at.secrets["NVIDIA_API_KEY"] = ""  # never read a real secrets.toml during tests
+    at.secrets[KEY_ENV] = ""  # never read a real secrets.toml during tests
     at.session_state[state.K_CONFIG] = result.config
     at.session_state[state.K_RESULT] = result
     if prepared is not None:
@@ -243,7 +244,7 @@ def test_compare_tolerates_minimal_result(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_compare_without_result_shows_info() -> None:
     at = AppTest.from_function(_page, default_timeout=60)
-    at.secrets["NVIDIA_API_KEY"] = ""
+    at.secrets[KEY_ENV] = ""
     at.run()
     _assert_clean(at)
     assert any("No candidates to compare" in i.value for i in at.info)

@@ -126,20 +126,67 @@ def md_escape(value: object) -> str:
     return _MD_SPECIAL.sub(r"\\\1", "" if value is None else str(value))
 
 
-_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
-_MD_LINK = re.compile(r"\[([^\]]*)\]\((?:https?|ftp|data|javascript):[^)]*\)", re.IGNORECASE)
+# Link text / image alt: escapes, soft line breaks and one level of nested brackets.
+_MD_TEXT = r"(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n)|\[[^\[\]\n]*\])*"
+_MD_DEST = r"(?:\\[\s\S]|[^()\\\n]|\([^()\n]*\))*"   # destination and title: one level of nested parentheses
+# Image or link: inline "![alt](url)" / "[text](url 'title')", or reference "[text][ref]",
+# "[text][]", "[text]" (the reference forms only matter when a definition exists). Escape
+# pairs are matched first so an escaped "\[" never starts a link, as in Markdown itself.
+_MD_LINK = re.compile(rf"\\[\s\S]|!?\[({_MD_TEXT})\](?:\(({_MD_DEST})\)|\[([^\[\]\n]*)\])?")
+# Link reference definition: '[ref]: https://... "title"' alone on a line (invisible when rendered).
+_MD_LINK_DEF = re.compile(
+    r"^ {0,3}\[([^\[\]\n]+)\]:[ \t]*(?:<[^<>\n]*>|[^\s<]\S*)"
+    r"(?:[ \t]+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*\r?(?:\n|$)",
+    re.MULTILINE,
+)
+_MD_AUTOLINK = re.compile(r"<((?:[A-Za-z][A-Za-z0-9+.\-]{1,31}:|[^<>\s@]+@)[^<>\s]*)>")  # <https://x>, <a@b.c>
+_MD_BARE_URL = re.compile(r"(?i)(?<![a-z0-9])(https?:(?=//)|www(?=\.))")  # what GFM turns into links
 _HTML_TAG = re.compile(r"<[^>]{1,200}>")
 
 
+def _md_label(label: str) -> str:
+    """Reference label as Markdown matches it: case-insensitive, whitespace collapsed."""
+    return " ".join(label.split()).casefold()
+
+
+def _escape_unescaped(text: str, char: str) -> str:
+    """Backslash-escape every ``char`` that is not already escaped.
+
+    Scans left to right over escape pairs ("\\x"), so "\\[" stays as it is while the
+    "[" in "\\\\[" (an escaped backslash) gets escaped.
+    """
+    return re.sub(rf"\\[\s\S]|{re.escape(char)}",
+                  lambda m: m.group(0) if len(m.group(0)) == 2 else "\\" + char, text)
+
+
 def safe_markdown(text: object) -> str:
-    """LLM-written Markdown with images, external links and HTML tags neutralised.
+    """LLM-written Markdown with images, links, raw HTML and math neutralised.
 
     Model output can be steered by resume content, so nothing in it may make the
-    browser fetch a URL (image beacons / link exfiltration).
+    browser fetch a URL (image beacons) or offer a link (exfiltration). Images and
+    links (inline and reference-style) are replaced by their visible text, link
+    reference definitions (never visible) are dropped, autolinks and bare URLs stay as
+    plain, unlinked text (a zero-width space keeps GFM from linking them), and every
+    remaining "[" is escaped so no link or image syntax can survive in any form.
     """
-    out = _MD_IMAGE.sub(lambda m: m.group(1), "" if text is None else str(text))
-    out = _MD_LINK.sub(lambda m: m.group(1), out)
-    return _HTML_TAG.sub("", out).replace("$", r"\$")
+    out = "" if text is None else str(text)
+    labels = {_md_label(m.group(1)) for m in _MD_LINK_DEF.finditer(out)}
+    out = _MD_LINK_DEF.sub("", out)
+
+    def visible(m: re.Match[str]) -> str:
+        text, inline, ref = m.groups()
+        if text is not None and (inline is not None or _md_label(ref or text) in labels):
+            return text
+        return m.group(0)   # an escape pair, or "[1]" / "[a][b]" without a definition (plain text)
+
+    for _ in range(8):  # links nested in link text / image alt
+        unlinked = _MD_LINK.sub(visible, out)
+        if unlinked == out:
+            break
+        out = unlinked
+    out = _HTML_TAG.sub("", _MD_AUTOLINK.sub(r"\1", out))
+    out = _MD_BARE_URL.sub("\\1\u200b", _escape_unescaped(out, "["))
+    return _escape_unescaped(out, "$")
 
 
 def inject_css() -> None:

@@ -15,6 +15,7 @@ from streamlit.testing.v1 import AppTest
 
 from screening import llm, pipeline
 from screening import schema as S
+from screening.config import LLMConfig
 from screening.models import PipelineResult
 from ui import state, tab_ask
 
@@ -25,6 +26,7 @@ except ImportError:  # pragma: no cover - tests/ imported as rootdir-relative mo
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
 FP = "fake-fingerprint"
+KEY_ENV = LLMConfig().api_key_env  # env var / secret name of the LLM API key, from the config
 # Renders only this tab, so the tests do not depend on which feature tabs app.py enables.
 HARNESS = """
 import streamlit as st
@@ -68,7 +70,7 @@ def fake() -> tuple[pipeline.PreparedData, PipelineResult]:
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv(KEY_ENV, raising=False)
     monkeypatch.setitem(vars(pipeline), "DEFAULT_SAMPLE_DIR", tmp_path / "no-sample")
     FakeLLM.calls = []
     FakeLLM.replies = {}
@@ -76,14 +78,14 @@ def _isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 @pytest.fixture
 def llm_on(monkeypatch: pytest.MonkeyPatch) -> type[FakeLLM]:
-    monkeypatch.setenv("NVIDIA_API_KEY", "dummy-test-value")
+    monkeypatch.setenv(KEY_ENV, "dummy-test-value")
     monkeypatch.setitem(vars(llm), "LLMClient", FakeLLM)
     return FakeLLM
 
 
 def _harness(result: PipelineResult, prepared: Any = None) -> AppTest:
     at = AppTest.from_string(HARNESS, default_timeout=60)
-    at.secrets["NVIDIA_API_KEY"] = ""  # never read a real secrets.toml during tests
+    at.secrets[KEY_ENV] = ""  # never read a real secrets.toml during tests
     at.session_state[state.K_CONFIG] = result.config
     at.session_state[state.K_RESULT] = result
     at.session_state[state.K_PREPARED_FP] = FP
@@ -124,7 +126,7 @@ def test_tab_without_llm_is_disabled_with_a_friendly_message(fake: tuple[Any, Pi
 
 def test_tab_without_a_result_asks_for_a_run() -> None:
     at = AppTest.from_string(HARNESS, default_timeout=60)
-    at.secrets["NVIDIA_API_KEY"] = ""
+    at.secrets[KEY_ENV] = ""
     at.run()
     _assert_clean(at)
     assert any("Run a screening first" in i.value for i in at.info)
@@ -247,7 +249,7 @@ def test_full_app_ask_tab(fake: tuple[Any, PipelineResult], monkeypatch: pytest.
     monkeypatch.setitem(vars(pipeline), "evaluate",
                         lambda prep, cfg, llm_results=None, *, risk_result=None: replace(result, config=cfg))
     at = AppTest.from_file(APP, default_timeout=60)
-    at.secrets["NVIDIA_API_KEY"] = ""
+    at.secrets[KEY_ENV] = ""
     at.session_state[state.K_CONFIG] = result.config
     at.session_state[state.K_PREPARED] = prepared
     at.session_state[state.K_PREPARED_FP] = FP

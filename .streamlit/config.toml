@@ -14,9 +14,14 @@ maxUploadSize = 1024
 # on file uploads, and origin checks on the browser connection.
 enableXsrfProtection = true
 enableCORS = true
-# Port, listen address, headless mode and file watching are set per machine by
-# scripts/run_app.ps1 / scripts/run_app.sh or by STREAMLIT_* environment variables, so this
-# file stays the same on every machine. See docs/DEPLOYMENT.md ("Configuration").
+# Listen on this machine only (the app has no login), also when it is started with a plain
+# "streamlit run app.py". For intranet use, override it: scripts/run_app.ps1 -Address 0.0.0.0
+# or scripts/run_app.sh --address 0.0.0.0 (the run scripts always pass --server.address,
+# default 127.0.0.1), or STREAMLIT_SERVER_ADDRESS=0.0.0.0 when Streamlit is started directly.
+address = "127.0.0.1"
+# Port, headless mode and file watching are set per machine by scripts/run_app.ps1 /
+# scripts/run_app.sh or by STREAMLIT_* environment variables, so this file stays the same on
+# every machine. See docs/DEPLOYMENT.md ("Configuration").
 
 [browser]
 # Never send usage statistics.
