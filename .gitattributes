@@ -2,3 +2,15 @@
 * text=auto
 *.sh text eol=lf
 *.ps1 text eol=crlf
+
+# Binary formats: never touch line endings (would corrupt PDFs/Office files on checkout).
+*.pdf binary
+*.docx binary
+*.xlsx binary
+*.xls binary
+*.zip binary
+*.gz binary
+*.parquet binary
+*.png binary
+*.jpg binary
+*.jpeg binary

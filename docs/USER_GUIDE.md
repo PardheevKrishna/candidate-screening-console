@@ -43,6 +43,8 @@ This guide explains every screen, setting, export and calculation in the Candida
 11. [FAQ and troubleshooting](#faq-and-troubleshooting)
     - [Data and runs](#data-and-runs) · [Scores and ranks](#scores-and-ranks) · [Integrity questions](#integrity-questions) · [LLM questions](#llm-questions)
 12. [Glossary](#glossary)
+13. [New features in detail](#new-features-in-detail)
+   - [Compare Candidates](#tab-compare-candidates) · [Campus Distribution](#tab-campus-distribution) · [Ask the Data](#tab-ask-the-data) · [Run History](#tab-run-history) · [College cap and What-if preview](#college-cap-and-what-if-preview-config-and-rubric-tuning) · [Deploying on a company VM](#deploying-on-a-company-vm-summary) · [FAQ: new features](#faq-new-features) · [Glossary: new terms](#glossary-new-terms)
 
 ---
 
@@ -189,6 +191,9 @@ After a run the tabs are, in order:
 - Selecting a row in the shortlist table loads that candidate into **Individual Deep-Dive**; the **Open profile** button then switches to that tab.
 
 ### Optional tabs
+
+Full details for each optional tab: [New features in detail](#new-features-in-detail).
+
 
 #### Compare Candidates
 
@@ -2657,3 +2662,617 @@ On the synthetic sample, every decoy at Medium got there through HackerRank's ow
 | TF-IDF cosine similarity | A text-similarity measure that weighs distinctive words more than common ones; 1 means identical wording. Used for JD relevance and resume similarity. |
 | Trait chip | A gold pill on a cluster card naming something the members share, such as a college, an IP or identical answers |
 | Walk-in | A resume with no matching TA row; it stays unmatched in a TA-feed run |
+
+## New features in detail
+
+Full reference for the **Compare Candidates**, **Campus Distribution**, **Ask the Data** and **Run History** tabs, the college cap and **Preview impact** in **Config & Rubric Tuning**, and deployment on a company virtual machine. Short overviews are in [Optional tabs](#optional-tabs).
+
+### Tab: Compare Candidates
+
+Use this tab to put two to four candidates side by side when you need to decide between close calls. Scores, required skills, resume highlights and integrity signals are lined up in columns, and the best value in each numeric row is highlighted.
+
+#### Choosing candidates
+
+- **"Candidates to compare (2-4)"** is a searchable picker: type part of an ID or a name (the empty box says "Search by ID or name"). Each entry reads "ID - Name (status)", for example "CAND-00012 - Name (Shortlisted)". Entries are listed in rank order; candidates without a rank (ineligible) come last. You can pick up to four, and remove one with the × on its chip.
+- **Starting selection.** The first time you open the tab, the picker is filled with the top 3 shortlisted candidates by rank (status "Shortlisted" or "Shortlisted (Integrity Review)"). If fewer than two candidates are shortlisted, it takes the top 3 by overall rank instead. The hover text on the picker says the same: "Defaults to the top 3 shortlisted candidates. Add to compare in the Individual Deep-Dive tab adds candidates here too."
+- **Your picks are remembered** while you work in this browser session, also after you re-score with new settings (the columns then show the new scores and ranks). If you clear the picker it stays empty; the starting selection is not filled in again.
+- With fewer than two candidates picked, the tab shows "Pick at least 2 candidates (up to 4) to compare them side by side. You can also use Add to compare in the Individual Deep-Dive tab." If the run itself has fewer than two candidates, you see "This run has fewer than two candidates, so there is nothing to compare."
+
+#### "Add to compare" on the Individual Deep-Dive tab
+
+- The **"Add to compare"** button is in the profile header, under **"Evidence pack (.md)"**. Its hover text shows how full the list is, for example "Add this candidate to the Compare Candidates tab (2/4 selected)."
+- Clicking it adds the candidate on screen and confirms with a short pop-up message, for example "Added CAND-00012 to Compare Candidates (3/4)."
+- Once the candidate is in the list, the button reads **"In compare list"** and is greyed out (hover text: "3/4 candidates selected. Open the Compare Candidates tab to see them side by side.").
+- The list holds at most four candidates. When it is full, the hover text reads "The compare list is full (4/4). Remove a candidate in the Compare Candidates tab first.", and clicking shows "The compare list already holds 4 candidates. Remove one in Compare Candidates before adding CAND-00012." Nothing is added.
+- The picker and the button share one list. If you open Compare Candidates first, its three starting candidates are already in the list, so there is room for one more. If you use "Add to compare" before opening the tab, the list holds only the candidates you added.
+
+#### What the tab shows
+
+**Candidate cards**, one per candidate in the order picked: the name (the ID when there is no name), "ID · College", the status badge, the risk badge ("High risk", "Medium risk", "Low risk" or "No integrity flags"), "Final score", "Rank" (for example "#12"; "-" when the candidate has no rank) and **"Open profile"**. "Open profile" (hover text: "Open this candidate in the Individual Deep-Dive tab.") switches to the Individual Deep-Dive tab with that candidate loaded.
+
+**"Side-by-side metrics"**: one row per metric and one column per candidate, headed "ID · Name". The "Metric" column stays pinned on the left while you scroll sideways. A row appears only when the run has data for it.
+
+| Row | What it shows | Best value |
+|---|---|---|
+| "Rank" | Shortlist rank, for example "#3" | Lowest |
+| "Status" | Screening status | Not compared |
+| "Final score" | Rubric score out of 100, one decimal | Highest |
+| "HackerRank %" | Assessment percentage, for example "87.5%" | Highest |
+| "HackerRank pts", "Skills pts", "Experience pts", "Education pts" | Rubric points earned in each component, one decimal | Highest |
+| "Required skills matched" | Required skills matched out of the total, for example "3 / 5" | Highest |
+| "Internships" | Internships found in the resume | Highest |
+| "Experience months" | Months of experience found in the resume | Highest |
+| "Projects" | Projects found in the resume | Highest |
+| "Certifications" | Certifications found in the resume | Highest |
+| "Degree" | Degree from the TA feed, or from the resume when the feed has none | Not compared |
+| "Branch" | Branch from the TA feed | Not compared |
+| "CGPA" | CGPA from the TA feed, or from the resume when the feed has none; two decimals | Highest |
+| "College tier" | For example "Tier 1" | Not compared |
+| "Risk level" | "🔴 High", "🟠 Medium", "🟡 Low" or "🟢 Clear" | Not compared |
+| "Risk score" | Integrity risk score, 0-100 | Lowest |
+| "Cluster" | Integrity cluster, for example "C03"; "-" when none | Not compared |
+| "Resume match method" | How the resume was linked, with the match confidence, for example "email (95%)"; "no resume" when none is linked | Not compared |
+
+The "Resume match method" values are "TA resume file", "ID in file name", "email", "ID in resume text", "phone", "fuzzy name", "resume only", "unmatched" and "duplicate".
+
+**Highlighting.** The best value in each numeric row has a pale-yellow, bold cell:
+
+- Lowest is best for "Rank" and "Risk score"; highest is best for every other numeric row. Text rows are never highlighted.
+- Values are compared as shown, after rounding to the displayed decimals: 80.04 and 80.01 both show as "80.0", so both are highlighted.
+- Every candidate tied for best is highlighted. When all candidates have the same value, nothing is highlighted. A dash ("-", no value) is never highlighted.
+- The caption under the table repeats the rule: "Highlighted cells mark the best value in each numeric row, compared as shown (lower is better for rank and risk score)."
+- The highlight is a reading aid, not a recommendation: a higher number is not automatically the better hire.
+
+**"Download comparison (CSV)"** saves `candidate_comparison.csv`: a "Metric" column plus one column per candidate; rows "Candidate ID", "Name" and "College"; then every metric row with its underlying value (not rounded; ranks as plain numbers, the risk level as a word); then one row per required skill, such as "Required skill: Python", with "Matched" or "Missing". The file opens cleanly in Excel. It contains candidate names, so handle it as personal data.
+
+**"Required skills"** matrix: the "Required skill" column is pinned, and each candidate column shows ✅ or ❌. The list holds the required skills from Config & Rubric Tuning in their configured order (spelled the way scoring records them), plus any other skill that scoring recorded as matched or missing for these candidates. Caption: "✅ matched, directly or implied by a related skill (AWS counts as Cloud), exactly as in scoring · ❌ missing." A candidate without a usable resume shows ❌ for every skill. With no required skills configured the section says "No required skills are configured."; if the run holds no skill-matching data it says "Required-skill matching is not available in this run."
+
+**"Sub-scores (0-1)"** radar chart: the four components "HackerRank", "Skills", "Experience" and "Education" on a 0%-100% scale, one outline per candidate. The outlines differ in colour, line style and marker shape, so they stay distinguishable even where colours are similar. The legend is below the chart; hover over a point to see the candidate and the value. A missing sub-score is drawn at 0. If the run has no sub-scores, the chart says "Sub-scores are not available for this selection."
+
+**"Resume highlights & integrity"**: one expandable panel per candidate, titled "ID · Name", with:
+
+- "Top projects (n)": the first three projects, each with its title and up to eight technology chips ("No tech stack detected" when none was found); "No projects detected." when there are none.
+- "Internships (n)": up to four entries such as "Title - Organisation · 6 months"; "No internships detected." when there are none.
+- "Integrity signals": the candidate's integrity evidence, one line per signal (the same reasons shown in Individual Deep-Dive), or "No integrity signals recorded."
+- For a candidate without a linked resume, the panel says "No resume is linked to this candidate." and still shows the integrity signals.
+
+If unexpected data stops the comparison, the tab shows "The comparison could not be shown (...). Try a different selection." and the rest of the app keeps working.
+
+#### Under the hood
+
+- The compare list belongs to your browser session: up to four candidate IDs, shared by the picker and "Add to compare". It is not saved with runs. Duplicates and IDs that are not in the current results are dropped automatically, so they never use up a slot; if every stored ID belongs to an earlier dataset, the starting selection is used again. Opening a saved run in Run History resets the list, so Compare Candidates starts again from the top 3.
+- The skills matrix reads the same matched-skills result that scoring uses (skill synonyms and implications such as AWS ⇒ Cloud and PostgreSQL ⇒ SQL), so it always agrees with "Skills pts".
+- The tab only reads the current results. It never re-scores and never calls the LLM.
+
+### Tab: Campus Distribution
+
+Use this tab to see how applicants and the shortlist are spread across colleges and other campus attributes, to spot groups that are over- or under-represented on the shortlist, and to check the college cap. In this tab "shortlist" means candidates with status "Shortlisted" or "Shortlisted (Integrity Review)"; candidates on "Integrity Hold" are not counted as shortlisted.
+
+#### "Group by"
+
+A row of buttons: "College", "College tier", "City", "Degree" and "Branch". Only groupings with at least one recorded value in this run are offered. The first available one (normally "College") is selected at the start, and your choice is remembered for the rest of the session.
+
+- Values that differ only in upper/lower case or spacing count as one group, shown with their most common spelling.
+- Blank values and placeholders such as "N/A", "-", "null", "none", "unknown" or "not available" are collected in a group called "(unknown)".
+- College tiers are shown as "Tier 1", "Tier 2" and so on.
+- If the data has none of these attributes, the tab shows "This dataset has no campus attributes (college, tier, city, degree or branch) to group by."
+
+#### Headline cards
+
+| Card | Value | Line under the value | Hover text |
+|---|---|---|---|
+| "Colleges" (or "College tiers", "Cities", "Degrees", "Branches") | Number of distinct groups among applicants; "(unknown)" is not counted | "N with a shortlisted candidate" | "Distinct college values among applicants." When some applicants have no value, it adds for example "12 applicant(s) have no college on record and are grouped as (unknown)." |
+| "Top college share of shortlist" (the wording follows the grouping) | Share of the shortlist held by the largest group, for example "15.0%"; this can also be the "(unknown)" group | That group's name | For example "45 of 300 shortlisted; representation 1.80x". When the shortlist is empty, the card shows "-" and "Nobody is shortlisted" |
+| "Colleges over the cap" (only when a college cap is set) | Number of colleges holding more than the cap | For example "12 candidates capped out (cap 10%)" | "Colleges holding a larger share of the shortlist than the cap. This can happen when too few candidates from other colleges are available to fill the slots, when the cap rounds up to one place, or with a score threshold (no backfill)." |
+| "College cap" (when no cap is set) | "Off" | "Set it in Config & Rubric Tuning" | "Optional limit on the share of the shortlist a single college can take." |
+
+"Colleges over the cap" is always counted per college, whichever grouping is selected.
+
+#### Chart
+
+For each group, two horizontal bars: "Share of applicants" (gold) and "Share of shortlist" (red, labelled with its percentage). The group with the most shortlisted candidates is at the top.
+
+- A red bar longer than the gold bar means the group's share of the shortlist is larger than its share of applicants (over-represented); a shorter red bar means under-represented.
+- Hover over a bar to see the share of the shortlist (with the number shortlisted), the share of applicants (with the number of applicants) and the representation.
+- The chart shows at most 20 groups. When there are more, the caption says, for example, "The chart shows the 20 colleges with the most shortlisted candidates; the table lists all 57." Long names are shortened with "…".
+- Grouped by "College" with a college cap set: a dashed vertical line marks the cap ("College cap 10%"), and colleges over the cap get darker, hatched red bars and a "⚠" before their name.
+- The caption under the chart explains representation: "Representation = share of shortlist ÷ share of applicants. 1.0 means a group is shortlisted in proportion to its applicants; above 1.0 it is over-represented, below 1.0 under-represented. The shortlist counts Shortlisted and Integrity Review candidates."
+
+#### Table
+
+One row per group, sorted by "Shortlisted" (highest first), then "Applicants", then name. The first column is named after the grouping (for example "College") and stays pinned.
+
+| Column | What it shows | How it is calculated |
+|---|---|---|
+| "Applicants" | Every candidate in the group, eligible or not | Count |
+| "Eligible" | Candidates who passed the eligibility rules (status is anything but "Ineligible") | Count |
+| "Perfect scorers" | Candidates with a HackerRank score of 100% (hover text: "HackerRank 100%") | Count |
+| "Shortlisted" | Hover text: "Shortlisted + Integrity Review" | Count of "Shortlisted" and "Shortlisted (Integrity Review)" |
+| "In review" | Hover text: "Shortlisted (Integrity Review)" | Count of "Shortlisted (Integrity Review)" |
+| "Capped out" | Shown when a college cap is set. Hover text: "Would have been shortlisted but the college cap was reached" | Count |
+| "Shortlist rate" | How many eligible candidates made the shortlist (hover text: "Shortlisted ÷ eligible") | Shortlisted ÷ Eligible; blank when nobody is eligible |
+| "Share of shortlist" | The group's part of the whole shortlist | Shortlisted ÷ all shortlisted |
+| "Share of applicants" | The group's part of all applicants | Applicants ÷ all applicants |
+| "Representation" | Shown like "1.80x" (hover text: "Share of shortlist ÷ share of applicants (1.0 = proportional)") | Share of shortlist ÷ Share of applicants; blank when nobody is shortlisted |
+| "Avg final score" | Average final score, one decimal | Average |
+| "Avg HackerRank %" | Average HackerRank %, whole number | Average |
+| "Risk flagged" | Hover text: "High or Medium integrity risk" | Count of risk level "High" or "Medium" |
+| "Over cap" | Ticked for a college over the cap. Shown only when grouping by "College" with a cap set | Share of shortlist above the cap percentage |
+
+**Over-cap highlighting.** When grouping by "College" and at least one college is over the cap, those rows are shaded light red and the caption reads, for example, "Shaded rows hold more than the 10% college cap of the shortlist."
+
+#### Why a college can show "Over cap"
+
+The cap limits how many shortlist places each college may take, and that number is worked out from the number of slots the shortlist rule aims for. "Over cap" compares a college's places with the shortlist that actually resulted. The two can differ in three situations:
+
+1. **Not enough candidates from other colleges ("Top N" or "Top % of eligible").** If the ranking runs out of eligible candidates from other colleges before every slot is filled, the shortlist ends up shorter than planned, so each college's places are a bigger share of it. Example: "Top N" 4 with a 25% cap allows 1 place per college; if the eligible candidates come from only three colleges, the shortlist has 3 people and each college holds 33%.
+2. **The cap never drops below one place.** Every college may always have at least one place. Example: a 5% cap on a 10-place shortlist works out to half a place, so each college still gets 1 place, which is 10% of the shortlist.
+3. **"Score threshold" has no backfill.** Capped candidates are excluded and nobody takes their places, so the shortlist is smaller than the number of candidates at or above the threshold. Example: 100 candidates reach the threshold and the cap is 10%, so each college may have 10 places; if 20 candidates are capped out, the shortlist has 80 people and a college with 10 places holds 12.5%. Integrity holds under "Hold & backfill" shrink a threshold shortlist in the same way.
+
+In every case no college holds more than its allowed number of places; "Over cap" only means that number is a larger share of the shortlist than the percentage you set.
+
+#### Download
+
+**"Distribution by college (CSV)"** (the wording follows the grouping, for example "Distribution by city (CSV)") saves `campus_distribution_by_college.csv` (or `..._college_tier`, `..._city`, `..._degree`, `..._branch`). It has one row per group and every column of the table, including "Capped out" and "Over cap", under internal names: the grouping (for example `college`), `applicants`, `eligible`, `perfect_scorers`, `shortlisted`, `in_review`, `capped_out`, `shortlist_rate`, `share_of_shortlist`, `share_of_applicants`, `representation`, `avg_final_score`, `avg_hackerrank_pct`, `flagged` (= "Risk flagged") and `over_cap`. Rates and shares are fractions (0.25 = 25%). The file holds counts and averages only, no candidate details. The button is greyed out when there is nothing to download.
+
+#### Under the hood
+
+- Grouping compares values the same way as the college cap (upper/lower case and extra spaces ignored), so this tab and the cap always agree on what counts as one college. Different names for the same institution, such as an abbreviation and the full name, remain separate groups.
+- "Perfect scorers" counts a HackerRank score of 100% (with a tiny rounding tolerance). It does not follow the integrity focus-group threshold in Config & Rubric Tuning.
+- A college is over the cap when Shortlisted × 100 > cap % × all shortlisted. The comparison is exact, so a college sitting exactly at the cap is not flagged. "(unknown)" is never over the cap.
+- Everything is computed from the current results; the tab updates as soon as you re-score and never calls the LLM.
+
+### Tab: Ask the Data
+
+Ask questions about the current screening results in plain English, such as "Average final score by college tier", and get the answer as a table, often with a chart. The LLM only translates your question into a small, structured query plan. The app checks that plan and runs it itself on this run's results, so the numbers come from your data, not from the LLM, and the LLM never receives candidate records.
+
+The tab appears once a screening has run or a saved run is open, and it needs the LLM to be configured.
+
+#### What you can ask
+
+- **Counts and statistics**, optionally broken down by up to three columns: how many, total, average, median, lowest, highest and number of different values, per college, tier, city, branch, status, risk level, cluster and so on.
+- **Filtered lists of candidates**: who matches some conditions, with the columns you ask for, sorted, for example the top 20.
+- Any column of the current results can be used: scores, rubric points and sub-scores, status and status reason, college and other campus fields, skills, resume counts, integrity fields (risk level, risk score, cluster, perfect scorer), assessment timing and proctoring fields, data flags and "College capped". Answer hashes and resume hashes are the only exception.
+- Lists can include personal columns such as name or email when you ask for them. The answer is built inside the app, and those values are never sent to the LLM.
+
+Built-in examples, under **"Try an example"**:
+
+- "How many perfect scorers are shortlisted per college?"
+- "Which colleges have the most High-risk candidates?"
+- "Average final score by college tier"
+- "List shortlisted candidates from Pune with CGPA above 9"
+- "How many candidates are under integrity review by cluster?"
+
+More questions of the same kind: "Median HackerRank % by branch", "How many candidates were capped out by the college cap, per college?", "Shortlisted candidates missing SQL, sorted by final score". Tip: the average of a yes/no column is a share between 0 and 1, for example the share of perfect scorers per college.
+
+**How common words are read.** The LLM is told that "shortlisted" means "Shortlisted" or "Shortlisted (Integrity Review)", "under integrity review" means "Shortlisted (Integrity Review)", "on hold" means "Integrity Hold", "flagged" or "high/medium risk" means risk level "High" or "Medium", "perfect scorers" means a HackerRank % of 100, and clustered candidates are those with a cluster ID (C01, C02, ...). Check "How this was answered" to confirm how your question was read.
+
+**What it cannot answer.** The LLM is instructed to decline the following, which then come back with the blue note "This question can't be answered from the screening results." followed by the reason:
+
+- Questions that need data the results do not contain, such as interview feedback or other hiring drives.
+- Opinions, predictions or judgements, such as "Who will be the best hire?".
+- Anything about protected attributes: gender, age, religion, caste, ethnicity, nationality, marital status or disability.
+- Requests to change data, such as "Move CAND-00012 to the shortlist".
+
+A query plan can only filter, group, apply the calculations listed below, sort and limit rows. It cannot combine columns (for example a ratio or difference between two columns), so such questions may be refused or answered only in part; check "How this was answered".
+
+#### Asking a question
+
+1. Click a question under **"Try an example"** (it is asked straight away), or type your own in the box at the bottom ("Ask about this screening run, e.g. average final score by college tier"; up to 500 characters) and press Enter.
+2. While the app works, you see "Planning the query and running it on the current results...".
+3. Your question and its answer appear as a conversation, newest at the bottom.
+
+- Before the first question the tab shows "No questions yet: pick an example above or type your own below."
+- **"Clear conversation"** (top right) removes all questions and answers. It is greyed out when there are none.
+- The conversation keeps your last 20 questions. It belongs to your browser session, is not saved with runs, and starts afresh when a different dataset is loaded (a screening of other files, or opening a saved run).
+
+#### Reading an answer
+
+Each answer shows, from top to bottom:
+
+1. **A summary line** written by the app, for example "12 groups · grouped by College · 1 filter · sorted by candidates (highest first)", "120 matching rows, showing the first 50", "Top 50 of 64 groups", "candidates: 128" for a single number, or "No matching rows".
+2. **A one-sentence explanation** of the plan, written by the LLM. It describes what was computed, not the result.
+3. **The table.** Column headings use the app's labels (for example "College" or "Final score"); calculated columns carry the name given in the plan (for example "candidates"). When nothing matches: "No rows match this question."
+4. **A bar chart** when the answer is grouped and has exactly one numeric result column (unless the plan asks for no chart). Bars follow the table's order, up to the first 30 groups; when grouped by more than one column, bar labels join the values with " · ".
+5. **"Download CSV"**: the answer table as `ask_answer_<n>.csv`, where n is the question's number in your session. Greyed out when the table is empty. A list of candidates is personal data.
+6. **"How this was answered"**: an expandable panel with the note "The LLM produced this plan from your question (personal details replaced by placeholders) and the column descriptions. It was checked against the allowed columns, operators and aggregations, then run locally on the current results." and the plan itself. Open it to check that the answer means what you intended, for example which statuses were counted or which filter was applied. The plan shows your original values again (they are put back inside the app).
+
+If you change the configuration or run an LLM re-score after asking, earlier answers are marked "Answered before the latest re-scoring; ask again for current numbers." Their numbers reflect the earlier results.
+
+#### How a question becomes an answer
+
+1. **Tidy:** extra spaces and unprintable characters are removed, and the question is cut to 500 characters.
+2. **Mask:** personal details in the question are replaced by placeholders. Names of candidates in this run become `[NAME_1]`, `[NAME_2]` ..., email addresses `[EMAIL_1]`, phone numbers `[PHONE_1]`, IP addresses `[IP_1]` and links `[URL_1]`; the same value always gets the same placeholder. For example, "What is the status of `<full name>`?" is sent as "What is the status of [NAME_1]?".
+3. **Plan:** the masked question and a description of the columns go to the LLM, which returns one query plan in a fixed format (filters, grouping, calculations, columns to list, sort order, row limit, chart choice and a one-sentence explanation), or a note that the question is unsupported.
+4. **Restore:** inside the app, the placeholders in the plan are replaced by your original values.
+5. **Validate:** every column must exist in the current results, every operator and calculation must be on the allowed list and suit the column's type, values are converted to the column's type, and limits and defaults are applied. A plan that fails is not run, and you are told why.
+6. **Run locally:** the app filters, groups, calculates, sorts and keeps the first rows using plain table operations. Nothing in the plan is executed as code.
+7. **Show:** summary line, table, chart, download and the plan.
+
+#### What the LLM sees and never sees
+
+**Sent to the LLM**
+
+- Your question after masking. Other things you type, such as candidate IDs, college or city names and numbers, are sent as typed.
+- The number of rows and, for every column, its name, label, type (number, text, yes/no or date) and a short description.
+- For number and date columns: the smallest and the largest value.
+- For a fixed list of categorical columns (status, risk level, college, college tier, degree, branch, city, test mode, source, experience source, resume match method, cluster, test slot, test name, test status, integrity status, data flags, matched skills and missing skills): the list of their values, but only when a column has at most 30 different values, none is longer than 60 characters, none looks like contact details and none contains a candidate's full name.
+- Standing instructions: the allowed operators and calculations, how to read words such as "shortlisted", "flagged" and "perfect scorers", and the required skills set in Config & Rubric Tuning.
+
+**Never sent to the LLM**
+
+- Any candidate record, and the answer table.
+- The values of personal columns: name, email, phone, IP address(es), resume file name, report URL, most similar candidate, and unmapped columns from the source file. The LLM only learns that these columns exist and are personal.
+- The values of any other text column, for example status reasons, risk reasons, score notes, LLM rationale, certifications, skills found, email domain or IP subnet.
+- Answer hashes and resume hashes; they are not even listed.
+- The personal details you typed; only their placeholders are sent.
+
+Name masking recognises full names and single first or last names of candidates in this run that are not ordinary words. A value of a category column that contains a person's name, such as a college named after someone, is left as typed, because the question is then about that college.
+
+#### Operators and calculations
+
+Filter operators:
+
+| In the plan | Meaning | Works on |
+|---|---|---|
+| `==`, `!=` | equals, does not equal (text comparisons ignore upper/lower case) | all columns |
+| `>`, `>=`, `<`, `<=` | greater than, at least, less than, at most | numbers, dates, text (alphabetical order) |
+| `in`, `not_in` | is one of, is none of a list of values | all columns |
+| `contains` | text contains the given words, ignoring case; on the skill lists ("Matched skills", "Missing skills", "Skills found") it checks for one whole skill, so "Java" does not match "JavaScript" | text columns |
+| `is_null`, `not_null` | is empty, has a value | all columns |
+
+Yes/no columns accept only `==`, `!=`, `in`, `not_in`, `is_null` and `not_null`.
+
+Calculations:
+
+| In the plan | Meaning |
+|---|---|
+| `count` | number of candidates (or of filled-in values of a column) |
+| `sum` | total; on a yes/no column, the number of "yes" |
+| `mean` | average; on a yes/no column, the share of "yes" (0-1) |
+| `median` | middle value |
+| `min`, `max` | lowest and highest value |
+| `nunique` | number of different values |
+
+`sum`, `mean` and `median` need a number or yes/no column. Averages, medians and decimal totals are rounded to two decimals.
+
+#### Limits
+
+| Item | Limit |
+|---|---|
+| Question length | 500 characters |
+| Rows in an answer | 50 unless the plan asks for more; at most 1,000 |
+| Bars in a chart | the first 30 groups |
+| Conversation | the last 20 questions |
+| Filters, grouping columns, calculations, listed columns, sort columns | 20, 3, 8, 40 and 5 |
+| Values in one `in` or `not_in` list | 200 |
+| Length of one filter value | 200 characters |
+
+#### When the tab is unavailable
+
+- Before the first screening the tab is not shown. Run a screening, or open a saved run in Run History.
+- When the LLM cannot be used, a note at the top explains why, and the examples and the question box are greyed out. Earlier answers stay visible. The note is one of the following, each followed by "Ask the Data uses the LLM only to turn a question into a query plan; the answer itself is computed locally.":
+  - "LLM features are switched off in Config & Rubric Tuning." Switch on "LLM features enabled" in Config & Rubric Tuning.
+  - "No LLM API key configured. Set NVIDIA_API_KEY in the environment or in .streamlit/secrets.toml to enable LLM features." Ask the administrator of the installation.
+  - "The LLM module is not available in this build."
+
+#### Troubleshooting
+
+| You see | What to do |
+|---|---|
+| "This question can't be answered from the screening results." and a reason | Rephrase in terms of the data the results hold, or ask something else. |
+| "The query plan could not be used:" followed by a reason, for example "Unknown column '...' in filters." | The LLM produced a plan the app will not run. Rephrase using the names you see in the app, such as "final score" or "college tier", and ask again. |
+| "The LLM reply was not a valid JSON query plan. Try rephrasing the question." or "The LLM could not plan this question: ..." | The model did not return a usable plan (the app has already asked once more automatically). Rephrase or shorten the question. |
+| "The LLM request failed (...). Check the LLM settings and try again." or "The LLM client could not be created: ..." | A connection or settings problem. Use "Test LLM connection" in Config & Rubric Tuning, or contact the administrator. |
+| "No rows match this question." | Open "How this was answered" and check the filters. "Equals" compares the whole value (ignoring case), so check the spelling of colleges and cities, or ask for names that contain a word. |
+| A number looks wrong | Check the filters in "How this was answered", for example whether "shortlisted" included "Shortlisted (Integrity Review)". |
+| "Top 50 of 64 groups" or "showing the first 50" | Ask for more rows, for example "top 100" or "all", up to 1,000. |
+| "Answered before the latest re-scoring; ask again for current numbers." or "This answer is no longer available. Ask the question again." | Ask the question again. |
+| "Something went wrong while answering. Please try again.", "Something went wrong while planning this question. Please try again." or "The query could not be run on this data. Try rephrasing the question." | Try again, or rephrase. |
+
+#### Under the hood
+
+- Validation is forgiving about names but strict about meaning: columns may be named by their internal name or their on-screen label, ignoring case, spaces, hyphens and underscores; common synonyms such as "=", "eq", "like", "avg", "average", "total" and "distinct" are accepted; anything else is rejected with a reason.
+- Defaults: a list without named columns shows "Candidate ID", "Name", "College", "Final score", "HackerRank %", "Status" and "Risk level"; a list without a sort order is sorted by rank (best first); a grouped answer without a sort order is sorted by its first calculated column, highest first; a column a list is sorted by is added to the list; blank text values are grouped as "(none)" and sorted last.
+- Plans are stored in the app's LLM response cache, so asking the same question about the same results again needs no new LLM call. The cache keeps only the plan the LLM returned, which contains placeholders, never your typed personal values.
+
+### Tab: Run History
+
+Save a screening run on the server, reopen it later without uploading or processing the files again, rename or delete it, and compare two saved runs to see who entered or left the shortlist and which settings changed. The tab has three parts: "Save current run", "Saved runs" and "Compare two runs".
+
+Before the first screening, Run History is shown next to "Getting started" and "Config & Rubric Tuning", so you can open a saved run straight away; after "Load" the full set of tabs appears.
+
+#### Save current run
+
+- **"Run label"**: a name for the run, up to 120 characters (hover text: "A name to recognise this run later, e.g. the drive and what you changed."). It is pre-filled with the dataset name and the current date and time, for example "Synthetic sample · 2026-11-05 14:32" or "Upload: ta_feed.csv · 2026-11-05 14:32". Line breaks and repeated spaces are removed; an empty label becomes "Untitled run". Labels do not have to be unique.
+- **"Save run"** stores the run and confirms with "Saved run 'Drive 1 baseline'." The run is then marked as open in the list below.
+- "Save run" is greyed out when:
+  - nothing has been screened yet: "Run a screening first, or open a saved run below.";
+  - the session no longer holds the data behind the results: "This result cannot be saved because its prepared data is not in this session; run the screening again.";
+  - you are viewing a saved run without changes: "You are viewing saved run Drive 1 baseline. Change the configuration or the LLM outputs to save a new version."
+- After you change settings or LLM outputs of an opened run, the tab says "Based on saved run Drive 1 baseline, with changes made since it was saved or opened." Saving then creates a new run; the original stays unchanged.
+- The caption under the button says where runs are kept, followed by "Saved runs contain candidate personal data (names, contact details, resume text and integrity evidence); your data-retention policy applies. Delete runs you no longer need."
+
+**What a saved run contains**
+
+| Part | Contents |
+|---|---|
+| Results | Every candidate row as shown in the app: scores, points, ranks, statuses and reasons, skills, integrity fields |
+| Prepared data | The TA feed as read by the app, the per-candidate table used for scoring, and the resume-to-candidate matches |
+| Parsed resumes | The text and details extracted from every resume in the run (including resumes not linked to a candidate), and which resume belongs to which candidate |
+| Integrity analysis | Risk scores, linked pairs, clusters, the commonality table (what perfect scorers have in common), individual flags, and the analysis settings and warnings |
+| Data quality | The data-quality report |
+| Configuration | Every setting from Config & Rubric Tuning at the moment of saving |
+| LLM outputs | Re-scores near the cutoff, candidate rationales and explanations, risk-group summaries and the executive summary |
+| Run details | Label, time saved, dataset name, input type, the counts shown in the run list, app version and processing times |
+
+Not saved: the uploaded files themselves (only what the app extracted from them), the Ask the Data conversation, the Compare Candidates selection and filter choices on other tabs.
+
+**Where runs are stored.** On the server, never on your computer. The caption shows either "Runs are stored on the server in the app's `runs` folder." or, when the administrator has set `SCREENING_RUNS_DIR`, "Runs are stored on the server in the `<folder>` folder set by `SCREENING_RUNS_DIR`." The full server path is never shown. Each run is one folder named after its run ID, `YYYYMMDD-HHMMSS-xxxxxx` (the save time plus six random characters). The folder is created with the first save. A saved run of about 3,000 candidates takes about 6 MB.
+
+#### Saved runs
+
+The table lists every saved run, newest first. Click a row to select that run in the picker below it. With no runs yet, the tab says "No saved runs yet. Save a screening run above to reopen it later without re-processing the files."
+
+| Column | Meaning |
+|---|---|
+| "Open" | Ticked for the run currently on screen (opened or just saved) |
+| "Label" | The run label; "(unreadable run)" when the run's details cannot be read |
+| "Saved" | Date and time saved, for example "5 Nov 2026, 14:32" |
+| "Dataset" | The dataset the run screened, for example "Synthetic sample" |
+| "Inputs" | "TA feed + resumes", "TA feed only" or "Resumes only" |
+| "Candidates", "Shortlisted", "In review", "High risk", "Medium risk", "Perfect scorers", "Clusters" | Headline counts at the time of saving ("Shortlisted" includes "Shortlisted (Integrity Review)") |
+| "Size (MB)" | Disk space the run uses |
+| "Run ID" | The run's unique ID |
+
+- **"Saved run"**: picker with entries such as "Drive 1 baseline · 05 Nov 2026 14:32" (hover text: "Or select a row in the table above."). It starts on the run that is open, otherwise the newest.
+- **"Load"** (hover text: "Open this run: results, configuration and LLM outputs are restored, ready to review or re-tune.") opens the selected run and confirms with, for example, "Opened saved run 'Drive 1 baseline' (3,000 candidates)." If the run cannot be read you see "This saved run could not be opened: ..." and nothing on screen changes.
+- **"Rename or delete this run"** (expandable panel, for the run selected in the picker):
+  - **"New label"** and **"Rename"**. "Rename" is greyed out until the label is different. Confirmation: "Renamed the run to 'Drive 1 final'."
+  - Deleting takes two steps. First tick "I understand that deleting permanently removes this saved run and the candidate data in it."; only then does **"Delete"** become active. Click it to delete the run, confirmed with "Deleted the saved run." This cannot be undone. If you delete the run you are viewing, its results stay on screen for this session but are no longer linked to a saved run.
+
+#### Viewing a loaded run
+
+- The header line starts with "Saved run: Drive 1 baseline", followed by the usual counts and rubric.
+- Every tab works as after a normal screening, including resume text in Individual Deep-Dive. Saved LLM outputs reappear: rationales, explanations, risk-group summaries, the executive summary and re-scores near the cutoff.
+- The run's configuration becomes the active configuration. You can re-tune it in Config & Rubric Tuning, including "Preview impact"; re-scoring uses the saved data, so the original files are not needed. Save the re-tuned version as a new run.
+- Opening a run resets the Individual Deep-Dive selection and the compare list (Compare Candidates starts again from the top 3), and starts a fresh Ask the Data conversation.
+- To leave the saved run, run a new screening from the sidebar or click "Clear results".
+
+#### Compare two runs
+
+This part needs at least two saved runs ("Save at least two runs to compare their shortlists and configuration."). It reads both runs from the server and does not change what is on your screen.
+
+- **"Run A (before)"** and **"Run B (after)"**: Run B starts on the newest run and Run A on the one before it. Picking the same run twice shows "Pick two different runs to compare."
+- Five cards:
+  - "Shortlisted (B)", with the change against run A, for example "+3 vs A" or "same as A".
+  - "Entering shortlist" (hover text: "Shortlisted in run B but not in run A").
+  - "Leaving shortlist" (hover text: "Shortlisted in run A but not in run B").
+  - "Cutoff score (B)" (hover text: "Lowest final score on the shortlist"), with the change against run A.
+  - "Integrity review (B)", with the change against run A.
+- When the runs screened different datasets (different dataset names or candidate counts), a note says "These runs screened different datasets, so the differences reflect both the data and the configuration."
+- **"Entering the shortlist (n)"** and **"Leaving the shortlist (n)"** tables, side by side ("Nobody new entered the shortlist." and "Nobody left the shortlist." when empty). Leaving candidates include "Reason (B)", which tells you why they dropped out, for example a college cap reason.
+- **"Status changes (n)"** (every candidate whose status differs) and **"Rank moves (n)"** (candidates ranked in both runs with a different rank, biggest move first), as expandable panels, shown only when there are any.
+- Table columns: "Candidate ID", "Name", "College", "Rank (A)", "Rank (B)", "Rank change" (hover text: "Positive = moved up in run B"), "Status (A)", "Status (B)", "Score (A)", "Score (B)", "Reason (B)".
+- **"Configuration changes"**: a table of "Setting", "Run A" and "Run B" for every setting that differs, for example "Shortlist › top n" or "Shortlist › college cap pct". On/off values show as "Yes" or "No", lists as comma-separated values ("(none)" when empty), "(not set)" when a run does not have the setting, and long text such as the job description is shortened to 140 characters with "…". When nothing differs: "Both runs used the same configuration."
+
+Candidates are matched by Candidate ID, and "shortlist" means "Shortlisted" plus "Shortlisted (Integrity Review)".
+
+#### Privacy and retention
+
+- Saved runs contain candidate personal data, including resume text and integrity evidence. Your data-retention policy applies: delete runs you no longer need.
+- There is no login: everyone who uses the same installation can see, open, rename and delete every saved run.
+- Administrators can schedule automatic clean-up of old runs and back up the runs folder (see sections 11 and 12 of [docs/DEPLOYMENT.md](DEPLOYMENT.md)).
+
+#### Under the hood
+
+- A run is written into a temporary folder and moved into place in one step, so an interrupted save never appears in the list; leftover temporary folders older than six hours are removed automatically. Deleting moves the folder aside first, so the run disappears from the list at once, then removes it.
+- Runs are stored as JSON and Parquet data files only, never as executable content, so opening a saved run cannot run code. Run IDs are checked against the fixed pattern and looked up inside the runs folder only.
+- LLM connection settings (provider, endpoint, API key name, backend, fallback models, extra request fields, cache folder) always come from the running installation, never from a saved run.
+- Opening a run restores it exactly as saved; nothing is re-scored until you change a setting. Rename changes only the label; the run ID stays the same.
+- A run saved by a newer version of the app cannot be opened by an older one ("Saved run ... was written by a newer version of the app and cannot be opened here."). Other problems are reported as "Saved runs are unavailable: ...", "The saved runs could not be listed: ...", "The run could not be saved: ...", "The run could not be renamed: ...", "The run could not be deleted: ..." or "These runs could not be compared: ...". These messages never include server paths.
+
+### College cap and What-if preview (Config and Rubric Tuning)
+
+Two additions to Config & Rubric Tuning: a **college cap** that stops any single college from taking more than a set share of the shortlist, and **"Preview impact"**, which shows who would enter or leave the shortlist before you apply new settings.
+
+#### College cap
+
+**Where:** Config & Rubric Tuning, section "Shortlist & eligibility", field **"Max share of shortlist per college (%)"**: 0 to 100 in steps of 1, default 0 (no cap; hover text: "0 = no cap."). The caption next to it reads: "Limits the share of the shortlist a single college can take (0 = no cap). Candidates beyond the cap are not shortlisted and the next-best candidates fill the slots (Top N / Top %); with a score threshold they are simply excluded. Candidates with no college on record are never capped." Apply it with **"Apply & re-score"**, or check its effect first with **"Preview impact"**.
+
+**How it works**
+
+1. **Places per college.** The app works out how many shortlist places one college may hold: max(1, floor(cap % × slots ÷ 100)), that is, the cap percentage of the planned number of slots, rounded down, but never less than one place. The slots depend on the "Method":
+   - "Top N": N (or the number of eligible candidates, if fewer).
+   - "Top % of eligible": that percentage of the eligible candidates, rounded up.
+   - "Score threshold": the number of eligible candidates at or above the threshold.
+
+   Examples: with "Top N" 300, a 10% cap allows 30 places per college and a 5% cap allows 15. With "Top N" 20, a 2% cap works out to 0.4 places, which becomes 1 (the minimum).
+2. **Going down the ranking.** Each eligible candidate, in rank order, takes a shortlist place unless their college already holds all of its places. Such a candidate becomes "Not Shortlisted" with the status reason "College cap reached: College A already has 30 shortlisted (cap 10%)" (the college as recorded for that candidate) and is counted as capped out.
+3. **Backfill.**
+   - "Top N" and "Top % of eligible": the app keeps going down the ranking until every slot is filled, so the next-best candidates from other colleges move onto the shortlist. Their status reason notes it, for example "Rank 312 of 2,968 (top 300; backfill for 12 college-capped candidates)", or "Rank 310 of 2,968 (top 10% = 297; backfill for 13 college-capped candidates)".
+   - "Score threshold": no backfill. Capped candidates are simply excluded, nobody below the threshold is added, and the shortlist gets shorter.
+   - If there are not enough eligible candidates from other colleges, the shortlist ends up shorter than planned.
+
+**What the cap does not change**
+
+- Scores and ranks stay the same; capped candidates keep their rank. Only statuses and status reasons change.
+- Candidates with no college on record (blank, or a placeholder such as "N/A", "-", "unknown" or "not available") are never capped and do not use any college's places.
+- College names that differ only in upper/lower case or spacing count as one college. Different names for the same institution (for example an abbreviation and the full name) count as different colleges, so tidy college names in the TA feed if needed.
+- Ineligible candidates are never capped and do not count.
+- Only candidates reached before the shortlist is full are marked capped out. Candidates further down the ranking stay "Not Shortlisted" with the usual cutoff reason, such as "Rank 340 of 2,968 (cutoff: top 300)".
+- A cap of 0 means no cap; a cap of 100% never takes effect.
+
+**Integrity review and integrity hold**
+
+- "Keep & flag (default): flagged candidates stay shortlisted with evidence": shortlisted candidates at a level chosen in "Risk levels that mark a shortlisted candidate for integrity review" (default "High" and "Medium") become "Shortlisted (Integrity Review)". They are on the shortlist, so they use one of their college's places.
+- "Hold & backfill: High-risk candidates move to Integrity Hold; slots are backfilled": a candidate on "Integrity Hold" takes neither a shortlist slot nor a college place. With "Top N" or "Top % of eligible" the slot is backfilled (the hold reason ends "slot backfilled"); with "Score threshold" the candidate is "excluded from shortlist" and not replaced.
+- For each candidate the app checks the hold first, then the cap, then the review. So a High-risk candidate under "Hold & backfill" is put on hold rather than capped, and a flagged candidate whose college is already full is capped ("Not Shortlisted") rather than put under review.
+- When both apply, the backfill note names both, for example "(top 300; backfill for 2 integrity holds and 12 college-capped candidates)".
+
+**Where you see the effect**
+
+- "Status" and "Status reason" in the shortlist and in Individual Deep-Dive.
+- The `college_capped` column (True or False): in the Shortlist tab's "Filtered view as CSV" download, in the "All Candidates" sheet of the "Full Excel report" (as "College Capped"), and in Ask the Data as "College capped".
+- Campus Distribution: the "Colleges over the cap" card, the "Capped out" and "Over cap" columns and the dashed cap line on the chart.
+- "Preview impact": capped candidates appear under "Leaving", with a "Reason after" starting "College cap reached".
+- Run History: saved with each run, and listed under "Configuration changes" as "Shortlist › college cap pct".
+
+#### What-if preview ("Preview impact")
+
+1. Change any settings in the form: weights, skills, job description, shortlist rule, college cap, eligibility, integrity policy, risk thresholds or LLM settings.
+2. Click **"Preview impact"**, next to "Apply & re-score" (hover text: "See who would enter or leave the shortlist before applying."). The caption beside the buttons reads "Preview shows how the shortlist would change; nothing is applied until you confirm."
+3. While "Scoring the proposed configuration..." is shown, the app scores the proposed settings on the current data. The panel "Preview: impact of the proposed changes" then appears below the form.
+4. Click **"Apply these changes"** or **"Discard preview"**.
+
+Before the first screening the button is greyed out, and the caption reads "Preview impact is available after the first screening run."
+
+**The preview panel**
+
+- **Proposed changes:** a line such as "Proposed changes: shortlist › college cap pct: 0 → 10; shortlist › top n: 300 → 250". Up to 12 changes are listed, then "(+N more)"; edited long text shows as, for example, "experience › job description edited". When the form equals the active settings: "The form matches the active configuration."
+- **Five cards:**
+  - "Shortlisted": the shortlist size after the change, with the difference and the current value (for example "vs 300 now").
+  - "Entering" (hover text: "Not shortlisted now, shortlisted after the change").
+  - "Leaving" (hover text: "Shortlisted now, not shortlisted after the change").
+  - "Cutoff score": the lowest final score on the shortlist after the change (two decimals), with the difference and the current value. It shows "-" when nobody would be shortlisted.
+  - "Integrity reviews": the number of "Shortlisted (Integrity Review)" candidates after the change, with the difference and the current value.
+- When nobody would change status: "No candidate would change status with these settings."
+
+**The four tabs of the panel**
+
+| Tab | Who is listed | Columns |
+|---|---|---|
+| "Entering (n)" | Not shortlisted now, shortlisted after ("Nobody new enters the shortlist." when empty) | "Candidate ID", "Name", "College", "Rank now", "Rank after", "Status now", "Status after", "Score after", "Reason after" |
+| "Leaving (n)" | Shortlisted now, not shortlisted after ("Nobody leaves the shortlist.") | Same as "Entering" |
+| "Status changes (n)" | Every candidate whose status would change ("No status changes.") | "Candidate ID", "Name", "College", "Status now", "Status after", "Rank now", "Rank after", "Reason after" |
+| "Biggest rank moves" | The 25 largest rank changes among candidates shortlisted now or after the change ("No rank changes among shortlisted candidates.") | "Candidate ID", "Name", "College", "Rank now", "Rank after", "Rank change", "Score now", "Score after", "Status after" |
+
+"Rank change" is positive when a candidate moves up (hover text: "Positive = moves up"); scores show two decimals. Under "Biggest rank moves" the caption reads "Largest rank changes among candidates shortlisted now or after the change (top 25)."
+
+**The panel's buttons**
+
+- **"Apply these changes"** makes the previewed settings active and re-scores, confirmed with "Previewed changes applied - candidates re-scored."
+- **"Discard preview"** (hover text: "Close the preview and reset the form to the active configuration.") closes the panel without changing anything and resets the form.
+
+**Good to know**
+
+- Nothing changes until you apply: every other tab keeps showing the current results.
+- "Apply these changes" applies exactly the settings that were previewed. Edits made in the form after previewing are not included; preview again first.
+- The panel stays until you apply or discard it. It closes by itself when the data or the active settings change before you decide (a new screening, a saved run opened, "Apply & re-score", "Reset to defaults", "Apply uploaded config" or an LLM re-score), because it would be out of date.
+- The preview uses LLM re-scores already in your session but never calls the LLM.
+- If a preview fails you see "Could not preview these settings: ..." (or "Could not read the form: ..."), and nothing is applied.
+
+#### Under the hood
+
+- The setting is `shortlist.college_cap_pct` (default `0.0`) in the configuration file from "Download current config (JSON)".
+- Places per college: `cap_n = max(1, floor(college_cap_pct × slots / 100))`, with a tiny rounding guard so that, for example, 29% of 100 slots is exactly 29 places. There is no cap when the setting is 0 or there are no slots. Places are used by "Shortlisted" and "Shortlisted (Integrity Review)" candidates, never by holds.
+- `college_capped` is True only for candidates the cap kept off the shortlist, and False for everyone when the cap is off. The backfill note counts capped candidates ranked above the last shortlisted candidate.
+- LLM re-scoring near the cutoff uses the last shortlisted rank after the cap, so its band moves with the backfill; the cap is applied again after LLM blending.
+- The preview re-scores the proposed settings on the same prepared data and compares the result with the current one, matching candidates by Candidate ID. It reuses the current integrity analysis when the integrity (risk) settings are unchanged, and recomputes it otherwise, which takes a little longer.
+
+### Deploying on a company VM (summary)
+
+The app runs as one Python process on a Windows Server or Linux VM inside the company network, and recruiters open it in their browsers. This is a summary; [docs/DEPLOYMENT.md](DEPLOYMENT.md) has the complete procedure, including offline installs, proxies and certificates, running as a service, the reverse proxy, health check, retention, backups, upgrades and troubleshooting.
+
+- **Prerequisites:** Windows Server 2019 or later, or 64-bit Linux; **Python 3.11 (64-bit)** installed for all users; 4 vCPU and 8 GB of memory (16 GB when several recruiters process drives at the same time); a dedicated service account without administrator rights.
+- **Copy the code** with Git or a clean archive. Never copy `data/`, `runs/`, `.cache/`, `.streamlit/secrets.toml` or a virtual environment from another machine.
+- **Install, then start.** The setup script finds Python 3.11, creates the virtual environment outside the project folder, installs the pinned packages and runs `pip check` and the test suite. The examples use the folder layout from DEPLOYMENT.md:
+
+```powershell
+## Windows, from the project folder
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup.ps1 -VenvPath C:\apps\venvs\hiring-screening
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_app.ps1 -VenvPath C:\apps\venvs\hiring-screening
+```
+
+```bash
+## Linux, from the project folder
+sudo bash scripts/setup.sh --venv /opt/venvs/hiring-screening
+bash scripts/run_app.sh --venv /opt/venvs/hiring-screening
+```
+
+- **Options:** setup takes `-IndexUrl` / `--index-url` (internal package mirror), `-WheelDir` / `--wheel-dir` (offline install from downloaded wheels), `-NoTests` / `--no-tests` and `-WhatIf` / `--dry-run`. The start script takes `-Port` / `--port` (default `8501`), `-Address` / `--address` (default `127.0.0.1`) and `-PublicHost` / `--public-host` (the host name users type). To keep the app running, start the script as a service: NSSM or Task Scheduler on Windows, systemd on Linux.
+- **Configure:** the LLM key in `.streamlit/secrets.toml` or the `NVIDIA_API_KEY` environment variable (leave it unset to run without LLM features), and `SCREENING_RUNS_DIR` pointing to a backed-up, access-restricted folder for saved runs.
+- **Check:** `http://<host>:8501/_stcore/health` returns `ok`; then run the smoke test in section 14 of DEPLOYMENT.md.
+
+**Security notes**
+
+- **No built-in login.** Anyone who can open the URL can upload data, run screenings and open, rename or delete every saved run, so access control has to come from the network.
+- **Bind address.** By default the start scripts listen on `127.0.0.1`, which only the VM itself can reach. Use `-Address 0.0.0.0` / `--address 0.0.0.0` only together with a firewall rule limited to the recruiters' subnets or the VPN.
+- **Reverse proxy and SSO.** When several recruiters share the app, keep it on `127.0.0.1` behind the company reverse proxy, which terminates TLS and enforces single sign-on (ideally limited to the recruiting group). The proxy must pass WebSocket upgrades, allow long idle timeouts and accept uploads of at least 1 GB.
+- **Data.** Saved runs and downloaded exports contain candidate personal data: apply the retention policy, and use only an LLM provider the company's data policy approves.
+
+### FAQ: new features
+
+#### Why does Campus Distribution show a college "Over cap" when a college cap is set?
+
+The cap limits how many places each college may take, worked out from the number of slots the shortlist rule aims for, while "Over cap" compares those places with the shortlist that actually resulted. A college can be over when there were not enough eligible candidates from other colleges to fill the slots, when the cap rounds up to its minimum of one place, or when a "Score threshold" shortlist shrinks because capped candidates are not replaced. No college ever holds more than its allowed number of places. See "Why a college can show "Over cap"" under Tab: Campus Distribution.
+
+#### Does the college cap change anyone's score or rank?
+
+No. Scores and ranks stay the same; only statuses and status reasons change. Capped candidates keep their rank, become "Not Shortlisted" with a reason starting "College cap reached", and are counted under "Capped out".
+
+#### I used "Add to compare" for two candidates, but Compare Candidates does not show the top 3. Why?
+
+The top 3 shortlisted candidates are only a starting selection for when nobody has been picked yet; candidates you add yourself take its place. You can add or remove candidates in the "Candidates to compare (2-4)" picker at any time.
+
+#### Does Ask the Data send candidate data to the LLM?
+
+No candidate records are sent. The LLM receives your question, with candidate names, email addresses, phone numbers, IP addresses and links replaced by placeholders, and a description of the columns: names, types, number ranges and, for a few categorical columns with at most 30 different values (such as college, city, status or cluster), the list of values. Other things you type, such as candidate IDs, are sent as typed. The answer itself is computed inside the app.
+
+#### Why are the example questions and the question box greyed out in Ask the Data?
+
+The LLM is not available: either "LLM features enabled" is switched off in Config & Rubric Tuning, or no LLM API key is configured on the server. The note at the top of the tab says which. Earlier answers stay readable.
+
+#### What does "Answered before the latest re-scoring; ask again for current numbers." mean?
+
+You changed the configuration (or ran an LLM re-score) after asking that question, so its numbers reflect the earlier results. Ask the question again to get the current numbers.
+
+#### Who can see the runs I save?
+
+Everyone who uses the same installation of the app. There is no login, so anyone who can open the app can open, rename or delete every saved run. Saved runs contain candidate personal data: give them clear labels and delete the ones you no longer need, following your data-retention policy.
+
+#### Do I need the original files to reopen or re-tune a saved run?
+
+No. A saved run holds the extracted data, results, settings and LLM outputs. After "Load" you can review every tab, change settings in Config & Rubric Tuning (including "Preview impact") and save the re-tuned version as a new run.
+
+#### Why is "Save run" greyed out?
+
+Either nothing has been screened yet ("Run a screening first, or open a saved run below."), the results on screen are a saved run you have not changed (change a setting or an LLM output to save a new version), or the session no longer holds the data behind the results ("This result cannot be saved because its prepared data is not in this session; run the screening again.").
+
+#### What is the difference between "Preview impact" and "Apply & re-score"?
+
+"Apply & re-score" makes the form's settings active straight away. "Preview impact" scores the proposed settings on the side and shows who would enter or leave the shortlist, status changes and rank moves, without changing anything; you then choose "Apply these changes" or "Discard preview". "Preview impact" is available after the first screening run.
+
+### Glossary: new terms
+
+| Term | Meaning |
+|---|---|
+| Backfill | Filling a shortlist slot left by a college-capped candidate or an integrity hold with the next-best eligible candidate. Happens with "Top N" and "Top % of eligible", never with "Score threshold". |
+| Best-value highlight | The pale-yellow cell in Compare Candidates marking the best value of a numeric row (lowest for rank and risk score, highest otherwise). A reading aid, not a recommendation. |
+| Bind address | The network address the app listens on. The start scripts use `127.0.0.1` (the VM only) unless told otherwise; `0.0.0.0` accepts connections from other machines. |
+| Cap places | The number of shortlist places one college may hold: max(1, floor(cap % × slots ÷ 100)). |
+| Capped out | A candidate who would have been shortlisted but whose college had already used all of its cap places. Status "Not Shortlisted"; `college_capped` is True. |
+| College cap | The setting "Max share of shortlist per college (%)" in Config & Rubric Tuning; 0 means no cap. |
+| Compare list | The up to four candidates shown in Compare Candidates, filled by the picker and by "Add to compare". Kept for your browser session only. |
+| Cutoff score | The lowest final score on the shortlist ("Shortlisted" and "Shortlisted (Integrity Review)"). |
+| Entering / Leaving | Candidates who join or drop off the shortlist between two saved runs (Run History) or between the current and the proposed settings ("Preview impact"). |
+| Group | In Campus Distribution, all candidates sharing one value of the chosen "Group by" attribute; values that differ only in upper/lower case or spacing form one group. |
+| Health check | The address `/_stcore/health` on the app's server, which answers `ok` while the app is running; used by monitoring. |
+| Over cap | A college whose share of the shortlist is above the college cap percentage. |
+| Personal column | A column holding personal details: name, email, phone, IP address, resume file, report URL, most similar candidate, or an unmapped column from the source file. Ask the Data never sends its values to the LLM. |
+| Placeholder | A stand-in such as `[NAME_1]` or `[EMAIL_1]` that replaces a personal detail in an Ask the Data question before it goes to the LLM; the app puts the original back afterwards. |
+| Query plan | The small structured instruction (filters, grouping, calculations, columns, sort order, row limit, chart choice) the LLM writes from an Ask the Data question. The app validates it and runs it locally; it is shown under "How this was answered". |
+| Representation | Share of shortlist ÷ share of applicants. 1.00x is proportional, above 1 over-represented, below 1 under-represented. |
+| Reverse proxy | A company web server in front of the app that provides HTTPS and single sign-on (SSO) and forwards requests to the app. |
+| Run A / Run B | The two saved runs picked in "Compare two runs": A is "before", B is "after". |
+| Run ID | The unique name of a saved run, `YYYYMMDD-HHMMSS-xxxxxx` (the save time plus six random characters). |
+| Run label | The name you give a saved run; it can be changed later with "Rename". |
+| Saved run | A screening stored on the server from Run History: results, prepared data, parsed resumes, integrity analysis, settings and LLM outputs. |
+| `SCREENING_RUNS_DIR` | Server setting naming the folder that holds saved runs; without it, the app's `runs` folder is used. |
+| Share of applicants | A group's applicants ÷ all applicants. |
+| Share of shortlist | A group's shortlisted candidates ÷ all shortlisted candidates. |
+| Shortlist rate | A group's shortlisted candidates ÷ its eligible candidates. |
+| Slots | The number of shortlist places the shortlist rule aims for: N for "Top N", the percentage of eligible candidates (rounded up) for "Top % of eligible", or the number of eligible candidates at or above the threshold for "Score threshold". |
+| Stale answer | An Ask the Data answer given before the latest re-scoring, marked "Answered before the latest re-scoring; ask again for current numbers." |
+| (unknown) | The Campus Distribution group for blank values and placeholders such as "N/A" or "unknown". |
+| What-if preview | The panel opened by "Preview impact": how the shortlist would change under proposed settings, before anything is applied. |
