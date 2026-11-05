@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------
+# Secrets: never commit credentials
+# ---------------------------------------------------------------
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+
+# ---------------------------------------------------------------
+# Candidate data: real TA feeds / resumes contain PII.
+# Everything under data/ is ignored; synthetic data is reproducible
+# with `python generate_mock_data.py`.
+# ---------------------------------------------------------------
+data/**
+!data/README.md
+uploads/
+runs/
+exports/
+*.xlsx
+*.xls
+!tests/fixtures/*.xlsx
+
+# ---------------------------------------------------------------
+# Runtime caches (LLM responses, parsed resumes)
+# ---------------------------------------------------------------
+.cache/
+*.log
+
+# ---------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# ---------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

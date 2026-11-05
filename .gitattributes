@@ -1,0 +1,4 @@
+# Normalise text files; shell scripts must stay LF for Linux VMs.
+* text=auto
+*.sh text eol=lf
+*.ps1 text eol=crlf
