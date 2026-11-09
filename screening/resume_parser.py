@@ -1,8 +1,9 @@
-"""Resume ingestion: safe upload/ZIP expansion, text extraction and structured parsing.
+"""Resume ingestion: safe upload/ZIP expansion, packet splitting, text extraction and parsing.
 
-Flow: ``expand_uploads`` (in-memory ZIP expansion with size / member / zip-bomb guards)
--> ``parse_resumes`` (thread pool, de-duplicated by content hash) -> ``parse_resume``
-(``extract_text`` + ``parse_resume_text``).
+Flow: ``expand_uploads`` (in-memory ZIP expansion with size / member / zip-bomb guards;
+multi-candidate PDF packets split per candidate by ``split_bundle``) -> ``parse_resumes``
+(thread pool, de-duplicated by content hash) -> ``parse_resume`` (``extract_text`` +
+``parse_resume_text``).
 
 Nothing here raises for a bad file. Upload problems become DataQualityReport-style
 issue dicts; extraction / parsing problems become ``ParsedResume.parse_status``,
@@ -10,6 +11,11 @@ issue dicts; extraction / parsing problems become ``ParsedResume.parse_status``,
 
 Decompression bombs: ZIP uploads, DOCX parts and PDF streams are size-limited before or
 while they are inflated (``ZIP_MAX_RATIO``, ``DOCX_*`` and ``PDF_*`` constants below).
+
+Hidden / adversarial text (screening.injection): PDF text a reader cannot see (white on white,
+invisible render mode, < 1 pt, outside the page, hidden layers) is blanked while the page is
+extracted, invisible unicode characters are stripped, and every finding is kept in
+``ParsedResume.injection_findings`` - hidden keyword stuffing never reaches skills or scores.
 """
 from __future__ import annotations
 
@@ -18,10 +24,12 @@ import binascii
 import contextlib
 import dataclasses
 import io
+import math
 import re
 import unicodedata
 import zipfile
 import zlib
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -29,6 +37,7 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import injection
 from . import schema as S
 from . import skills
 from .config import ProcessingConfig
@@ -38,7 +47,9 @@ __all__ = [
     "SUPPORTED_EXTENSIONS",
     "ARCHIVE_EXTENSIONS",
     "PRESENT_DATE",
+    "PacketResumeDoc",
     "expand_uploads",
+    "split_bundle",
     "load_resume_folder",
     "extract_text",
     "parse_resume_text",
@@ -58,6 +69,10 @@ DOCX_MAX_PARTS = 2000              # DOCX: at most this many ZIP members
 DOCX_RATIO_MIN_MB = 1              # DOCX: ZIP_MAX_RATIO is checked for parts larger than this
 PDF_MAX_DECODED_MB = 30            # PDF: pypdf decompresses a stream to at most this
 PDF_MAX_PAGES = 50                 # PDF: longer files are not read
+# Multi-candidate packets (e.g. a Workday "<requisition> - <job>_set 3.pdf"): table of contents
+# on the first pages, one outline bookmark per attachment. Size cap: ProcessingConfig.max_bundle_mb.
+BUNDLE_TOC_PAGES = 3               # the table of contents is looked for on at most this many pages
+BUNDLE_MAX_TEXT_PAGES = 1000       # no-outline fallback: candidate names are searched on at most this many pages
 
 _MB = 1024 * 1024
 # zipfile inflates these methods in bounded steps; bzip2 / LZMA members are inflated in one
@@ -73,9 +88,22 @@ ProgressCallback = Callable[[int, int, str], None]
 # ===========================================================================
 # Uploads, ZIP archives and folders
 # ===========================================================================
-def _issue(severity: str, issue: str, file_name: str | None) -> dict[str, Any]:
+def _issue(severity: str, issue: str, file_name: str | None, candidate_id: str | None = None) -> dict[str, Any]:
     return {"severity": severity, "stage": _STAGE_UPLOAD, "issue": issue,
-            "candidate_id": None, "file_name": file_name}
+            "candidate_id": candidate_id, "file_name": file_name}
+
+
+@dataclasses.dataclass
+class PacketResumeDoc(ResumeDoc):
+    """One candidate attachment split out of a multi-candidate PDF packet (``split_bundle``)."""
+
+    bundle_source: str | None = None   # "<packet file name> p.<first>-<last>"
+
+
+def _processing_cfg(cfg: Any) -> ProcessingConfig:
+    """ProcessingConfig from an AppConfig, a ProcessingConfig or None (defaults)."""
+    proc = getattr(cfg, "processing", cfg)
+    return proc if isinstance(proc, ProcessingConfig) else ProcessingConfig()
 
 
 def _basename(name: str) -> str:
@@ -95,56 +123,128 @@ def _unsupported_message(ext: str) -> str:
     return f"Unsupported file type '{ext or '(none)'}' skipped (supported: {supported})"
 
 
-def expand_uploads(docs: list[ResumeDoc], cfg: ProcessingConfig) -> tuple[list[ResumeDoc], list[dict[str, Any]]]:
-    """Expand ZIP archives in memory and filter uploads down to parseable resumes.
+def expand_uploads(docs: list[ResumeDoc], cfg: ProcessingConfig | Any,
+                   progress_cb: ProgressCallback | None = None) -> tuple[list[ResumeDoc], list[dict[str, Any]]]:
+    """Expand ZIP archives in memory, split multi-candidate PDF packets and filter uploads
+    down to parseable resumes.
 
-    Returns (docs, issues). Unsupported or oversized files are skipped with an issue;
-    file names are reduced to their basename. Never raises.
+    Returns (docs, issues). Unsupported or oversized files are skipped with an issue; file
+    names are reduced to their basename. Packets (``split_bundle``) are split BEFORE the
+    per-resume caps: a packet may be up to ``cfg.max_bundle_mb`` with any page count, and each
+    per-candidate file then goes through the normal size cap here and the page cap at parse
+    time. Archives are read member by member, so only one packet is held in memory at a time.
+    ``cfg`` is a ProcessingConfig (or an AppConfig). ``progress_cb(done, total, detail)`` runs
+    on the calling thread once per uploaded file / archive member. Never raises.
     """
+    proc = _processing_cfg(cfg)
     out: list[ResumeDoc] = []
     issues: list[dict[str, Any]] = []
-    max_file = cfg.max_file_mb * _MB
-    for doc in docs or []:
+    items = list(docs or [])
+    total = sum(_upload_units(d) for d in items)
+    done = 0
+
+    def tick(detail: str) -> None:
+        nonlocal done
+        done += 1
+        if progress_cb is not None:
+            progress_cb(min(done, total), total, detail)
+
+    for doc in items:
         name = _basename(getattr(doc, "file_name", ""))
         content = getattr(doc, "content", b"") or b""
         ext = Path(name).suffix.lower()
         if not name or _is_junk_name(name):
             issues.append(_issue("info", "Skipped hidden/system file", name or None))
+            tick(name)
         elif ext in ARCHIVE_EXTENSIONS:
-            out.extend(_expand_zip(name, content, cfg, issues))
+            out.extend(_expand_zip(name, content, proc, issues, tick))
         elif ext not in SUPPORTED_EXTENSIONS:
             issues.append(_issue("warning", _unsupported_message(ext), name))
-        elif len(content) > max_file:
-            issues.append(_issue("warning", f"File is larger than {cfg.max_file_mb:g} MB "
-                                            f"({len(content) / _MB:.1f} MB) - skipped", name))
+            tick(name)
         else:
-            out.append(doc if doc.file_name == name else ResumeDoc(name, content, doc.source))
+            doc = doc if doc.file_name == name else ResumeDoc(name, content, getattr(doc, "source", "upload"))
+            out.extend(_accept(doc, proc, issues, packet_limit=proc.max_zip_members))
+            tick(name)
+    if progress_cb is not None and done < total:
+        progress_cb(total, total, "")
     return out, issues
 
 
-def _expand_zip(archive: str, content: bytes, cfg: ProcessingConfig,
-                issues: list[dict[str, Any]]) -> list[ResumeDoc]:
+def _upload_units(doc: Any) -> int:
+    """Progress units of one upload: its supported members for a ZIP, else 1."""
+    name = _basename(getattr(doc, "file_name", ""))
+    if Path(name).suffix.lower() not in ARCHIVE_EXTENSIONS:
+        return 1
+    try:
+        with zipfile.ZipFile(io.BytesIO(getattr(doc, "content", b"") or b"")) as zf:
+            count = sum(1 for info in zf.infolist() if _zip_member_name(info)
+                        and Path(_zip_member_name(info) or "").suffix.lower() in SUPPORTED_EXTENSIONS)
+    except Exception:
+        return 1
+    return max(1, count)
+
+
+def _zip_member_name(info: zipfile.ZipInfo) -> str | None:
+    """Basename of a regular, non-hidden archive member; None for folders and junk."""
+    path = info.filename.replace("\\", "/")
+    parts = [p for p in path.split("/") if p not in ("", ".", "..")]
+    if info.is_dir() or path.endswith("/") or not parts:
+        return None
+    if any(p == "__MACOSX" or p.startswith(".") for p in parts) or _is_junk_name(parts[-1]):
+        return None
+    return parts[-1]
+
+
+def _too_big(name: str, size: int, limit_mb: float, what: str = "") -> dict[str, Any]:
+    return _issue("warning", f"File is larger than {limit_mb:g} MB{what} ({size / _MB:.1f} MB) - skipped", name)
+
+
+def _accept(doc: ResumeDoc, proc: ProcessingConfig, issues: list[dict[str, Any]],
+            packet_limit: int) -> list[ResumeDoc]:
+    """One supported file -> the resume documents it yields (packets split, size cap applied)."""
+    content = doc.content or b""
+    max_file = proc.max_file_mb * _MB
+    may_split = Path(doc.file_name).suffix.lower() == ".pdf" and proc.split_bundles
+    if may_split and len(content) <= proc.max_bundle_mb * _MB:
+        split = split_bundle(doc, proc, issues, max_docs=packet_limit)
+        if split is not None:
+            kept = []
+            for part in split:
+                if len(part.content) > max_file:
+                    issues.append(_too_big(part.file_name, len(part.content), proc.max_file_mb))
+                else:
+                    kept.append(part)
+            return kept
+    if len(content) > max_file:
+        if may_split and proc.max_bundle_mb > proc.max_file_mb and len(content) > proc.max_bundle_mb * _MB:
+            issues.append(_too_big(doc.file_name, len(content), proc.max_bundle_mb, " (multi-candidate packet limit)"))
+        else:
+            issues.append(_too_big(doc.file_name, len(content), proc.max_file_mb))
+        return []
+    return [doc]
+
+
+def _expand_zip(archive: str, content: bytes, cfg: ProcessingConfig, issues: list[dict[str, Any]],
+                tick: Callable[[str], None] = lambda _detail: None) -> list[ResumeDoc]:
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
         infos = zf.infolist()
     except Exception as exc:  # BadZipFile, truncated, not a zip at all, ...
         issues.append(_issue("error", f"Could not open ZIP archive ({type(exc).__name__})", archive))
+        tick(archive)
         return []
 
     out: list[ResumeDoc] = []
     source = f"zip:{archive}"
     max_file = cfg.max_file_mb * _MB
+    max_bundle = max(cfg.max_bundle_mb * _MB, max_file)
     max_total = cfg.max_zip_total_mb * _MB
     total_bytes = 0
-    members = 0
+    full_note = (f"'{archive}' has more than {cfg.max_zip_members:,} resumes; the rest were skipped")
     with zf:
         for info in infos:
-            path = info.filename.replace("\\", "/")
-            parts = [p for p in path.split("/") if p not in ("", ".", "..")]
-            if info.is_dir() or path.endswith("/") or not parts:
-                continue
-            name = parts[-1]
-            if any(p == "__MACOSX" or p.startswith(".") for p in parts) or _is_junk_name(name):
+            name = _zip_member_name(info)
+            if name is None:
                 continue
             ext = Path(name).suffix.lower()
             if ext in ARCHIVE_EXTENSIONS:
@@ -154,40 +254,372 @@ def _expand_zip(archive: str, content: bytes, cfg: ProcessingConfig,
                 issues.append(_issue("info", f"Skipped unsupported file inside '{archive}': "
                                              f"{_unsupported_message(ext)}", name))
                 continue
-            members += 1
-            if members > cfg.max_zip_members:
-                issues.append(_issue("warning", f"'{archive}' has more than {cfg.max_zip_members:,} resumes; "
-                                                "the rest were skipped", archive))
+            if len(out) >= cfg.max_zip_members:
+                issues.append(_issue("warning", full_note, archive))
                 break
+            may_split = ext == ".pdf" and cfg.split_bundles
+            limit = max_bundle if may_split else max_file
             if info.flag_bits & 0x1:
                 issues.append(_issue("warning", f"Encrypted file inside '{archive}' skipped", name))
-                continue
-            if info.compress_type not in _ZIP_BOUNDED_METHODS:
+            elif info.compress_type not in _ZIP_BOUNDED_METHODS:
                 issues.append(_issue("warning", f"File inside '{archive}' uses an unsupported compression "
                                                 "method - skipped (re-create the ZIP with standard settings)", name))
-                continue
-            if info.file_size > max_file:
-                issues.append(_issue("warning", f"File is larger than {cfg.max_file_mb:g} MB - skipped", name))
-                continue
-            if info.file_size and info.file_size / max(info.compress_size, 1) > ZIP_MAX_RATIO:
+            elif info.file_size > limit:
+                what = " (multi-candidate packet limit)" if may_split and max_bundle > max_file else ""
+                issues.append(_too_big(name, info.file_size, cfg.max_bundle_mb if what else cfg.max_file_mb, what))
+            elif info.file_size and info.file_size / max(info.compress_size, 1) > ZIP_MAX_RATIO:
                 issues.append(_issue("warning", "Suspicious compression ratio (possible zip bomb) - skipped", name))
-                continue
-            if total_bytes + info.file_size > max_total:
+            elif total_bytes + info.file_size > max_total:
                 issues.append(_issue("warning", f"'{archive}' exceeds {cfg.max_zip_total_mb:g} MB uncompressed; "
                                                 "the remaining files were skipped", archive))
                 break
-            try:
-                with zf.open(info) as fh:
-                    data = fh.read(int(max_file) + 1)  # bounded even if the header lies
-            except Exception as exc:
-                issues.append(_issue("warning", f"Could not read file from '{archive}' ({type(exc).__name__})", name))
-                continue
-            if len(data) > max_file:
-                issues.append(_issue("warning", f"File is larger than {cfg.max_file_mb:g} MB - skipped", name))
-                continue
-            total_bytes += len(data)
-            out.append(ResumeDoc(name, data, source))
+            else:
+                try:
+                    with zf.open(info) as fh:
+                        data = fh.read(int(limit) + 1)  # bounded even if the header lies
+                except Exception as exc:
+                    issues.append(_issue("warning", f"Could not read file from '{archive}' ({type(exc).__name__})",
+                                         name))
+                    data = None
+                if data is not None and len(data) > limit:
+                    issues.append(_too_big(name, len(data), cfg.max_bundle_mb if limit > max_file else cfg.max_file_mb))
+                elif data is not None:
+                    total_bytes += len(data)
+                    room = cfg.max_zip_members - len(out)
+                    produced = _accept(ResumeDoc(name, data, source), cfg, issues, packet_limit=room)
+                    del data                     # one packet in memory at a time
+                    out.extend(produced[:room])
+                    if len(produced) > room:
+                        issues.append(_issue("warning", full_note, archive))
+                        tick(name)
+                        break
+            tick(name)
     return out
+
+
+# ===========================================================================
+# Multi-candidate PDF packets
+# ===========================================================================
+_PACKET_ID_RE = re.compile(r"\bC-\d{6,8}\b")
+_TOC_HEAD_RE = re.compile(r"table\s+of\s+contents|candidate\s+name\s+candidate\s+id", re.IGNORECASE)
+_TOC_ROW_RE = re.compile(r"^\s*(?P<num>\d{1,5})\s*[.)]\s+(?P<rest>\S.*?)\s*$")
+_CONTENTS_TITLE_RE = re.compile(r"^\s*(?:table\s+of\s+)?contents\s*$", re.IGNORECASE)
+_PAREN_RE = re.compile(r"\([^)]*\)")
+_ALIGN_MISS, _ALIGN_EXTRA, _ALIGN_SKIP = 4.0, 0.6, 1.0   # bookmark -> TOC row alignment costs
+_ALIGN_MAX_CELLS = 4_000_000
+TocRow = tuple[int, str, str]                    # (number, name, candidate ID)
+PacketPlan = list[tuple[TocRow, int, int, int]]  # (row, attachment number, first page, end page)
+
+
+def split_bundle(doc: ResumeDoc, cfg: Any = None, issues: list[dict[str, Any]] | None = None,
+                 max_docs: int | None = None) -> list[ResumeDoc] | None:
+    """Split a multi-candidate PDF packet into one PDF per candidate attachment.
+
+    A packet opens with a table of contents ("1. Asha Menon C-1000042" rows on its first 1-3
+    pages) and has one outline bookmark per attachment pointing at the attachment's first page
+    (titles "First Last" or "First Last (first last)"). Attachment k covers pages
+    [start_k, start_k+1); the last one runs to the end. TOC rows and bookmarks are aligned in
+    order by name, so a candidate with two attachments yields "{candidate_id}_{Cleaned_Name}.pdf"
+    and "..._att2.pdf". Split files have source "bundle:<packet>" and ``bundle_source``
+    "<packet> p.<a>-<b>" (PacketResumeDoc). Without bookmarks the listed names are located on
+    the page text; if that fails too, ``[doc]`` is returned with a warning.
+
+    Returns None when ``doc`` is not a packet or splitting is disabled (``cfg`` is a
+    ProcessingConfig or an AppConfig). Problems become ``issues``; never raises.
+    """
+    proc = _processing_cfg(cfg)
+    issues = issues if issues is not None else []
+    try:
+        content = doc.content or b""
+        name = _basename(doc.file_name)
+    except Exception:
+        return None
+    if not proc.split_bundles or Path(name).suffix.lower() != ".pdf" or b"%PDF-" not in content[:1024]:
+        return None
+    try:
+        with _pdf_limits():
+            return _split_packet(doc, name, content, proc, issues,
+                                 proc.max_zip_members if max_docs is None else max(0, max_docs))
+    except Exception:  # unreadable, limits hit while probing, pypdf bug: treat as an ordinary file
+        return None
+
+
+def _split_packet(doc: ResumeDoc, name: str, content: bytes, proc: ProcessingConfig,
+                  issues: list[dict[str, Any]], max_docs: int) -> list[ResumeDoc] | None:
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(content), strict=False)
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:
+            return None
+    n = len(reader.pages)
+    if n < 2:
+        return None
+    starts = _outline_starts(reader, n)
+    if not starts and n < 3:
+        return None                                # single resumes are 1-2 pages without bookmarks
+    rows, last_toc = _read_toc(reader, min(BUNDLE_TOC_PAGES, n - 1), proc.candidate_id_pattern)
+    if not rows:
+        return None
+    try:                                          # a confirmed packet is reported, never silently passed on
+        plan, note, severity = _packet_plan(reader, rows, last_toc, starts, n)
+    except Exception:
+        plan, note, severity = None, "", "warning"
+    if not plan:
+        issues.append(_issue("warning", f"Multi-candidate packet listing {len(rows)} candidate(s) could not be split "
+                                        "(no usable bookmarks and the listed names were not found on the pages); "
+                                        "kept as one file", name))
+        return [doc]
+    docs = _write_splits(reader, plan[:max_docs], name, issues)
+    if len(plan) > max_docs:
+        issues.append(_issue("warning", f"Packet has more than {max_docs:,} attachments; the rest were skipped", name))
+    listed = {cid for _, _, cid in rows}
+    split_ids = {row[2] for row, _, _, _ in plan[:max_docs]}
+    missing = len(listed - split_ids)
+    text = (f"Split multi-candidate packet into {len(docs):,} file(s) for {len(split_ids):,} candidate(s) "
+            f"({n:,} pages)")
+    if missing:
+        text += f"; {missing:,} listed candidate(s) have no attachment pages"
+    issues.append(_issue(severity, text + (f"; {note}" if note else ""), name))
+    return docs
+
+
+def _packet_plan(reader: Any, rows: list[TocRow], last_toc: int, starts: list[tuple[int, list[str]]],
+                 n: int) -> tuple[PacketPlan | None, str, str]:
+    """(plan, note, issue severity): bookmarks first, the names on the pages as the fallback."""
+    starts = [(page, titles) for page, titles in starts if page > last_toc]
+    if starts:
+        plan, matched = _plan_from_outline(rows, starts, n)
+        if matched >= 0.5 * len(starts):
+            return plan, "", "info"
+        located = _plan_from_text(reader, rows, last_toc + 1, n) if len(starts) != len(rows) else None
+        if located:
+            return located, ("bookmark titles do not name the listed candidates, so the names were located on "
+                             "the pages - verify the split"), "warning"
+        return plan, ("bookmark titles do not name the listed candidates; attachments were assigned in order "
+                      "- verify the split"), "warning"
+    return (_plan_from_text(reader, rows, last_toc + 1, n),
+            "the packet has no bookmarks, so the names were located on the pages - verify the split", "warning")
+
+
+def _outline_starts(reader: Any, n: int) -> list[tuple[int, list[str]]]:
+    """Bookmark pages (ascending) with their titles; "Contents" bookmarks are ignored."""
+    try:
+        outline = reader.outline
+    except Exception:
+        return []
+    found: dict[int, list[str]] = {}
+
+    def visit(items: Any, depth: int) -> None:
+        if depth > 8:
+            return
+        for item in items or []:
+            if isinstance(item, list):
+                visit(item, depth + 1)
+                continue
+            try:
+                page = reader.get_destination_page_number(item)
+            except Exception:
+                page = None
+            title = " ".join(str(getattr(item, "title", "") or "").split())
+            if isinstance(page, int) and 0 <= page < n and not _CONTENTS_TITLE_RE.match(title):
+                found.setdefault(page, []).append(title)
+
+    visit(outline, 0)
+    return sorted(found.items())
+
+
+def _read_toc(reader: Any, pages: int, id_pattern: str | None) -> tuple[list[TocRow], int]:
+    """Table-of-contents rows from the first ``pages`` pages and the last page holding rows."""
+    _, general = _id_regexes(id_pattern)
+    rows: list[TocRow] = []
+    last = -1
+    heading = False
+    for i in range(max(0, pages)):
+        text = reader.pages[i].extract_text() or ""
+        heading = heading or bool(_TOC_HEAD_RE.search(text))
+        found = _toc_rows(text, _PACKET_ID_RE) or (_toc_rows(text, general) if heading and general else [])
+        if found:
+            rows.extend(found)
+            last = i
+        elif rows or not heading:
+            break                                    # the contents ended, or this is no contents page
+    if not rows or (not heading and len(rows) < 2):
+        return [], -1
+    seen: set[str] = set()
+    unique = [r for r in rows if not (r[2] in seen or seen.add(r[2]))]
+    return unique, last
+
+
+def _toc_rows(text: str, id_rx: re.Pattern[str]) -> list[TocRow]:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    rows: list[TocRow] = []
+    for k, line in enumerate(lines):
+        m = _TOC_ROW_RE.match(line)
+        if not m:
+            continue
+        rest = m.group("rest")
+        found = id_rx.search(rest)
+        for extra in lines[k + 1:k + 3] if found is None else []:   # name wrapped onto the next line
+            if _TOC_ROW_RE.match(extra):
+                break
+            rest = f"{rest} {extra}"
+            found = id_rx.search(rest)
+            if found:
+                break
+        if found is None:
+            continue
+        person = rest[:found.start()] if found.start() > 0 else rest[found.end():]
+        person = " ".join(person.split()).strip(" -–—|,:;")
+        if re.search(r"[^\W\d_]{2,}", person):
+            rows.append((int(m.group("num")), person[:120], found.group(0).strip().upper()))
+    return rows
+
+
+def _person_key(text: str) -> str:
+    """'Asha Menon (asha menon)' -> 'asha menon' (accents folded, punctuation dropped)."""
+    text = unicodedata.normalize("NFKD", _PAREN_RE.sub(" ", str(text))).encode("ascii", "ignore").decode()
+    return " ".join(re.findall(r"[a-z]+", text.casefold()))
+
+
+def _plan_from_outline(rows: list[TocRow], starts: list[tuple[int, list[str]]], n: int) -> tuple[PacketPlan, int]:
+    """Assign bookmarks (attachments) to TOC rows in order; returns (plan, bookmarks whose title matched)."""
+    assign, matched = _align(rows, [titles for _, titles in starts])
+    plan: PacketPlan = []
+    counts: Counter[int] = Counter()
+    for k, (page, _titles) in enumerate(starts):
+        end = starts[k + 1][0] if k + 1 < len(starts) else n
+        counts[assign[k]] += 1
+        plan.append((rows[assign[k]], counts[assign[k]], page, end))
+    return plan, matched
+
+
+_TITLE_ID_RE = re.compile(r"[A-Za-z]{1,6}[-_]?\d{3,10}")
+
+
+def _title_rows(titles: list[str], by_key: dict[str, list[int]], by_id: dict[str, int]) -> set[int]:
+    """TOC rows a bookmark's titles name: candidate ID, exact name, or fuzzy name (>= 90)."""
+    from rapidfuzz import fuzz, process
+
+    hits: set[int] = set()
+    for title in titles:
+        hits.update(by_id[t.upper()] for t in _TITLE_ID_RE.findall(title) if t.upper() in by_id)
+        key = " ".join(sorted(_person_key(title).split()))
+        if not key:
+            continue
+        if key in by_key:
+            hits.update(by_key[key])
+            continue
+        for choice, _score, _ in process.extract(key, list(by_key), scorer=fuzz.token_sort_ratio,
+                                                 processor=None, limit=5, score_cutoff=90):
+            hits.update(by_key[choice])
+    return hits
+
+
+def _align(rows: list[TocRow], titles: list[list[str]]) -> tuple[list[int], int]:
+    """Monotone assignment of bookmarks to rows minimising (title mismatches, extra attachments,
+    rows without attachments) by dynamic programming; (row per bookmark, matched bookmarks)."""
+    R, K = len(rows), len(titles)
+    by_key: dict[str, list[int]] = {}
+    for i, (_, person, _) in enumerate(rows):
+        key = " ".join(sorted(_person_key(person).split()))
+        if key:
+            by_key.setdefault(key, []).append(i)
+    by_id = {cid.upper(): i for i, (_, _, cid) in enumerate(rows)}
+    match = [_title_rows(t, by_key, by_id) for t in titles]
+    if R * K > _ALIGN_MAX_CELLS:                     # huge packet: greedy in order
+        assign, r = [], 0
+        for k in range(K):
+            if k and r + 1 < R and (r + 1 in match[k] or r not in match[k]):
+                r += 1
+            assign.append(r)
+        return assign, sum(assign[k] in match[k] for k in range(K))
+    inf = float("inf")
+    prev = [r * _ALIGN_SKIP + (0.0 if r in match[0] else _ALIGN_MISS) for r in range(R)]
+    back: list[list[int]] = [[-1] * R]
+    for k in range(1, K):
+        cur = [inf] * R
+        choice = [-1] * R
+        best, best_r = inf, -1
+        for r in range(R):
+            if r > 0 and prev[r - 1] - (r - 1) * _ALIGN_SKIP < best:
+                best, best_r = prev[r - 1] - (r - 1) * _ALIGN_SKIP, r - 1
+            advance = best + (r - 1) * _ALIGN_SKIP if best_r >= 0 else inf
+            stay = prev[r] + _ALIGN_EXTRA
+            miss = 0.0 if r in match[k] else _ALIGN_MISS
+            if advance <= stay:
+                cur[r], choice[r] = advance + miss, best_r
+            else:
+                cur[r], choice[r] = stay + miss, r
+        prev = cur
+        back.append(choice)
+    r = min(range(R), key=lambda i: (prev[i] + (R - 1 - i) * _ALIGN_SKIP, i))
+    assign = [0] * K
+    for k in range(K - 1, -1, -1):
+        assign[k] = r
+        r = back[k][r] if k else r
+    return assign, sum(assign[k] in match[k] for k in range(K))
+
+
+def _plan_from_text(reader: Any, rows: list[TocRow], first: int, n: int) -> PacketPlan | None:
+    """No usable bookmarks: find each listed candidate's first page by name (or ID) near the top
+    of the page, in TOC order. None when fewer than half of the candidates are found."""
+    if first >= n or n - first > BUNDLE_MAX_TEXT_PAGES:
+        return None
+    tops: list[tuple[set[str], str]] = []
+    for p in range(first, n):
+        try:
+            head = (reader.pages[p].extract_text() or "")[:800].casefold()
+        except Exception:
+            head = ""
+        tops.append((set(re.findall(r"[a-z]+", _person_key(head))), head))
+    found: list[tuple[int, int]] = []
+    pos = 0
+    for r, (_num, person, cid) in enumerate(rows):
+        need = [t for t in _person_key(person).split() if len(t) >= 2]
+        for q in range(pos, len(tops)):
+            tokens, head = tops[q]
+            if (need and all(t in tokens for t in need)) or cid.casefold() in head:
+                found.append((first + q, r))
+                pos = q + 1
+                break
+    if len(found) < max(1, math.ceil(len(rows) / 2)):
+        return None
+    return [(rows[r], 1, page, found[i + 1][0] if i + 1 < len(found) else n) for i, (page, r) in enumerate(found)]
+
+
+def _clean_file_name(person: str) -> str:
+    text = unicodedata.normalize("NFKD", person).encode("ascii", "ignore").decode()
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")[:60] or "Candidate"
+
+
+def _write_splits(reader: Any, plan: PacketPlan, packet: str, issues: list[dict[str, Any]]) -> list[ResumeDoc]:
+    """One PDF per attachment. The candidate ID goes into the file's metadata, so identical resumes
+    of two applications (same person, two IDs) stay two files with their own hashes."""
+    from pypdf import PdfWriter
+
+    docs: list[ResumeDoc] = []
+    for (_num, person, cid), attachment, first, end in plan:
+        if end <= first:
+            continue
+        stem = f"{cid}_{_clean_file_name(person)}"
+        file_name = f"{stem}.pdf" if attachment == 1 else f"{stem}_att{attachment}.pdf"
+        try:
+            writer = PdfWriter()
+            for p in range(first, end):
+                writer.add_page(reader.pages[p])
+            writer.add_metadata({"/Subject": f"{cid} attachment {attachment}"})
+            buf = io.BytesIO()
+            writer.write(buf)
+        except Exception as exc:
+            issues.append(_issue("warning", f"Could not write pages {first + 1}-{end} of the packet "
+                                            f"({type(exc).__name__}) - skipped", packet, cid))
+            continue
+        docs.append(PacketResumeDoc(file_name, buf.getvalue(), f"bundle:{packet}",
+                                    bundle_source=f"{packet} p.{first + 1}-{end}"))
+    return docs
 
 
 def load_resume_folder(path: str | Path) -> list[ResumeDoc]:
@@ -224,10 +656,20 @@ def load_resume_folder(path: str | Path) -> list[ResumeDoc]:
 def extract_text(doc: ResumeDoc) -> tuple[str, list[str]]:
     """(raw text, warnings) for a .pdf / .docx / .txt resume. Never raises.
 
-    Read failures are reported as the first warning and yield "".
+    Read failures are reported as the first warning and yield "". PDF text a reader cannot see
+    (white on white, invisible render mode, < 1 pt, outside the page) is left out.
     """
     text, warnings, error = _extract(doc)
     return text, ([error] if error else []) + warnings
+
+
+@dataclasses.dataclass
+class _Extracted:
+    text: str = ""
+    warnings: list[str] = dataclasses.field(default_factory=list)
+    error: str | None = None
+    hidden: list[dict[str, str]] = dataclasses.field(default_factory=list)   # hidden-text findings
+    pending: list[str] = dataclasses.field(default_factory=list)  # hidden runs still in ``text`` (to remove)
 
 
 def _sniff_kind(content: bytes, ext: str) -> str:
@@ -242,34 +684,39 @@ def _sniff_kind(content: bytes, ext: str) -> str:
 
 def _extract(doc: ResumeDoc) -> tuple[str, list[str], str | None]:
     """(text, warnings, error). ``error`` is set only when the file could not be read."""
+    out = _extract_full(doc)
+    return injection.remove_snippets(out.text, out.pending) if out.pending else out.text, out.warnings, out.error
+
+
+def _extract_full(doc: ResumeDoc) -> _Extracted:
     try:
         content = doc.content or b""
         ext = Path(doc.file_name or "").suffix.lower()
     except Exception:
-        return "", [], "Invalid document object"
+        return _Extracted(error="Invalid document object")
     if not content:
-        return "", ["File is empty (0 bytes)"], None
+        return _Extracted(warnings=["File is empty (0 bytes)"])
     if ext not in SUPPORTED_EXTENSIONS:
-        return "", [], _unsupported_message(ext)
+        return _Extracted(error=_unsupported_message(ext))
     kind = _sniff_kind(content, ext)
     try:
         if kind == ".pdf":
             return _pdf_text(content)
         if kind == ".docx":
             return _docx_text(content)
-        return _decode_text(content), [], None
+        return _Extracted(_decode_text(content))
     except Exception as exc:  # defensive: extractor bugs must not escape
-        return "", [], f"Could not extract text ({type(exc).__name__})"
+        return _Extracted(error=f"Could not extract text ({type(exc).__name__})")
 
 
 _PDF_LIMIT_NOTE = (f"exceeds the safety limits for a resume (over {PDF_MAX_DECODED_MB} MB when decompressed, "
                    "or too complex; possible decompression bomb)")
 
 
-def _pdf_text(content: bytes) -> tuple[str, list[str], str | None]:
+def _pdf_text(content: bytes) -> _Extracted:
     if b"%PDF-" not in content[:1024]:
         # Checked here so pypdf never logs "invalid pdf header: <first bytes of the file>".
-        return "", [], "Not a valid PDF file (missing %PDF header) - the file may be corrupted or mislabelled"
+        return _Extracted(error="Not a valid PDF file (missing %PDF header) - the file may be corrupted or mislabelled")
     warnings: list[str] = []
     error: str | None = None
     text = ""
@@ -277,6 +724,9 @@ def _pdf_text(content: bytes) -> tuple[str, list[str], str | None]:
     page_count: int | None = None
     limit_hit = False   # pypdf stopped at a size limit: the file never goes to pdfminer either
     limit_errors = _pdf_limit_errors()
+    hidden: list[dict[str, str]] = []
+    hidden_texts: list[str] = []
+    form_texts: list[str] = []
     try:
         from pypdf import PdfReader
 
@@ -286,15 +736,20 @@ def _pdf_text(content: bytes) -> tuple[str, list[str], str | None]:
                 try:
                     reader.decrypt("")
                 except Exception:
-                    return "", [], "PDF is password-protected"
+                    return _Extracted(error="PDF is password-protected")
             page_count = len(reader.pages)
             if page_count > PDF_MAX_PAGES:
-                return "", [], (f"PDF has {page_count:,} pages - files longer than {PDF_MAX_PAGES} pages "
-                                "are not read as resumes")
+                return _Extracted(error=f"PDF has {page_count:,} pages - files longer than {PDF_MAX_PAGES} pages "
+                                        "are not read as resumes")
+            budget, off_layers = injection.ScanBudget(), injection.hidden_ocgs(reader)
             pages: list[str] = []
             for i, page in enumerate(reader.pages, start=1):
                 try:
-                    pages.append(page.extract_text() or "")
+                    page_text, scan = _pdf_page_text(page, reader, i, budget, off_layers)
+                    pages.append(page_text)
+                    hidden.extend(scan.findings)
+                    hidden_texts.extend(scan.texts)
+                    form_texts.extend(scan.form_texts)
                 except limit_errors:
                     limit_hit = True
                     warnings.append(f"PDF page {i} {_PDF_LIMIT_NOTE} - this and any later pages were skipped")
@@ -308,16 +763,53 @@ def _pdf_text(content: bytes) -> tuple[str, list[str], str | None]:
     except Exception as exc:
         error = f"Could not read PDF ({type(exc).__name__}) - the file may be corrupted"
 
+    pending = form_texts            # hidden text in form XObjects is still in the extracted text
     if len(text.strip()) < PDF_FALLBACK_CHARS and not limit_hit and _pdf_fallback_allowed(content, page_count):
         alt = _pdfplumber_text(content)
         ours, theirs = _alnum_count(text), _alnum_count(alt)
         if theirs > ours and (ours < 30 or theirs > 1.5 * ours):
-            text, error = alt, None
+            text, error, pending = alt, None, hidden_texts   # pdfminer shows every hidden run
     if limit_hit and error is None:
         error = f"PDF {_PDF_LIMIT_NOTE} - not read"
     if not text.strip() and error is None:
         warnings.append(_OCR_HINT)
-    return _append_links(text, links), warnings, (error if not text.strip() else None)
+    return _Extracted(_append_links(text, links), warnings, error if not text.strip() else None,
+                      hidden[:injection.MAX_FINDINGS], list(pending))
+
+
+def _pdf_page_text(page: Any, reader: Any, page_no: int, budget: injection.ScanBudget,
+                   off_layers: frozenset[int]) -> tuple[str, injection.PageScan]:
+    """Visible text of one page and its hidden-text evidence.
+
+    The page's content stream is parsed once: the hidden-text scan walks the parsed operators,
+    blanks the strings a reader cannot see, and pypdf's extractor then reuses the same parsed
+    stream. Size-limit errors propagate (the caller skips the page); a stream pypdf cannot
+    parse is left to pypdf's own extractor.
+    """
+    from pypdf.generic import ContentStream, NameObject
+
+    limit_errors = _pdf_limit_errors()
+    try:
+        contents = page.get("/Contents")
+        obj = contents.get_object() if contents is not None else None
+        stream = ContentStream(obj, reader, "bytes") if obj is not None else None
+        ops = stream.operations if stream is not None else None
+    except limit_errors:
+        raise
+    except Exception:
+        ops = stream = None
+    if stream is None or ops is None:
+        return page.extract_text() or "", injection.PageScan()
+    try:
+        scan = injection.scan_page(page, ops, reader, page_no, budget=budget, off_ocgs=off_layers)
+    except limit_errors:
+        raise
+    except Exception:  # a scanner bug must never cost the page its text
+        scan = injection.PageScan()
+    if scan.hidden_ops:
+        injection.neutralize(ops, scan.hidden_ops)
+    page[NameObject("/Contents")] = stream      # pypdf reuses an already-parsed ContentStream
+    return page.extract_text() or "", scan
 
 
 _PDF_LIMIT_FIELDS = (  # pypdf Configuration fields capped at PDF_MAX_DECODED_MB while a resume is read
@@ -617,10 +1109,10 @@ def _docx_for_reading(content: bytes) -> tuple[bytes, str | None]:
     return out.getvalue(), None
 
 
-def _docx_text(content: bytes) -> tuple[str, list[str], str | None]:
+def _docx_text(content: bytes) -> _Extracted:
     content, problem = _docx_for_reading(content)
     if problem:
-        return "", [], problem
+        return _Extracted(error=problem)
     try:
         import docx
         from docx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -628,7 +1120,7 @@ def _docx_text(content: bytes) -> tuple[str, list[str], str | None]:
 
         document = docx.Document(io.BytesIO(content))
     except Exception as exc:
-        return "", [], f"Could not read DOCX ({type(exc).__name__}) - the file may be corrupted"
+        return _Extracted(error=f"Could not read DOCX ({type(exc).__name__}) - the file may be corrupted")
 
     warnings: list[str] = []
     head: list[str] = []
@@ -671,8 +1163,80 @@ def _docx_text(content: bytes) -> tuple[str, list[str], str | None]:
                 links.append(rel.target_ref)
     except Exception:
         pass
+    try:
+        hidden, pending = _docx_hidden(document)
+    except Exception:
+        hidden, pending = [], []
     text = "\n".join(head + body + boxes + foot)
-    return _append_links(text, links), warnings, None
+    return _Extracted(_append_links(text, links), warnings, None, hidden, pending)
+
+
+_DOCX_OFF = frozenset({"0", "false", "off", "none"})
+DOCX_HIDDEN_REPORT_WORDS = 15   # hidden Word text this long is reported even without skills / instructions
+
+
+def _docx_run_hidden(rpr: Any, qn: Callable[[str], str]) -> str | None:
+    """Why Word never shows this run ('Hidden' font attribute, or under 1 pt), else None."""
+    if rpr is None:
+        return None
+    val = qn("w:val")
+    for tag in ("w:vanish", "w:specVanish"):
+        el = rpr.find(qn(tag))
+        if el is not None and str(el.get(val, "true")).lower() not in _DOCX_OFF:
+            return "Word 'Hidden' text attribute"
+    size = rpr.find(qn("w:sz"))
+    try:
+        half_points = float(size.get(val)) if size is not None else None
+    except (TypeError, ValueError):
+        half_points = None
+    if half_points is not None and half_points < 2:
+        return f"text {half_points / 2:g} pt high"
+    return None
+
+
+def _docx_hidden(document: Any) -> tuple[list[dict[str, str]], list[str]]:
+    """(findings, texts to remove) for body text Word never displays.
+
+    Every hidden run is removed from the text used for parsing; it is reported only when it
+    looks adversarial (instruction-like, 3+ known skills, or long), since templates sometimes
+    keep short hidden remnants.
+    """
+    from docx.oxml.ns import qn
+
+    runs: list[tuple[str, str]] = []
+    for p in document.element.body.iter(qn("w:p")):
+        parts: list[str] = []
+        reason = ""
+        for r in p.iter(qn("w:r")):
+            if next(r.iterancestors(qn("w:p")), None) is not p:
+                continue                                     # runs of a nested text-box paragraph
+            text = "".join(t.text or "" for t in r.iter(qn("w:t")))
+            if not text:
+                continue
+            why = _docx_run_hidden(r.find(qn("w:rPr")), qn)
+            if why:
+                parts.append(text)
+                reason = reason or why
+            elif text.strip() and parts:
+                runs.append(("".join(parts), reason))
+                parts, reason = [], ""
+        if parts:
+            runs.append(("".join(parts), reason))
+    pending: list[str] = []
+    findings: list[dict[str, str]] = []
+    for raw, reason in runs:
+        text = " ".join(raw.split())
+        if not text:
+            continue
+        pending.append(text)
+        instruction = injection.looks_like_instruction(text)
+        words = len(text.split())
+        if instruction or len(skills.extract_skills(text)) >= 3 or words >= DOCX_HIDDEN_REPORT_WORDS:
+            detail = f"{reason}; {words} word{'s' if words != 1 else ''}"
+            if instruction:
+                detail += "; reads like an instruction to AI screeners"
+            findings.append({"kind": "hidden_text", "snippet": text[:injection.SNIPPET_MAX], "detail": detail})
+    return findings[:injection.MAX_FINDINGS], pending
 
 
 def _docx_blocks(container: Any, out: list[str]) -> None:
@@ -1761,19 +2325,33 @@ def parse_resume_text(text: str, file_name: str = "", file_hash: str = "",
     """Structure raw resume text into a ParsedResume. Never raises.
 
     ``id_pattern`` defaults to ProcessingConfig.candidate_id_pattern ("" disables ID guessing).
+    Instruction-like text aimed at AI screeners and invisible characters are recorded in
+    ``injection_findings``; invisible characters are removed before parsing.
     """
+    return _parse_safely(text, file_name, file_hash, id_pattern)
+
+
+def _parse_safely(text: str, file_name: str, file_hash: str, id_pattern: str | None,
+                  hidden: list[dict[str, str]] | None = None, pending: list[str] | None = None) -> ParsedResume:
     file_name = _basename(file_name)
     try:
-        return _parse_text(text or "", file_name, file_hash or "", id_pattern)
+        return _parse_text(text or "", file_name, file_hash or "", id_pattern, hidden or [], pending or [])
     except Exception as exc:  # defensive: one odd resume must never stop a batch
-        return _failed(file_name, file_hash or "", f"Parser error ({type(exc).__name__})", [], id_pattern)
+        failed = _failed(file_name, file_hash or "", f"Parser error ({type(exc).__name__})", [], id_pattern)
+        failed.injection_findings = list(hidden or [])
+        return failed
 
 
-def _parse_text(raw: str, file_name: str, file_hash: str, id_pattern: str | None) -> ParsedResume:
-    text = _normalize_text(raw)
+def _parse_text(raw: str, file_name: str, file_hash: str, id_pattern: str | None,
+                hidden: list[dict[str, str]], pending: list[str]) -> ParsedResume:
+    if pending:                                       # hidden runs the PDF extractor could not blank
+        raw = injection.remove_snippets(raw, pending)
+    findings = list(hidden) + injection.scan_text(raw)
+    text = _normalize_text(injection.strip_invisible(raw))
     lines = text.split("\n") if text else []
     rx, _ = _id_regexes(id_pattern)
-    pr = ParsedResume(file_name=file_name, file_hash=file_hash, text=text, word_count=len(text.split()))
+    pr = ParsedResume(file_name=file_name, file_hash=file_hash, text=text, word_count=len(text.split()),
+                      injection_findings=findings)
     pr.emails = _emails(text)
     pr.phones = _phones(text)
     pr.urls = _urls(text)
@@ -1825,23 +2403,31 @@ def _failed(file_name: str, file_hash: str, error: str, warnings: list[str],
 
 
 def parse_resume(doc: ResumeDoc, id_pattern: str | None = None) -> ParsedResume:
-    """Extract and parse one resume file. Never raises (status "ok" | "empty" | "error")."""
+    """Extract and parse one resume file. Never raises (status "ok" | "empty" | "error").
+
+    Hidden / adversarial text goes to ``injection_findings`` and never into the parsed text;
+    a file split from a packet carries ``bundle_source``.
+    """
     file_name = _basename(getattr(doc, "file_name", "") or "")
+    bundle_source = getattr(doc, "bundle_source", None)
     try:
         file_hash = doc.sha256
     except Exception:
         file_hash = ""
     try:
-        text, warnings, error = _extract(doc)
-        if error:
-            return _failed(file_name, file_hash, error, warnings, id_pattern)
-        parsed = parse_resume_text(text, file_name, file_hash, id_pattern)
-        parsed.warnings = _dedupe(warnings + parsed.warnings)
-        if parsed.parse_status == "empty" and warnings:
-            parsed.parse_error = warnings[0]
-        return parsed
+        ext = _extract_full(doc)
+        if ext.error:
+            parsed = _failed(file_name, file_hash, ext.error, ext.warnings, id_pattern)
+            parsed.injection_findings = list(ext.hidden)
+        else:
+            parsed = _parse_safely(ext.text, file_name, file_hash, id_pattern, ext.hidden, ext.pending)
+            parsed.warnings = _dedupe(ext.warnings + parsed.warnings)
+            if parsed.parse_status == "empty" and ext.warnings:
+                parsed.parse_error = ext.warnings[0]
     except Exception as exc:  # defensive
-        return _failed(file_name, file_hash, f"Unexpected parser error ({type(exc).__name__})", [], id_pattern)
+        parsed = _failed(file_name, file_hash, f"Unexpected parser error ({type(exc).__name__})", [], id_pattern)
+    parsed.bundle_source = bundle_source if isinstance(bundle_source, str) else None
+    return parsed
 
 
 def parse_resumes(docs: list[ResumeDoc], max_workers: int = 8,

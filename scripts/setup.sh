@@ -13,7 +13,7 @@
 #   --index-url URL      Package index, e.g. an internal mirror (https://pypi.internal.example/simple).
 #   --trusted-host HOST  Trust this index host without TLS verification (internal mirror only).
 #   --wheel-dir DIR      Install offline from a folder of wheels (pip --no-index --find-links).
-#   --python EXE         Python 3.11 (64-bit) interpreter used to create the environment.
+#   --python EXE         Python 3.11 to 3.14 (64-bit) interpreter used to create the environment.
 #   --no-tests           Skip the test suite after installing.
 #   --dry-run            Print the steps without changing anything.
 #   -h, --help           Show this help.
@@ -22,7 +22,9 @@
 # Full installation guide: docs/DEPLOYMENT.md
 set -euo pipefail
 
-REQUIRED_MINOR=11   # requirements.txt is pinned and tested on Python 3.11
+MIN_MINOR=11   # requirements.txt is tested on Python 3.11 to 3.14
+MAX_MINOR=14
+SUPPORTED="3.${MIN_MINOR} to 3.${MAX_MINOR}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="${HOME}/.venvs/hiring-screening"
 INDEX_URL=""
@@ -89,7 +91,9 @@ find_python() {
   if [[ -n "$PYTHON" ]]; then
     candidates=("$PYTHON")
   else
-    candidates=("python3.${REQUIRED_MINOR}" python3 python)
+    local m
+    for (( m = MIN_MINOR; m <= MAX_MINOR; m++ )); do candidates+=("python3.${m}"); done
+    candidates+=(python3 python)
   fi
   for candidate in "${candidates[@]}"; do
     command -v "$candidate" >/dev/null 2>&1 || continue
@@ -100,17 +104,17 @@ find_python() {
     seen+=" ${candidate} = Python ${version} (${bits}-bit);"
     [[ "$bits" == "64" && "${version%%.*}" == "3" ]] || continue
     minor="$(printf '%s' "$version" | cut -d. -f2)"
-    if [[ "$minor" == "$REQUIRED_MINOR" ]]; then
+    if (( minor >= MIN_MINOR && minor <= MAX_MINOR )); then
       printf '%s\n' "$candidate"
       return 0
     fi
-    if [[ -n "$PYTHON" ]] && (( minor > REQUIRED_MINOR )); then
-      warn "Python $version is not the tested version (3.${REQUIRED_MINOR}); continuing because --python was given."
+    if [[ -n "$PYTHON" ]] && (( minor > MAX_MINOR )); then
+      warn "Python $version is newer than the tested versions (${SUPPORTED}); continuing because --python was given."
       printf '%s\n' "$candidate"
       return 0
     fi
   done
-  die "Python 3.${REQUIRED_MINOR} (64-bit) is required.${seen:+ Found:${seen}} Install python3.${REQUIRED_MINOR} (plus python3.${REQUIRED_MINOR}-venv on Debian/Ubuntu) or pass --python PATH."
+  die "Python ${SUPPORTED} (64-bit) is required.${seen:+ Found:${seen}} Install one of them (plus the matching python3.X-venv package on Debian/Ubuntu) or pass --python PATH."
 }
 
 # ---------------------------------------------------------------------------
@@ -140,16 +144,16 @@ if VPY="$(venv_python "$VENV")"; then
   step "Using the existing virtual environment at $VENV"
   info="$(py_info "$VPY")"
   [[ -n "$info" ]] || die "The virtual environment at $VENV does not start (was its base Python removed or moved?). Delete that folder and run this script again."
-  case "${info% *}" in
-    "3.${REQUIRED_MINOR}."*) ;;
-    *) warn "It uses Python ${info% *}; requirements.txt is tested on Python 3.${REQUIRED_MINOR}." ;;
-  esac
+  vminor="$(printf '%s' "${info% *}" | cut -d. -f2)"
+  if [[ "${info%%.*}" != "3" ]] || (( vminor < MIN_MINOR || vminor > MAX_MINOR )); then
+    warn "It uses Python ${info% *}; requirements.txt is tested on Python ${SUPPORTED}."
+  fi
 else
   BASE_PY="$(find_python)"
   step "Creating the virtual environment at $VENV with $BASE_PY (Python $(py_info "$BASE_PY" | cut -d' ' -f1))"
   run mkdir -p "$(dirname "$VENV")"
   if ! run "$BASE_PY" -m venv "$VENV"; then
-    die "Creating the virtual environment failed. On Debian/Ubuntu install the python3.${REQUIRED_MINOR}-venv package first."
+    die "Creating the virtual environment failed. On Debian/Ubuntu install the matching python3.X-venv package first."
   fi
   if (( DRY_RUN )); then
     case "$(uname -s 2>/dev/null || echo unknown)" in

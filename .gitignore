@@ -24,6 +24,21 @@ exports/
 !tests/fixtures/*.xlsx
 
 # ---------------------------------------------------------------
+# Package-manager / build credentials and caches (may hold tokens)
+# ---------------------------------------------------------------
+.npmrc
+.yarnrc
+.yarnrc.yml
+pip.conf
+pip.ini
+NuGet.Config
+nuget.config
+.gradle/
+gradle.properties
+node_modules/
+*.vsix
+
+# ---------------------------------------------------------------
 # Runtime caches (LLM responses, parsed resumes)
 # ---------------------------------------------------------------
 .cache/

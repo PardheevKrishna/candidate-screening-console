@@ -609,3 +609,62 @@ def test_parse_300_txt_resumes_quickly():
     elapsed = time.perf_counter() - start
     assert len(out) == 300 and all(p.parse_status == "ok" for p in out.values())
     assert elapsed < 5.0, elapsed
+
+
+# ---------------------------------------------------------------------------
+# Packets, progress and provenance (Workday specifics live in tests/test_workday.py)
+# ---------------------------------------------------------------------------
+def _packet(n: int) -> bytes:
+    """Contents page + one bookmarked single-page resume per listed candidate."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4, invariant=1)
+    c.drawString(60, 800, "Table of Contents")
+    for i in range(n):
+        c.drawString(60, 780 - 16 * i, f"{i + 1}. Person{chr(65 + i)} Example C-{2000000 + i}")
+    c.showPage()
+    for i in range(n):
+        c.bookmarkPage(f"k{i}")
+        c.addOutlineEntry(f"Person{chr(65 + i)} Example", f"k{i}")
+        c.drawString(60, 800, f"Person{chr(65 + i)} Example")
+        c.drawString(60, 780, "Skills: Python, SQL")
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def test_sample_resume_has_no_injection_findings(parsed_txt):
+    assert parsed_txt.injection_findings == [] and parsed_txt.bundle_source is None
+
+
+def test_expand_uploads_progress_runs_on_the_calling_thread():
+    from screening.config import AppConfig
+
+    archive = _zip_bytes({"b.txt": b"Bbb Person\nSkills: SQL", "c.pdf": _packet(3), "photo.png": b"\x89PNG"})
+    docs = [ResumeDoc("a.txt", b"Aaa Person\nSkills: Python"), ResumeDoc("batch.zip", archive),
+            ResumeDoc("notes.png", b"\x89PNG")]
+    calls: list[tuple[int, int, str, int]] = []
+    out, _issues = RP.expand_uploads(docs, AppConfig(),            # an AppConfig is accepted too
+                                     progress_cb=lambda d, t, n: calls.append((d, t, n, threading.get_ident())))
+    assert [d.file_name for d in out] == ["a.txt", "b.txt", "C-2000000_PersonA_Example.pdf",
+                                          "C-2000001_PersonB_Example.pdf", "C-2000002_PersonC_Example.pdf"]
+    assert [c[0] for c in calls] == [1, 2, 3, 4] and {c[1] for c in calls} == {4}
+    assert [c[2] for c in calls] == ["a.txt", "b.txt", "c.pdf", "notes.png"]
+    assert {c[3] for c in calls} == {threading.get_ident()}
+
+
+def test_zip_member_cap_counts_split_resumes():
+    archive = _zip_bytes({"a.txt": b"Aaa Person\nSkills: Python", "packet.pdf": _packet(4),
+                          "z.txt": b"Zed Person\nSkills: SQL"})
+    out, issues = RP.expand_uploads([ResumeDoc("x.zip", archive)], ProcessingConfig(max_zip_members=3))
+    assert [d.file_name for d in out] == ["a.txt", "C-2000000_PersonA_Example.pdf", "C-2000001_PersonB_Example.pdf"]
+    assert any("more than 3 resumes" in i["issue"] for i in issues)
+
+
+def test_packet_documents_carry_their_source():
+    first, second = RP.split_bundle(ResumeDoc("set_1.pdf", _packet(2)), ProcessingConfig())
+    assert isinstance(first, RP.PacketResumeDoc) and first.source == "bundle:set_1.pdf"
+    assert (first.bundle_source, second.bundle_source) == ("set_1.pdf p.2-2", "set_1.pdf p.3-3")
+    parsed = RP.parse_resume(first)
+    assert parsed.bundle_source == "set_1.pdf p.2-2" and parsed.candidate_id_guess == "C-2000000"
+    assert parsed.name_guess == "PersonA Example" and parsed.parse_status == "ok"
+    assert RP.parse_resume(ResumeDoc("plain.txt", TXT_RESUME.encode())).bundle_source is None

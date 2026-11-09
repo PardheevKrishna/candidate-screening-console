@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     Steps:
-      1. Finds Python 3.11 (64-bit): -PythonExe when given, otherwise the "py -3.11" launcher,
-         otherwise python3.11 / python / python3 on PATH.
+      1. Finds Python 3.11 to 3.14 (64-bit): -PythonExe when given, otherwise the "py" launcher
+         (3.11, 3.12, 3.13, then 3.14), otherwise python3.11 ... python3.14 / python / python3 on PATH.
       2. Creates the virtual environment at -VenvPath, or reuses it when it already exists.
       3. Installs requirements.txt from the default index, from an internal mirror (-IndexUrl,
          -TrustedHost) or from a folder of pre-downloaded wheels (-WheelDir, no network needed).
@@ -35,7 +35,7 @@
     Cannot be combined with -IndexUrl.
 
 .PARAMETER PythonExe
-    Full path of the Python 3.11 (64-bit) interpreter used to create the virtual environment.
+    Full path of the Python 3.11 to 3.14 (64-bit) interpreter used to create the virtual environment.
 
 .PARAMETER NoTests
     Skip the test suite after installing.
@@ -65,7 +65,9 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$RequiredMinor = 11   # requirements.txt is pinned and tested on Python 3.11
+$MinMinor = 11   # requirements.txt is tested on Python 3.11 to 3.14
+$MaxMinor = 14
+$Supported = "3.$MinMinor to 3.$MaxMinor"
 
 function Write-Step([string]$Message) {
     Write-Host "==> $Message"
@@ -106,9 +108,10 @@ function Find-Python {
         $candidates.Add(@($PythonExe))
     } else {
         if (Get-Command py -CommandType Application -ErrorAction SilentlyContinue) {
-            $candidates.Add(@('py', "-3.$RequiredMinor"))
+            foreach ($minor in $MinMinor..$MaxMinor) { $candidates.Add(@('py', "-3.$minor")) }
         }
-        foreach ($name in @("python3.$RequiredMinor", 'python', 'python3')) {
+        $names = @(foreach ($minor in $MinMinor..$MaxMinor) { "python3.$minor" }) + @('python', 'python3')
+        foreach ($name in $names) {
             foreach ($cmd in @(Get-Command $name -CommandType Application -ErrorAction SilentlyContinue)) {
                 # Skip the Microsoft Store placeholder: it offers to install Python instead of running it.
                 if ($cmd.Source -notmatch '\\WindowsApps\\') { $candidates.Add(@($cmd.Source)) }
@@ -124,16 +127,16 @@ function Find-Python {
         if ($null -eq $info) { continue }
         $seen += "$label = Python $($info.Version) ($($info.Bits)-bit)"
         if ($info.Bits -ne 64 -or $info.Version.Major -ne 3) { continue }
-        if ($info.Version.Minor -eq $RequiredMinor) {
+        if ($info.Version.Minor -ge $MinMinor -and $info.Version.Minor -le $MaxMinor) {
             return [pscustomobject]@{ Exe = $exe; Prefix = $prefix; Version = $info.Version; Label = $label }
         }
-        if ($PythonExe -and $info.Version.Minor -gt $RequiredMinor) {
-            Write-Warning "Python $($info.Version) is not the tested version (3.$RequiredMinor); continuing because -PythonExe was given."
+        if ($PythonExe -and $info.Version.Minor -gt $MaxMinor) {
+            Write-Warning "Python $($info.Version) is newer than the tested versions ($Supported); continuing because -PythonExe was given."
             return [pscustomobject]@{ Exe = $exe; Prefix = $prefix; Version = $info.Version; Label = $label }
         }
     }
     $detail = if ($seen.Count) { ' Found: ' + ($seen -join '; ') + '.' } else { ' No Python interpreter was found.' }
-    Stop-WithError ("Python 3.$RequiredMinor (64-bit) is required.$detail Install it for all users " +
+    Stop-WithError ("Python $Supported (64-bit) is required.$detail Install it for all users " +
                     '(python.org installer or the company software portal) or pass -PythonExe <path>.')
 }
 
@@ -184,8 +187,8 @@ if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
         Stop-WithError ("The virtual environment at $venvFull does not start (was its base Python removed or moved?). " +
                         'Delete that folder and run this script again.')
     }
-    if ($info.Version.Minor -ne $RequiredMinor) {
-        Write-Warning "It uses Python $($info.Version); requirements.txt is tested on Python 3.$RequiredMinor."
+    if ($info.Version.Minor -lt $MinMinor -or $info.Version.Minor -gt $MaxMinor) {
+        Write-Warning "It uses Python $($info.Version); requirements.txt is tested on Python $Supported."
     }
 } else {
     $python = Find-Python

@@ -424,3 +424,65 @@ def test_name_only_match_is_not_linked_when_contact_details_disagree():
     assert "possible name match CAND-00001" in m.loc["h1", "note"]
     assert m.loc["h2", S.MATCH_METHOD] == S.MATCH_NAME            # no contradicting contact -> linked
     assert m.loc["h2", S.CANDIDATE_ID] == "CAND-00002"
+
+
+# ---------------------------------------------------------------------------
+# Workday packet splits: "{candidate_id}_{Cleaned_Name}.pdf" and "..._att2.pdf"
+# ---------------------------------------------------------------------------
+RESUME_SECTIONS = {"education": "B.Tech", "skills": "Python", "projects": "Portal", "experience": "Intern"}
+WORKDAY_TA = [("C-1000042", "Asha Menon", "asha.menon@example.com"), ("C-1000049", "Ravi Kumar", "ravi@example.com"),
+              ("C-1000999", "Asha Menon", "asha42@xyiict.example"), ("C-1000056", "Neha Singh", "neha@example.org")]
+
+
+@pytest.fixture()
+def workday_ta() -> pd.DataFrame:
+    return ta_frame([{S.CANDIDATE_ID: c, S.NAME: n, S.EMAIL: e} for c, n, e in WORKDAY_TA])
+
+
+def test_split_file_names_match_by_candidate_id(workday_ta):
+    parsed = as_dict(resume("C-1000042_Asha_Menon.pdf", word_count=300, sections=RESUME_SECTIONS),
+                     resume("C-1000049_Ravi_Kumar.pdf", word_count=280, name_guess="Somebody Else",
+                            emails=["ravi@example.com"]),
+                     resume("C-1000056_Neha_Singh.pdf", word_count=10))     # near-empty scan still links by ID
+    m = by_file(matching.match_resumes(workday_ta, parsed, CFG))
+    assert m[S.MATCH_METHOD].eq(S.MATCH_ID_FILENAME).all() and m[S.MATCH_CONFIDENCE].eq(1.0).all()
+    assert m[S.CANDIDATE_ID].to_dict() == {"C-1000042_Asha_Menon.pdf": "C-1000042",
+                                           "C-1000049_Ravi_Kumar.pdf": "C-1000049",
+                                           "C-1000056_Neha_Singh.pdf": "C-1000056"}
+    assert matching.attachment_index("C-1000042_Asha_Menon_att2.pdf") == 2
+    assert matching.attachment_index("C-1000042_Asha_Menon.pdf") == 1
+    assert matching.name_from_filename("C-1000042_Asha_Menon_att2.pdf") == "asha menon"
+
+
+@pytest.mark.parametrize("primary, second, winner", [
+    # a longer cover letter does not replace the resume
+    ({"word_count": 300, "sections": RESUME_SECTIONS}, {"word_count": 900}, "primary"),
+    # two resume-like attachments: the larger one is kept
+    ({"word_count": 300, "sections": RESUME_SECTIONS}, {"word_count": 500, "sections": RESUME_SECTIONS}, "second"),
+    # identical size and content: the primary attachment wins the tie
+    ({"word_count": 300, "sections": RESUME_SECTIONS}, {"word_count": 300, "sections": RESUME_SECTIONS}, "primary"),
+], ids=["cover-letter", "larger-resume", "tie"])
+def test_second_attachment_of_the_same_candidate(workday_ta, primary, second, winner):
+    parsed = as_dict(resume("C-1000042_Asha_Menon.pdf", **primary), resume("C-1000042_Asha_Menon_att2.pdf", **second))
+    matches = matching.match_resumes(workday_ta, parsed, CFG)
+    m = by_file(matches)
+    keep, other = (("C-1000042_Asha_Menon.pdf", "C-1000042_Asha_Menon_att2.pdf") if winner == "primary"
+                   else ("C-1000042_Asha_Menon_att2.pdf", "C-1000042_Asha_Menon.pdf"))
+    assert m.loc[keep, S.MATCH_METHOD] == S.MATCH_ID_FILENAME
+    assert m.loc[other, S.MATCH_METHOD] == S.MATCH_DUPLICATE and m.loc[other, S.CANDIDATE_ID] == "C-1000042"
+    assert m.loc[other, matching.NOTE] == f"additional attachment of C-1000042; {keep} linked as the resume"
+    _base, by_cand, issues = matching.link_candidates(workday_ta, parsed, matches, CFG)
+    assert by_cand["C-1000042"].file_name == keep
+    assert [i["issue"] for i in issues if i["file_name"] == other] == [
+        "Additional attachment for this candidate (not scored); the primary resume was linked."]
+
+
+def test_duplicate_application_note_vs_identity_conflict(workday_ta):
+    parsed = as_dict(resume("C-1000999_Asha_Menon.pdf", emails=["asha.menon@example.com"], word_count=300),
+                     resume("C-1000056_Neha_Singh.pdf", emails=["ravi@example.com"], word_count=300))
+    m = by_file(matching.match_resumes(workday_ta, parsed, CFG))
+    assert m.loc["C-1000999_Asha_Menon.pdf", S.CANDIDATE_ID] == "C-1000999"
+    assert m.loc["C-1000999_Asha_Menon.pdf", matching.NOTE] == (
+        "possible duplicate application: resume email belongs to C-1000042 (same name)")
+    assert m.loc["C-1000056_Neha_Singh.pdf", matching.NOTE] == (
+        f"{matching.IDENTITY_CONFLICT}: resume email belongs to C-1000049")

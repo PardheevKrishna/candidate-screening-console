@@ -2,8 +2,9 @@
 
 This guide installs the Candidate Screening & Integrity Console on a virtual machine inside the
 company network, so recruiters can use it from their browsers on the intranet. It covers Windows
-Server and Linux, installs with or without internet access, running the app as a service, and the
-day-to-day tasks: health checks, retention, backups and upgrades.
+Server and Linux, installs with or without internet access, running the app as a service, the
+optional GitHub Copilot connection for the LLM features, and the day-to-day tasks: health checks,
+retention, backups and upgrades.
 
 Values in angle brackets, such as `<DOMAIN\svc-screening>` or `<screening.example.internal>`, are
 placeholders for your environment. The examples use the layout below. Any local folders work,
@@ -14,6 +15,7 @@ but keep them out of cloud-synced folders and network shares.
 | Application code | `C:\apps\hiring-screening` | `/opt/hiring-screening` |
 | Virtual environment | `C:\apps\venvs\hiring-screening` | `/opt/venvs/hiring-screening` |
 | Saved runs (`SCREENING_RUNS_DIR`) | `D:\screening-data\runs` | `/var/lib/hiring-screening/runs` |
+| Cached datasets (fixed location) | `C:\apps\hiring-screening\data\cache` | `/opt/hiring-screening/data/cache` |
 | Service account | `<DOMAIN\svc-screening>` | `screening` |
 | App port | `8501` | `8501` |
 
@@ -47,18 +49,28 @@ but keep them out of cloud-synced folders and network shares.
         |  HTTP + WebSocket to 127.0.0.1:8501
         v
  Streamlit app: one Python process started by scripts/run_app.ps1 or scripts/run_app.sh
-        |  writes: saved runs (SCREENING_RUNS_DIR), LLM response cache (.cache/llm/)
-        v  only when a user clicks an LLM action
- LLM endpoint (hosted provider, or the internal wrapper; optional)
+        |  writes: saved runs (SCREENING_RUNS_DIR), cached datasets (data/cache/), LLM response cache (.cache/llm/)
+        v  only when a user clicks an LLM action (optional)
+ VS Code on the same VM, extension "Screening Copilot Proxy" on 127.0.0.1:5757
+        |  VS Code's own HTTPS connection
+        v
+ GitHub Copilot (under the Copilot account signed in to VS Code)
 ```
 
 * One Python process serves the page and a WebSocket connection (`/_stcore/stream`) on a single
   TCP port.
 * Every browser tab is its own session. Its uploads, parsed resumes and results are held in the
-  server's memory. Uploaded files themselves are never written to disk.
-* The app writes to disk only in these cases: a user saves a run in Run History (this stores the
-  results and the parsed resume text, see section 11), an LLM response is cached, someone generates
-  the synthetic sample data, or the service writes its log.
+  server's memory. Uploaded files themselves are never written to disk, but the parsed data (tables
+  and extracted resume text) is cached on disk in `data/cache/` so the same files reload in about a
+  second (section 11).
+* The app writes to disk only in these cases: a screening run caches its parsed dataset (unless
+  "Cache parsed datasets for fast reload" is switched off), a user saves a run in Run History (this
+  stores the results and the parsed resume text, section 11), an LLM response is cached, someone
+  generates the synthetic sample data, or the service writes its log.
+* The app's own code opens no outbound connections (Streamlit's public-IP lookup, which you can
+  avoid, is covered in section 8). Its only LLM traffic goes to the VS Code extension on
+  `127.0.0.1` of the same machine; VS Code forwards it to GitHub Copilot. Without VS Code the app
+  works fully, except for the LLM-written text.
 * There is no login screen. Who can open the URL is decided by the network, the firewall and the
   reverse proxy (section 8).
 
@@ -67,57 +79,68 @@ but keep them out of cloud-synced folders and network shares.
 | Item | Requirement |
 |---|---|
 | Operating system | Windows Server 2019 or later, or 64-bit Linux with glibc 2.28 or later (RHEL/Rocky/Alma 8+, Debian 11+, Ubuntu 22.04+) |
-| Python | **3.11, 64-bit** (`requirements.txt` is pinned and tested on 3.11.9) |
+| Python | **3.11, 3.12, 3.13 or 3.14, 64-bit**. `requirements.txt` lists compatible version ranges; the test suite passes on 3.11 and 3.14 |
 | CPU | 4 vCPU recommended; resume parsing runs on several threads |
-| Memory | 8 GB minimum; 16 GB when several recruiters process drives at the same time |
-| Disk | About **1.5 GB** for the code, the virtual environment (about 0.6 GB) and the pip download cache, **plus data**: about 6 MB per saved 3,000-candidate run, the LLM cache (a few KB per response) and, if generated, the synthetic sample (about 90 MB, or 10 MB with `--quick`) |
-| Network | Inbound: the app port (or 443 on the reverse proxy). Outbound: the package index during installation only, and the LLM endpoint only if LLM features are used |
+| Memory | 8 GB at least; 16 GB when several recruiters process drives at the same time |
+| Disk | About **1.5 GB** for the code, the virtual environment (about 0.6 GB) and the pip download cache, **plus data**: about 4 MB per cached dataset and 3.6 MB per saved run for the 2,133-application synthetic sample (real drives grow with the number and length of resumes), the LLM cache (a few KB per response) and, if generated, the synthetic sample (6.5 MB, under 1 MB with `--quick`) |
+| Network | Inbound: the app port (or 443 on the reverse proxy). Outbound: the package index during installation only; the app needs no outbound access at run time (section 8). If the LLM features are used, VS Code needs HTTPS access to GitHub Copilot |
+| LLM features (optional) | VS Code 1.95 or later with GitHub Copilot Chat, signed in to a GitHub account with a Copilot licence, running **on the same VM** in a logged-on desktop session (5.4) |
 | Accounts | An administrator to install; a dedicated, non-administrator service account to run the app |
 
-Measured on the 3,000-candidate synthetic sample (2,892 resumes): preparing the data takes about
-30 s and the process peaks at about 0.9 GB of memory. Afterwards each open session keeps roughly
-0.3 GB, plus the size of its uploads (the sample's resume ZIP is 40 MB; the upload limit is 1 GB),
-until its browser tab has been closed for about two minutes.
+Measured on the synthetic sample (2,133 applications, 1,877 resumes in a 6 MB `Resume.zip`):
+preparing the data takes about 40 s and the screening engine peaks at about 0.3 GB of memory
+(measured without the web server). Each open session keeps its own parsed data and results in
+memory, plus its uploads (the upload limit is 1 GB per file), until its browser tab has been closed
+for about two minutes.
 
-**Installing Python 3.11**
+**Installing Python**
 
-* **Windows Server:** use the python.org 3.11.9 64-bit installer, or the company software portal.
-  Install it **for all users** so the service account can run it. The installer adds the `py`
-  launcher. Unattended install:
+* **Windows Server:** use the python.org 64-bit installer of Python 3.11, 3.12, 3.13 or 3.14, or the
+  company software portal. Install it **for all users** so the service account can run it. The
+  installer adds the `py` launcher. Unattended install (`<version>` for example `3.12.10`):
 
   ```powershell
-  .\python-3.11.9-amd64.exe /quiet InstallAllUsers=1 PrependPath=1 Include_launcher=1 Include_test=0
-  py -0p          # lists installed versions; 3.11 must be among them
+  .\python-<version>-amd64.exe /quiet InstallAllUsers=1 PrependPath=1 Include_launcher=1 Include_test=0
+  py -0p          # lists installed versions; one of 3.11 to 3.14 must be among them
   ```
 
-* **Linux:** RHEL/Rocky/Alma 8.8+ and 9.2+: `sudo dnf install python3.11`. Ubuntu 22.04:
-  `sudo apt install python3.11 python3.11-venv`. Debian 12: `sudo apt install python3 python3-venv`
-  (its `python3` is 3.11). On other distributions, use the company's approved Python 3.11 build.
+* **Linux:** RHEL/Rocky/Alma 8.8+ and 9.2+: `sudo dnf install python3.11` (newer minor releases also
+  offer `python3.12`). Ubuntu 22.04: `sudo apt install python3.11 python3.11-venv`. Ubuntu 24.04 and
+  Debian 12: `sudo apt install python3 python3-venv` (their `python3` is 3.12 and 3.11). On other
+  distributions, use the company's approved build of Python 3.11 to 3.14.
 
 ## 3. Copy the project to the VM
 
 **Option A: Git (preferred).** Clone or pull from the internal repository into
-`C:\apps\hiring-screening` or `/opt/hiring-screening`. Ignored files (data, secrets, caches,
-virtual environments) are never in the repository, so nothing unwanted comes along. That includes the
-synthetic sample: everything under `data/` except `data/README.md` is ignored, so generate the sample
-on the VM when you need it (section 14).
+`C:\apps\hiring-screening` or `/opt/hiring-screening`. Ignored files (data, caches, secrets, `.env`,
+package-manager credential files, virtual environments) are never in the repository, so nothing
+unwanted comes along. That includes the synthetic sample: everything under `data/` except
+`data/README.md` is ignored, so generate the sample on the VM when you need it (section 14).
 
 **Option B: an archive.** Build it from a clean copy that contains only what the app needs:
 
-* `app.py`, `generate_mock_data.py`, `requirements.txt`, `pytest.ini`, `README.md`, `.gitignore`
-* the folders `docs/`, `screening/`, `scripts/`, `tests/`, `ui/`
+* `app.py`, `generate_mock_data.py`, `requirements.txt`, `pytest.ini`, `README.md`, `.gitignore`,
+  `.env.example`
+* the folders `docs/`, `screening/`, `scripts/`, `tests/`, `ui/` and `vscode-copilot-proxy/` (the
+  VS Code extension, needed only for the LLM features)
 * `.streamlit/config.toml` and `.streamlit/secrets.toml.example`
 
-**Never copy these:**
+**Never commit or copy these:**
 
 | Path | Why |
 |---|---|
-| `data/` | Candidate data (real TA feeds and resumes are personal data); the synthetic sample is generated on the VM with `python generate_mock_data.py` (section 14) |
+| `data/` | Candidate data (real TA exports and resumes are personal data) and `data/cache/` (cached parsed datasets with resume text); the synthetic sample is generated on the VM with `python generate_mock_data.py` (section 14) |
 | `runs/` | Saved runs contain candidate personal data and belong to the machine that created them |
 | `.cache/` | LLM response cache; machine-specific and rebuilt automatically |
-| `.streamlit/secrets.toml` | API keys; create a new one on the VM (section 5.2) |
+| `.env`, `.streamlit/secrets.toml` | May hold the pinned proxy token; create new ones on the VM (section 5.2) |
+| `*.pem`, `*.key`, `*.pfx` | Certificates and private keys |
+| `.npmrc`, `.yarnrc`, `.yarnrc.yml`, `pip.conf`, `pip.ini`, `NuGet.Config` / `nuget.config`, `.gradle/`, `gradle.properties` | Package-manager configuration that can contain registry credentials or tokens |
 | `.venv/`, `venv/` or any other virtual environment | Virtual environments contain absolute paths and cannot be moved to another machine; create a new one on the VM |
-| `__pycache__/`, `.pytest_cache/`, editor or tool settings folders | Machine-specific files that are generated again |
+| `node_modules/`, `*.vsix` | Build output of the VS Code extension; package a VSIX when you need one (docs/COPILOT_PROXY.md) |
+| `__pycache__/`, `.pytest_cache/`, `.vscode/`, editor or tool settings folders | Machine-specific files that are generated again |
+
+`.gitignore` already excludes all of these (virtual environments under the usual names `.venv/`,
+`venv/` and `env/`; keep yours outside the project folder anyway, section 4).
 
 From a Git checkout, `git archive` writes exactly the committed files:
 
@@ -133,11 +156,11 @@ $stage = Join-Path $env:TEMP 'hiring-screening-release'
 Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force (Join-Path $stage '.streamlit') | Out-Null
 foreach ($item in 'app.py', 'generate_mock_data.py', 'requirements.txt', 'pytest.ini', 'README.md', '.gitignore',
-                  'docs', 'screening', 'scripts', 'tests', 'ui') {
+                  '.env.example', 'docs', 'screening', 'scripts', 'tests', 'ui', 'vscode-copilot-proxy') {
     Copy-Item -Recurse -Path $item -Destination $stage
 }
 Copy-Item '.streamlit\config.toml', '.streamlit\secrets.toml.example' (Join-Path $stage '.streamlit')
-Get-ChildItem $stage -Recurse -Directory -Force | Where-Object { $_.Name -in '__pycache__', '.pytest_cache' } |
+Get-ChildItem $stage -Recurse -Directory -Force | Where-Object { $_.Name -in '__pycache__', '.pytest_cache', 'node_modules' } |
     Remove-Item -Recurse -Force
 tar -czf ..\hiring-screening.tar.gz -C $stage .
 ```
@@ -146,10 +169,10 @@ On Linux:
 
 ```bash
 stage=$(mktemp -d)
-cp -r app.py generate_mock_data.py requirements.txt pytest.ini README.md .gitignore \
-      docs screening scripts tests ui "$stage"/
+cp -r app.py generate_mock_data.py requirements.txt pytest.ini README.md .gitignore .env.example \
+      docs screening scripts tests ui vscode-copilot-proxy "$stage"/
 mkdir -p "$stage/.streamlit" && cp .streamlit/config.toml .streamlit/secrets.toml.example "$stage/.streamlit/"
-find "$stage" -type d \( -name __pycache__ -o -name .pytest_cache \) -prune -exec rm -rf {} +
+find "$stage" -type d \( -name __pycache__ -o -name .pytest_cache -o -name node_modules \) -prune -exec rm -rf {} +
 tar -czf ../hiring-screening.tar.gz -C "$stage" .
 ```
 
@@ -176,8 +199,11 @@ antivirus scanners lock files while pip writes them, which breaks installs.
 
 ### 4.1 With the setup scripts (recommended)
 
-The scripts find Python 3.11 (64-bit), create the virtual environment (or reuse it), install
-`requirements.txt`, run `pip check` and the test suite (several hundred tests, about a minute).
+The scripts find a 64-bit Python 3.11 to 3.14, create the virtual environment (or reuse it),
+install `requirements.txt`, run `pip check` and the test suite (1,114 tests, about 1.5 minutes).
+On Windows they try the `py` launcher (3.11, 3.12, 3.13, then 3.14), then `python3.11` to
+`python3.14`, `python` and `python3` on the PATH; on Linux `python3.11` to `python3.14`, `python3`
+and `python`.
 
 ```powershell
 # Windows (as an administrator)
@@ -197,23 +223,30 @@ sudo bash scripts/setup.sh --venv /opt/venvs/hiring-screening
 | `-IndexUrl <url>` | `--index-url <url>` | Install from an internal mirror (4.3) |
 | `-TrustedHost <host>` | `--trusted-host <host>` | Skip TLS verification for that mirror host (only when unavoidable) |
 | `-WheelDir <dir>` | `--wheel-dir <dir>` | Install offline from downloaded wheels (4.4) |
-| `-PythonExe <path>` | `--python <exe>` | Use this interpreter instead of searching for Python 3.11 |
+| `-PythonExe <path>` | `--python <exe>` | Use this interpreter instead of searching for Python 3.11-3.14 (a newer version is accepted with a warning) |
 | `-NoTests` | `--no-tests` | Skip the test suite |
 | `-WhatIf` | `--dry-run` | Show the steps without changing anything |
 
+An existing virtual environment is reused; if it runs a Python outside 3.11-3.14 the script warns.
 `-ExecutionPolicy Bypass` applies to that one PowerShell process only; it does not change the
 machine's policy. If Group Policy requires signed scripts, sign `scripts\*.ps1` with the company
 code-signing certificate instead.
 
+**Version ranges.** `requirements.txt` lists compatible ranges (for example `streamlit>=1.50,<2`)
+rather than exact versions, so pip installs the newest versions within the ranges that the index
+offers on that day; `pip check` and the test suite confirm the combination. To install identical
+versions on several VMs, build one wheelhouse (4.4) and install every VM from it. Record what was
+installed with `python -m pip freeze > installed-versions.txt`.
+
 ### 4.2 Manually
 
 ```powershell
-py -3.11 -m venv C:\apps\venvs\hiring-screening
+py -3.11 -m venv C:\apps\venvs\hiring-screening        # or -3.12, -3.13, -3.14
 C:\apps\venvs\hiring-screening\Scripts\python.exe -m pip install -r C:\apps\hiring-screening\requirements.txt
 ```
 
 ```bash
-python3.11 -m venv /opt/venvs/hiring-screening
+python3.11 -m venv /opt/venvs/hiring-screening         # or python3.12, python3.13, python3.14
 /opt/venvs/hiring-screening/bin/python -m pip install -r /opt/hiring-screening/requirements.txt
 ```
 
@@ -227,7 +260,8 @@ python3.11 -m venv /opt/venvs/hiring-screening
   verify. Credentials embedded in the URL are masked in the script output.
 * **Make the mirror permanent** with a pip configuration file (`C:\ProgramData\pip\pip.ini` for the
   whole Windows machine, `/etc/pip.conf` on Linux, or `pip.ini` / `pip.conf` inside the virtual
-  environment folder for that environment only):
+  environment folder for that environment only). Keep these files out of the repository: they can
+  hold mirror credentials.
 
   ```ini
   [global]
@@ -237,20 +271,22 @@ python3.11 -m venv /opt/venvs/hiring-screening
   ```
 
 * **TLS inspection (CERTIFICATE_VERIFY_FAILED):** pip 24.2 and later trust the operating system's
-  certificate store automatically. The pip that ships with Python 3.11.9 is 24.0 and does not, so
-  give it the company root CA as a PEM file: `$env:PIP_CERT = '<path>\company-root-ca.pem'` or
+  certificate store automatically. Older pip versions (for example the one bundled with Python
+  3.11.9) do not, so give them the company root CA as a PEM file:
+  `$env:PIP_CERT = '<path>\company-root-ca.pem'` or
   `export PIP_CERT=/etc/pki/tls/certs/company-root-ca.pem` (or `cert =` in `pip.ini` / `pip.conf`).
 
 ### 4.4 Offline (no internet, no mirror)
 
-1. On a machine **with** internet access, the same operating system family and Python 3.11 64-bit,
-   download every package as a wheel:
+1. On a machine **with** internet access, the same operating system family and the **same Python
+   minor version** as the VM (64-bit), download every package as a wheel:
 
    ```bash
    python -m pip download -r requirements.txt -d wheelhouse --only-binary=:all:
    ```
 
-   To download for a different target operating system, add its tags, for example for a Linux VM:
+   To download for a different target operating system, add its tags, for example for a Linux VM
+   with Python 3.11 (for 3.12 use `--python-version 3.12 --abi cp312`, and so on):
 
    ```bash
    python -m pip download -r requirements.txt -d wheelhouse --only-binary=:all: \
@@ -271,7 +307,8 @@ python3.11 -m venv /opt/venvs/hiring-screening
    ```
 
    This runs `pip install --no-index --find-links <wheelhouse> -r requirements.txt`. pip itself
-   comes from Python's bundled copy (`ensurepip`), so it needs no download.
+   comes from Python's bundled copy (`ensurepip`), so it needs no download. Because a wheelhouse
+   holds exact files, every VM installed from it gets the same versions.
 
 ## 5. Configuration
 
@@ -279,38 +316,53 @@ python3.11 -m venv /opt/venvs/hiring-screening
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `NVIDIA_API_KEY` | API key for the hosted LLM provider of the default configuration. Leave it unset to run without LLM features. Takes precedence over `.streamlit/secrets.toml`. | unset |
-| `TACHYON_API_KEY` (or the name set in `api_key_env`) | Replaces `NVIDIA_API_KEY` after switching to the internal LLM wrapper ([SWITCH_TO_TACHYON.md](SWITCH_TO_TACHYON.md)). No key is needed if the wrapper authenticates by itself. | unset |
+| `COPILOT_PROXY_TOKEN` | Optional. Pins the bearer token of the GitHub Copilot proxy (value from the VS Code command **Screening Proxy: Copy Token**). Needed only when the app cannot read the VS Code user's connection file, for example when it runs as a service under another account (5.4). Keep it in `.env` or `.streamlit/secrets.toml` rather than in a service definition. | unset: the app reads `~/.screening-copilot-proxy.json` |
 | `SCREENING_RUNS_DIR` | Folder for saved runs (Run History). Put it on a data disk with backups and restricted access. | `<project>/runs` |
 | `APP_BRAND_EYEBROW` | The small line of text above the title in the header banner, for example a team or environment name. The app reads it once, so restart it after a change. | `WELLS FARGO · TALENT ACQUISITION` (built into `ui/theme.py`) |
-| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | Outbound proxy for LLM calls (pip uses them as well). List internal hosts, such as an internal LLM gateway, in `NO_PROXY`. | unset |
-| `SSL_CERT_FILE` / `SSL_CERT_DIR` | CA bundle for LLM calls. Without it, the Windows certificate store or the Linux system CA bundle is used. | unset |
 | `STREAMLIT_<SECTION>_<OPTION>` | Any Streamlit setting, for example `STREAMLIT_BROWSER_SERVER_ADDRESS` or `STREAMLIT_SERVER_ADDRESS` (5.3) | unset |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `PIP_CERT`, `PIP_INDEX_URL`, `PIP_TRUSTED_HOST` | Used by pip during installation (section 4). The app's LLM calls go to `127.0.0.1` and never use a proxy, so the app needs none of them at run time | unset |
 
-Set them in the shell before an interactive start (`$env:NAME = 'value'` in PowerShell,
-`export NAME=value` in bash), or in the service definition (section 7). Keep API keys out of
-command lines and scripts.
+**The `.env` file.** Instead of setting variables in the shell or the service definition, you can
+put the first three in a `.env` file in the project folder: copy `.env.example` to `.env` and
+uncomment what you need. The app reads it once at startup; a variable that is already set in the
+environment always wins over `.env`. `STREAMLIT_*` settings do not work in `.env`, because
+Streamlit reads them before the app loads the file. `.env` is gitignored and must never be
+committed.
 
-### 5.2 Secrets file
+Otherwise set variables in the shell before an interactive start (`$env:NAME = 'value'` in
+PowerShell, `export NAME=value` in bash), or in the service definition (section 7). Keep tokens
+out of command lines and scripts.
 
-The API key can live in `.streamlit/secrets.toml` in the project folder instead of an environment
-variable (an environment variable wins when both are set). The file is never committed.
+### 5.2 Secrets file and `.env`
+
+Both files are optional. You need one of them only to pin `COPILOT_PROXY_TOKEN` (5.4). The app looks
+for the token in this order: environment variable (including `.env`), then
+`.streamlit/secrets.toml`, then the connection file of the account the app runs under.
 
 ```powershell
 cd C:\apps\hiring-screening
+Copy-Item .env.example .env
+notepad .env                           # COPILOT_PROXY_TOKEN=<token>   (and SCREENING_RUNS_DIR if wanted)
+icacls .env /inheritance:r /grant:r "Administrators:F" "SYSTEM:F" "<DOMAIN\svc-screening>:R"
+
+# or the Streamlit secrets file instead
 Copy-Item .streamlit\secrets.toml.example .streamlit\secrets.toml
-notepad .streamlit\secrets.toml        # NVIDIA_API_KEY = "<key>"
+notepad .streamlit\secrets.toml        # COPILOT_PROXY_TOKEN = "<token>"
 icacls .streamlit\secrets.toml /inheritance:r /grant:r "Administrators:F" "SYSTEM:F" "<DOMAIN\svc-screening>:R"
 ```
 
 ```bash
 # Linux: create the service account first (section 7.1)
 cd /opt/hiring-screening
-sudo install -m 640 -o root -g screening .streamlit/secrets.toml.example .streamlit/secrets.toml
-sudoedit .streamlit/secrets.toml       # NVIDIA_API_KEY = "<key>"
+sudo install -m 640 -o root -g screening .env.example .env
+sudoedit .env                          # COPILOT_PROXY_TOKEN=<token>
+# or: sudo install -m 640 -o root -g screening .streamlit/secrets.toml.example .streamlit/secrets.toml
+#     sudoedit .streamlit/secrets.toml # COPILOT_PROXY_TOKEN = "<token>"
 ```
 
-The UI only ever shows "LLM: configured", never the key. Rotate any key that may have been exposed.
+Restart the app after editing either file. The UI never shows the token, only where it came from
+("environment", "secrets" or "connection file"). If a token may have been exposed, run
+**Screening Proxy: Rotate Token** in VS Code and update the pinned value.
 
 ### 5.3 Streamlit settings
 
@@ -339,19 +391,45 @@ account's `~/.streamlit/config.toml`.
 | `client.showErrorDetails` | `type` | `STREAMLIT_CLIENT_SHOW_ERROR_DETAILS` | Optional hardening: users see only the error type for unexpected errors; full details stay in the log |
 | `server.disconnectedSessionTTL` | `120` (s) | `STREAMLIT_SERVER_DISCONNECTED_SESSION_TTL` | How long a session survives a dropped connection (laptop sleep, VPN reconnect). Longer keeps more memory in use |
 
-### 5.4 LLM provider, or no LLM
+### 5.4 LLM features: GitHub Copilot through VS Code, or no LLM
 
-* **No LLM (safest for real candidate data until a provider is approved):** leave the key unset.
-  The sidebar shows "LLM: not configured"; LLM buttons explain how to enable them; every other
-  feature works. A recruiter can also switch LLM features off for their own session
-  (Config & Rubric Tuning, "LLM features enabled").
-* **Hosted provider (default configuration):** set `NVIDIA_API_KEY`. Calls go to the provider's
-  public endpoint, which means candidate-related text leaves the company network (section 9).
-  Allow outbound HTTPS to that endpoint through the proxy only if the data policy permits it.
-* **Internal LLM wrapper:** follow [SWITCH_TO_TACHYON.md](SWITCH_TO_TACHYON.md), then set the key
-  variable it names (if any). Add the gateway host to `NO_PROXY` if it must bypass the proxy.
+The LLM features (rationales only: shortlist rationales, borderline gap analyses, the Deep-Dive
+"explain this candidate", risk-group summaries and the batch executive summary) use GitHub Copilot
+through the VS Code extension **Screening Copilot Proxy** in
+`vscode-copilot-proxy/`. The LLM only writes text; it never changes scores, ranks, cutoffs or the
+shortlist. [COPILOT_PROXY.md](COPILOT_PROXY.md) describes the extension in full.
 
-After any change, check it in Config & Rubric Tuning with "Test LLM connection".
+* **No LLM (safest for real candidate data until GitHub Copilot is approved for it):** do not run
+  the extension on the VM. The sidebar badge shows "Not connected", the LLM buttons explain why
+  they are unavailable, and every other feature works. A recruiter can also switch the LLM features
+  off for their own session (Config & Rubric Tuning, "LLM features enabled"; the badge then reads
+  "LLM features off").
+* **GitHub Copilot on the VM:**
+  1. On the VM, install **VS Code 1.95 or later** (company software portal or the system installer)
+     and the **GitHub Copilot Chat** extension, and sign in with a GitHub account that has a
+     Copilot licence. If the VM reaches the internet through a proxy, configure VS Code's proxy
+     (`http.proxy` setting or the system proxy).
+  2. In VS Code run **Developer: Install Extension from Location...** and select
+     `C:\apps\hiring-screening\vscode-copilot-proxy` (or install a packaged `.vsix`). Then run
+     **Screening Proxy: Show Status** > **Test Copilot Access** and choose **Allow**.
+  3. **If the app runs as a service under another account** (section 7), it cannot read the
+     connection file in the VS Code user's home folder. Run **Screening Proxy: Copy Token**, put the
+     token into `COPILOT_PROXY_TOKEN` in the app's `.env` or `.streamlit/secrets.toml` (5.2), keep the
+     extension on its default port 5757 (`screeningProxy.port`), and restart the app. After
+     **Rotate Token**, update the pinned value. When the app runs interactively under the same
+     account as VS Code, nothing has to be configured.
+  4. **Keep VS Code running** in that user's logged-on session: the proxy runs only while VS Code
+     runs (it starts with VS Code by default, `screeningProxy.autoStart`). On Windows Server a
+     disconnected Remote Desktop session keeps it running; signing out stops it, and the LLM
+     buttons then report that the proxy cannot be reached. A Linux VM without a desktop cannot run
+     the VS Code desktop app; run the app there without the LLM features, or see "Remote windows" in
+     [COPILOT_PROXY.md](COPILOT_PROXY.md).
+  5. Every recruiter's LLM requests on this installation run under the Copilot account signed in to
+     that VS Code, and leave the company network to GitHub Copilot (section 9). Confirm that this
+     matches the company's Copilot licensing and data policy.
+
+After any change, check it in Config & Rubric Tuning with **Test connection** and in the sidebar
+badge (**Check again** re-checks at once).
 
 ## 6. Run interactively
 
@@ -382,9 +460,10 @@ bash /opt/hiring-screening/scripts/run_app.sh --venv /opt/venvs/hiring-screening
 | `-PublicHost <name>` | `--public-host <name>` | Host name users type (sets `browser.serverAddress`) | not set |
 
 The scripts always start the app from the project folder, because `.streamlit/` and `.cache/`
-are resolved from the working directory. The app is ready when it prints its URL, usually within
-a few seconds. Then open `http://<vm-name>:8501` (or `http://127.0.0.1:8501` on the VM itself when
-it listens on `127.0.0.1`) and run the smoke test (section 14).
+are resolved from the working directory (`.env`, `data/cache/` and the default `runs/` are found
+relative to the code). The app is ready when it prints its URL, usually within a few seconds. Then
+open `http://<vm-name>:8501` (or `http://127.0.0.1:8501` on the VM itself when it listens on
+`127.0.0.1`) and run the smoke test (section 14).
 
 Started without the scripts (`python -m streamlit run app.py` from the project folder), the app also
 listens on `127.0.0.1` only, because `.streamlit/config.toml` sets that address. To expose it on the
@@ -400,18 +479,19 @@ Run the app under a dedicated account without administrator rights. It needs:
 
 | Path | Access |
 |---|---|
-| Python 3.11 installation, application code, virtual environment | read and execute |
-| `.cache/` in the project folder (LLM cache) and the saved-runs folder | modify |
-| `.streamlit/secrets.toml` | read |
+| Python installation, application code, virtual environment | read and execute |
+| `.cache/` in the project folder (LLM cache), `data/cache/` (cached datasets) and the saved-runs folder | modify |
+| `.env` and `.streamlit/secrets.toml` (if used) | read |
 | log folder (Windows with NSSM) | modify |
 
 ```powershell
 # Windows (as an administrator)
 $svc = '<DOMAIN\svc-screening>'
-New-Item -ItemType Directory -Force C:\apps\hiring-screening\.cache, C:\apps\hiring-screening\logs, D:\screening-data\runs | Out-Null
+New-Item -ItemType Directory -Force C:\apps\hiring-screening\.cache, C:\apps\hiring-screening\data\cache, C:\apps\hiring-screening\logs, D:\screening-data\runs | Out-Null
 icacls C:\apps\hiring-screening /grant "${svc}:(OI)(CI)RX"
 icacls C:\apps\venvs\hiring-screening /grant "${svc}:(OI)(CI)RX"
 icacls C:\apps\hiring-screening\.cache /grant "${svc}:(OI)(CI)M"
+icacls C:\apps\hiring-screening\data\cache /inheritance:r /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "${svc}:(OI)(CI)M"
 icacls C:\apps\hiring-screening\logs /grant "${svc}:(OI)(CI)M"
 icacls D:\screening-data\runs /inheritance:r /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "${svc}:(OI)(CI)M"
 ```
@@ -419,8 +499,12 @@ icacls D:\screening-data\runs /inheritance:r /grant:r "Administrators:(OI)(CI)F"
 ```bash
 # Linux
 sudo useradd --system --create-home --home-dir /var/lib/hiring-screening --shell /usr/sbin/nologin screening
-sudo install -d -o screening -g screening -m 750 /var/lib/hiring-screening/runs /opt/hiring-screening/.cache
+sudo install -d -o screening -g screening -m 750 /var/lib/hiring-screening/runs /opt/hiring-screening/.cache \
+     /opt/hiring-screening/data/cache
 ```
+
+The cached-datasets folder is always `data/cache/` inside the project folder; it cannot be moved by
+a setting. It holds parsed resume text, so restrict it like the saved-runs folder.
 
 ### 7.2 Windows: NSSM (recommended)
 
@@ -450,8 +534,8 @@ nssm start HiringScreening
 
 * Use `-Address 0.0.0.0` instead of `127.0.0.1` when there is no reverse proxy on the same VM.
 * The paths above contain no spaces. If yours do, quote them inside `AppParameters`.
-* Keep the API key in `.streamlit\secrets.toml` (5.2) rather than in `AppEnvironmentExtra`, which
-  any administrator can read in the registry.
+* If you pin `COPILOT_PROXY_TOKEN`, keep it in `.env` or `.streamlit\secrets.toml` (5.2) rather than
+  in `AppEnvironmentExtra`, which any administrator can read in the registry.
 * Daily operation: `Get-Service HiringScreening`, `Restart-Service HiringScreening`, log in
   `C:\apps\hiring-screening\logs\service.log`. Remove with `nssm remove HiringScreening confirm`.
 
@@ -478,10 +562,11 @@ Start-ScheduledTask -TaskName 'HiringScreening'
   managed service account, use
   `-Principal (New-ScheduledTaskPrincipal -UserId '<DOMAIN\gmsa-screening$>' -LogonType Password)`
   instead of `-User`/`-Password`.
-* Task Scheduler has no per-task environment variables. Put the API key in
-  `.streamlit\secrets.toml`, and set other variables machine-wide, for example
-  `[Environment]::SetEnvironmentVariable('SCREENING_RUNS_DIR', 'D:\screening-data\runs', 'Machine')`.
-  Restart the task afterwards (restart the VM if the task still sees the old value).
+* Task Scheduler has no per-task environment variables. Put `SCREENING_RUNS_DIR`, `APP_BRAND_EYEBROW`
+  and a pinned `COPILOT_PROXY_TOKEN` in the project's `.env` file (5.1, 5.2), or set variables
+  machine-wide, for example
+  `[Environment]::SetEnvironmentVariable('SCREENING_RUNS_DIR', 'D:\screening-data\runs', 'Machine')`,
+  and restart the task afterwards (restart the VM if the task still sees the old value).
 * Task Scheduler does not keep the app's console output and does not watch the app the way a
   service manager does. Monitor the health endpoint (section 10), or prefer NSSM.
 
@@ -492,9 +577,7 @@ Start-ScheduledTask -TaskName 'HiringScreening'
 ```ini
 SCREENING_RUNS_DIR=/var/lib/hiring-screening/runs
 STREAMLIT_BROWSER_SERVER_ADDRESS=<screening.example.internal>
-# HTTPS_PROXY=http://<proxy-host>:<port>
-# NO_PROXY=localhost,127.0.0.1,.example.internal
-# NVIDIA_API_KEY is better kept in /opt/hiring-screening/.streamlit/secrets.toml (section 5.2)
+# A pinned COPILOT_PROXY_TOKEN is better kept in /opt/hiring-screening/.env or .streamlit/secrets.toml (5.2)
 ```
 
 `/etc/systemd/system/hiring-screening.service`:
@@ -521,7 +604,7 @@ PrivateTmp=true
 ProtectSystem=strict
 # ProtectHome assumes the virtual environment is not under /home.
 ProtectHome=true
-ReadWritePaths=/opt/hiring-screening/.cache /var/lib/hiring-screening
+ReadWritePaths=/opt/hiring-screening/.cache /opt/hiring-screening/data/cache /var/lib/hiring-screening
 
 [Install]
 WantedBy=multi-user.target
@@ -535,13 +618,15 @@ journalctl -u hiring-screening -f          # follow the log
 ```
 
 Use `--address 0.0.0.0` in `ExecStart` when there is no reverse proxy on the same VM.
-`ReadWritePaths` must list every folder the app writes to (the LLM cache and the saved runs).
+`ReadWritePaths` must list every folder the app writes to (the LLM cache, the cached datasets and
+the saved runs). `ProtectHome=true` also hides other users' home folders, so the service never sees
+a VS Code user's connection file: pin the token if you use the LLM features (5.4).
 
 ## 8. Network and security
 
 **The app has no login of its own.** Anyone who can open its URL can upload data, run
-screenings, and open, rename or delete every saved run (saved runs are shared by all users of an
-installation). Access control therefore has to come from the network.
+screenings, and open, rename or delete every saved run and cached dataset (both are shared by all
+users of an installation). Access control therefore has to come from the network.
 
 | Setup | When | How |
 |---|---|---|
@@ -566,7 +651,8 @@ sudo firewall-cmd --reload
 sudo ufw allow from <10.0.0.0/8> to any port 8501 proto tcp
 ```
 
-For setup B, open 443 for the proxy instead and leave 8501 closed.
+For setup B, open 443 for the proxy instead and leave 8501 closed. Never open the Copilot proxy's
+port (5757) in the firewall: it serves the same machine only.
 
 **Reverse proxy requirements**
 
@@ -627,17 +713,20 @@ IIS on Windows Server (Application Request Routing + URL Rewrite):
 
 **Where the data lives**
 
-* Uploads, parsed resumes and results stay in the server's memory for the session; files are
-  written only as described in section 11.
+* Uploads, parsed resumes and results stay in the server's memory for the session; parsed datasets
+  are also cached in `data/cache/`, and other files are written only as described in section 11.
 * Exports (CSV, Excel, evidence packs) are downloaded to the user's own computer; company policy
   for personal data applies there.
-* Logs contain no candidate data by design (names, e-mails and API keys are never logged).
+* Logs contain no candidate data by design (names, e-mails, resume text and the proxy token are
+  never logged). The Copilot proxy's log in VS Code records method, path, status, duration and
+  model only.
 
 **Outbound connections**
 
 | Connection | When | How to control it |
 |---|---|---|
-| LLM endpoint | Only when a key is configured and a user clicks an LLM action | Section 9; leave the key unset to disable |
+| LLM requests from the app | Only to the VS Code extension on `127.0.0.1:5757` of the same VM, and only when a user clicks an LLM action or **Test connection**. Never routed through `HTTP_PROXY` / `HTTPS_PROXY` | Section 9; switch the LLM features off, or do not run the extension |
+| VS Code to GitHub Copilot | Only if VS Code with the extension runs on the VM; carries the redacted LLM prompts | VS Code's proxy settings (`http.proxy`) and the company's GitHub Copilot policies |
 | `fonts.googleapis.com` (the "Inter" web font) | Each user's **browser** loads it with the page; no candidate data is involved | If it is blocked, the browser falls back to a system font; nothing else changes |
 | Public-IP lookup by Streamlit (`checkip.amazonaws.com`) | Only if `browser.serverAddress` is not set: at startup when listening on `0.0.0.0`, and when a browser connection's origin does not match the `Host` header | Pass `-PublicHost` / `--public-host` (or set `STREAMLIT_BROWSER_SERVER_ADDRESS`) whenever the app is reached by host name, and forward the `Host` header on the proxy |
 | Usage statistics | Never (`gatherUsageStats = false`) | |
@@ -646,34 +735,44 @@ IIS on Windows Server (Application Request Routing + URL Rewrite):
 
 * Dedicated service account without administrator rights; code and virtual environment
   read-only for it (section 7.1).
-* `.streamlit/secrets.toml` readable only by administrators and the service account; never
-  committed and never copied between machines.
-* Saved-runs folder readable only by administrators and the service account.
+* `.env` and `.streamlit/secrets.toml` readable only by administrators and the service account;
+  never committed and never copied between machines.
+* Saved-runs folder and `data/cache/` readable only by administrators and the service account.
 * Optional: `server.allowedHosts` set to the public host name and `client.showErrorDetails = "type"` (5.3).
-* Keep Windows/Linux and Python 3.11 patched. Review security advisories for the pinned packages
-  when upgrading (section 13).
+* If the Copilot proxy runs on the VM: `screeningProxy.host` stays `127.0.0.1`, port 5757 stays
+  closed in the firewall, and the token is rotated (**Screening Proxy: Rotate Token**) whenever it
+  may have been exposed.
+* Keep Windows/Linux, Python and VS Code patched. Review security advisories for the installed
+  package versions when upgrading (section 13).
 
 ## 9. LLM data handling
 
-* The app calls the LLM only when a user clicks an LLM action: re-score near the cutoff,
-  rationales, candidate explanations with interview and integrity questions, risk-group
-  summaries, the executive summary, Ask the Data, or "Test LLM connection". Re-scoring is limited
-  to the ranks around the shortlist cutoff.
-* Before any text leaves the VM, candidate names, e-mail addresses, phone numbers and URLs are
-  replaced with placeholders, and resume text is truncated (6,000 characters by default). Prompts
-  tell the model to ignore protected attributes and to word integrity findings as patterns to
-  verify, not accusations.
-* Ask the Data sends only column names, types, descriptions and example values of
-  low-cardinality, non-personal columns, never rows of data. The question is masked for personal
-  values before it is sent, and the answer is computed locally.
+* The app calls the LLM only when a user clicks an LLM action: **LLM: write rationales for
+  shortlist**, **LLM: explain borderline**, **LLM: explain this candidate**, **LLM: summarize risk
+  groups**, **LLM: executive summary** or **Test connection**. The
+  sidebar's status check only asks the proxy which models exist (no candidate data). The LLM only
+  writes text: it never changes scores, ranks, cutoffs or the shortlist.
+* Before any text leaves the app, e-mail addresses, phone numbers, links, IP addresses and candidate
+  names are replaced with placeholders (`[REDACTED_EMAIL]` and so on), lines with personal details
+  (date of birth, gender, religion, address, ID numbers and similar) are dropped, and candidates are
+  referred to by candidate ID only.
+* Resume text is treated as untrusted: invisible characters are stripped, lines that read like
+  instructions to an AI screener are replaced with "[instruction-like text removed]", hidden PDF
+  text is never extracted, and the excerpt is cut to "Max input chars" (6,000 by default). Prompts
+  tell the model to ignore instructions inside resume text and protected attributes, and to word
+  integrity findings as patterns to verify, not accusations.
+* The executive summary is written from aggregate statistics only.
+* The text travels from the app to the VS Code extension over the loopback interface (it never
+  leaves the VM there), and from VS Code to GitHub Copilot under the Copilot account signed in to
+  VS Code and the organisation's Copilot terms and policies. Process real candidate data with the
+  LLM features only if the company's data policy approves GitHub Copilot for it; otherwise keep
+  them off (5.4).
 * Responses are cached in `.cache/llm/` in the project folder: one JSON file per response,
   holding the parsed response only (not the prompt) and named by a hash of the model, prompt
   version and prompt. The cache is shared by all users of the installation and can be deleted at
   any time (section 11).
-* With the hosted provider (default configuration), the redacted text is processed outside the
-  company network under that provider's terms. Process real candidate data only with a provider
-  the company's data policy approves: the internal wrapper ([SWITCH_TO_TACHYON.md](SWITCH_TO_TACHYON.md))
-  or no LLM at all (5.4).
+* When a user saves a run, the session's LLM outputs are stored with it (`llm.json` in the run
+  folder).
 
 ## 10. Health check
 
@@ -690,27 +789,38 @@ curl -fsS http://127.0.0.1:8501/_stcore/health; echo                            
 ```
 
 Point the company monitoring at this URL: on the VM itself, or through the proxy if the monitoring
-system can pass its SSO. It shows that the server is up; it does not test the LLM endpoint or the
+system can pass its SSO. It shows that the server is up; it does not test the Copilot proxy or the
 saved-runs folder. The smoke test (section 14) covers those.
+
+The Copilot proxy has its own endpoint, `GET http://127.0.0.1:5757/health`, which needs the bearer
+token and answers `{"ok": true, "models": <count>, ...}` (examples in
+[COPILOT_PROXY.md](COPILOT_PROXY.md), section 13). In the app, the sidebar badge and **Test
+connection** show the same.
 
 ## 11. Data retention and cleanup
 
 | Where | What | Personal data | Cleanup |
 |---|---|---|---|
-| Server memory (each browser session) | Uploaded files, parsed resumes, results | Yes | Freed about two minutes after the tab is closed (`server.disconnectedSessionTTL`) and on every service restart. Never written to disk. |
-| Saved runs (`SCREENING_RUNS_DIR`, default `<project>/runs`) | One folder per run named `YYYYMMDD-HHMMSS-xxxxxx` (save time): result tables (Parquet), configuration, data-quality report, parsed resumes including resume text (`parsed.json.gz`), LLM notes | **Yes** | Delete in the Run History tab ("Delete"), or remove run folders past the retention period (below) |
+| Server memory (each browser session) | Uploaded files, parsed resumes, results | Yes | Freed about two minutes after the tab is closed (`server.disconnectedSessionTTL`) and on every service restart. Uploaded files are never written to disk. |
+| `data/cache/` in the project folder | Cached datasets for fast reload, one folder per set of input files (named by a fingerprint): the TA table, matches, data-quality report and every parsed resume including its text (`parsed.json.gz`); no scores and no LLM text | **Yes** | Deleted automatically once older than "Keep cached datasets for (days)" (Config, default 7, range 1-30), whenever the cache is listed or read. **Clear cached datasets** (Config) deletes all of them; the delete icon in the sidebar's **Recent datasets (fast reload)** deletes one. Switching off "Cache parsed datasets for fast reload" stops new entries. A dataset made by a different version of the parsing code is discarded automatically |
+| Saved runs (`SCREENING_RUNS_DIR`, default `<project>/runs`) | One folder per run named `YYYYMMDD-HHMMSS-xxxxxx` (save time): result tables (Parquet), configuration, data-quality report, parsed resumes including resume text (`parsed.json.gz`), LLM outputs (`llm.json`) | **Yes** | Delete in the Run History tab ("Delete"), or remove run folders past the retention period (below) |
 | `.cache/llm/` in the project folder | LLM responses (JSON), one file per response | Model-written text about candidates; names, e-mails and phone numbers were redacted from the prompts | Safe to delete at any time; responses are fetched again when needed |
 | `data/sample/` | Synthetic sample data | No (fictional) | Delete after the smoke test if it is not needed |
 | Service log | Start/stop messages, warnings | No (by design) | NSSM rotation (7.2) or journald retention |
+| VS Code user's home folder | `.screening-copilot-proxy.json` (proxy address and token) | No | Removed when the proxy stops or VS Code closes |
 | Users' computers | Downloaded exports and evidence packs | Yes | Company policy for personal data |
 
-Apply the company's retention period to saved runs. Examples for 180 days for runs and 30 days for
-the LLM cache:
+Apply the company's retention period to saved runs. A scheduled job also gives the dataset cache a
+hard upper bound that does not depend on what users set in Config. Examples for 180 days for runs,
+30 days for cached datasets and 30 days for the LLM cache:
 
 ```powershell
 $cutoff = (Get-Date).AddDays(-180).ToString('yyyyMMdd')
 Get-ChildItem D:\screening-data\runs -Directory |
     Where-Object { $_.Name -match '^\d{8}-\d{6}-[0-9a-f]{6}$' -and $_.Name.Substring(0, 8) -lt $cutoff } |
+    Remove-Item -Recurse -Force
+Get-ChildItem C:\apps\hiring-screening\data\cache -Directory |
+    Where-Object { $_.Name -match '^[0-9a-f]{16,128}$' -and $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
     Remove-Item -Recurse -Force
 Get-ChildItem C:\apps\hiring-screening\.cache\llm -File -Filter *.json |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } | Remove-Item
@@ -722,31 +832,36 @@ for dir in /var/lib/hiring-screening/runs/*/; do
     name=$(basename "$dir")
     [[ "$name" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$ && "${name:0:8}" < "$cutoff" ]] && rm -rf -- "$dir"
 done
+find /opt/hiring-screening/data/cache -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+     -regex '.*/[0-9a-f]{16,128}' -mtime +30 -exec rm -rf -- {} +
 find /opt/hiring-screening/.cache/llm -type f -name '*.json' -mtime +30 -delete
 ```
 
 Schedule them (Task Scheduler or a systemd timer / cron) under the service account. Folders named
-`.tmp-...` in the runs folder are left behind by an interrupted save; delete them while the app is
-stopped.
+`.tmp-...` or `.trash-...` in the runs or cache folder are leftovers of an interrupted save or
+delete; the app removes them by itself (`.trash-...` at once, `.tmp-...` after an hour) the next
+time a run is saved or deleted or the cache is written or listed.
 
 ## 12. Backups
 
 | Back up | Notes |
 |---|---|
 | Saved-runs folder | Only if run history must survive a VM loss. The backup holds personal data: encrypt it, restrict access, and apply the same retention period |
-| `.streamlit/secrets.toml` | Better: keep the key in the company secrets vault and recreate the file on a restore |
-| Site configuration | Service definition (NSSM or Task Scheduler settings, systemd unit, `/etc/hiring-screening.env`), reverse-proxy and firewall configuration, and any VM-specific `.streamlit/config.toml` changes |
+| `.env`, `.streamlit/secrets.toml` | Only if they hold settings you need. Better: keep a pinned token in the company secrets vault (or simply copy a new one from VS Code) and recreate the file on a restore |
+| Site configuration | Service definition (NSSM or Task Scheduler settings, systemd unit, `/etc/hiring-screening.env`), reverse-proxy and firewall configuration, any VM-specific `.streamlit/config.toml` changes, and the VS Code settings of the proxy if you changed them |
 
-Not needed: the virtual environment, `.cache/`, `data/sample/` and `__pycache__/` are all rebuilt.
-The input files (TA feed, resumes) come from the assessment platform and the applicant tracking
-system, which remain the systems of record.
+Not needed: the virtual environment, `.cache/`, `data/cache/`, `data/sample/` and `__pycache__/` are
+all rebuilt. The input files (TA export, resumes) come from the assessment platform and the
+applicant tracking system, which remain the systems of record.
 
-Restore: install the same release (sections 3 and 4), restore the saved runs and the secrets, start
-the service, and run the smoke test.
+Restore: install the same release (sections 3 and 4), restore the saved runs and the settings files,
+reinstall the VS Code extension if the LLM features are used (5.4; pin the new token if needed),
+start the service, and run the smoke test.
 
 ## 13. Upgrading
 
-1. Read the release notes. Check whether `requirements.txt` or the Python version changed.
+1. Read the release notes. Check whether `requirements.txt`, the supported Python versions or the
+   VS Code extension changed.
 2. Stop the app: `Stop-Service HiringScreening` (or `Stop-ScheduledTask -TaskName HiringScreening`),
    or `sudo systemctl stop hiring-screening`. On Windows this is required: a running app locks
    files inside the virtual environment. Check that nothing still listens on the port
@@ -754,44 +869,61 @@ the service, and run the smoke test.
 3. Back up the saved runs (section 12) and keep the current code folder for a rollback, for
    example as `C:\apps\hiring-screening.prev` or `/opt/hiring-screening.prev`.
 4. Update the code: `git pull` in the project folder, or unpack the new release into an empty
-   folder and copy over `.streamlit/secrets.toml` and any VM-specific settings. Re-apply the
-   permissions from section 7.1 if the folder is new.
-5. Install the dependencies with the same command as in section 4. It installs what changed and
-   runs the tests. If the Python version or many pins changed, create a new virtual environment
-   next to the old one (for example `C:\apps\venvs\hiring-screening-2`) and point the service at it.
-   That keeps an instant rollback path.
-6. Start the app, check the health endpoint (section 10), run the smoke test (section 14) and open
+   folder and copy over `.env`, `.streamlit/secrets.toml` and any VM-specific settings. Re-apply the
+   permissions from section 7.1 if the folder is new (including `data/cache/`).
+5. Install the dependencies with the same command as in section 4. It installs what changed within
+   the version ranges and runs the tests. If the Python version or many requirements changed, create
+   a new virtual environment next to the old one (for example `C:\apps\venvs\hiring-screening-2`)
+   and point the service at it. That keeps an instant rollback path.
+6. If the LLM features are used and `vscode-copilot-proxy/` changed or moved, reinstall the
+   extension (**Developer: Install Extension from Location...** on the new folder, or the new
+   `.vsix`) and reload VS Code.
+7. Start the app, check the health endpoint (section 10), run the smoke test (section 14) and open
    one older saved run in Run History to confirm it still loads.
-7. Rollback: stop the app, restore the previous code folder (and the previous virtual environment
+8. Rollback: stop the app, restore the previous code folder (and the previous virtual environment
    path in the service definition), then start it again.
 
-The LLM cache does not need clearing: its file names include the model and prompt version, so old
-entries are simply not reused.
+Caches need no clearing: cached datasets made by a different version of the parsing code are
+discarded automatically and rebuilt on the next upload, and the LLM cache's file names include the
+model and prompt version, so old entries are simply not reused.
+
+If an earlier installation kept an API key for a hosted LLM service in `.streamlit/secrets.toml`,
+`.env` or the service environment, delete it there and have it revoked: this release does not use
+any such key.
 
 ## 14. Smoke test after installation
 
 Run these from the project folder with the virtual environment's Python
 (`C:\apps\venvs\hiring-screening\Scripts\python.exe` or `/opt/venvs/hiring-screening/bin/python`):
 
-1. **Tests:** `python -m pytest -p no:cacheprovider`. All tests pass (several hundred, about a minute).
+1. **Tests:** `python -m pytest -p no:cacheprovider`. All 1,114 tests pass (about 1.5 minutes).
    The setup scripts already ran them unless `-NoTests` / `--no-tests` was used.
 2. **Synthetic data:** the sample is not part of the repository or a release archive, so generate it
-   on the VM. `python generate_mock_data.py --quick` writes 300 fictional candidates and about 290
-   resumes to `data/sample/` in a few seconds, plus `resumes.zip` (used in step 4) unless you add
-   `--no-zip`. Without `--quick` it writes the full 3,000-candidate dataset (a few minutes, about 90 MB).
+   on the VM. `python generate_mock_data.py --quick` writes 300 fictional applications and their
+   resume packets to `data/sample/` in a few seconds (under 1 MB). Without `--quick` it writes the
+   full 2,133-application dataset (about 5 s, 6.5 MB). Optionally confirm the engine with
+   `python scripts/run_e2e.py --strict`: it screens the sample without the browser and checks it
+   against the planted ground truth (13 of 13 checks pass, for the quick and the full sample).
 3. **UI:** start the app (section 6 or 7), open it in a browser from a recruiter's machine and click
-   **Load synthetic sample & run**. Expect the KPI cards, a ranked shortlist, risk clusters in
-   Integrity & Risk Intelligence and a candidate profile in Individual Deep-Dive. Download the CSV
-   or Excel export once.
-4. **Uploads:** copy `ta_feed.csv` and `resumes.zip` from `data/sample/` to the machine you test
-   from, upload them in the sidebar and run screening. This checks the upload path, including the
-   proxy's body-size limit (the full sample's ZIP is 40 MB, above the nginx and IIS defaults).
-5. **Run History:** save the run, open it again, then delete it. This checks write access to the
+   **Load synthetic sample & run**. Expect the KPI cards, a ranked shortlist with an "Ineligible
+   candidates" section, risk clusters in Integrity & Risk Intelligence and a candidate profile in
+   Individual Deep-Dive. Download the CSV or Excel export once.
+4. **Uploads:** copy `test_scores_export.xlsx` and `Resume.zip` from `data/sample/` to the machine you
+   test from, upload them in the sidebar (**Upload TA feed + resumes**) and run screening. This
+   checks the upload path, including the proxy's body-size limit: the full sample's ZIP is 6 MB,
+   above nginx's 1 MB default (the `--quick` ZIP is under 1 MB, so use the full sample for this
+   check). Real `Resume.zip` files can be far larger.
+5. **Fast reload:** reload the browser page and open **Recent datasets (fast reload)** in the
+   sidebar. The dataset is listed; **Load** screens it again in about a second. This checks write
+   access to `data/cache/`.
+6. **Run History:** save the run, open it again, then delete it. This checks write access to the
    saved-runs folder.
-6. **LLM (if configured):** Config & Rubric Tuning, "Test LLM connection".
-7. **Health:** the health endpoint returns `ok` (section 10).
-8. **Clean up:** delete `data/sample/` if the synthetic data is not needed on this VM. The
-   "Load synthetic sample & run" button then shows as unavailable.
+7. **LLM (if used):** the sidebar badge **GitHub Copilot (VS Code proxy)** shows **Connected**; in
+   Config & Rubric Tuning, **Test connection** reports "LLM connection OK".
+8. **Health:** the health endpoint returns `ok` (section 10).
+9. **Clean up:** delete `data/sample/` if the synthetic data is not needed on this VM (the
+   "Load synthetic sample & run" button then shows as unavailable), and click **Clear cached
+   datasets** in Config & Rubric Tuning.
 
 ## 15. Troubleshooting
 
@@ -799,22 +931,25 @@ Run these from the project folder with the virtual environment's Python
 |---|---|
 | `Port 8501 is already in use ...` or `Port 8501 is not available` | Another program (often a second copy of the app) listens on that port. Find it with `Get-NetTCPConnection -LocalPort 8501 -State Listen` and `Get-Process -Id <pid>` (Windows) or `sudo ss -ltnp 'sport = :8501'` (Linux). Stop it or choose another `-Port` / `--port` (and update the proxy and firewall). |
 | The app works in a browser on the VM itself, but other machines cannot connect | It listens on `127.0.0.1`, the default from `.streamlit/config.toml` and the run scripts. Start it with `-Address 0.0.0.0` / `--address 0.0.0.0` (or `STREAMLIT_SERVER_ADDRESS=0.0.0.0` without the scripts) and allow the port in the firewall, or publish it through the reverse proxy (section 8). |
-| `Python 3.11 (64-bit) is required` | Install Python 3.11 64-bit for all users (section 2), check with `py -0p` (Windows) or `python3.11 --version`, or pass `-PythonExe` / `--python`. 32-bit Python cannot install the pinned packages. |
-| `ensurepip is not available` (Debian/Ubuntu) | `sudo apt install python3.11-venv` (or `python3-venv` on Debian 12), then run setup again. |
+| `Python 3.11 to 3.14 (64-bit) is required` | Install a 64-bit Python 3.11 to 3.14 for all users (section 2), check with `py -0p` (Windows) or `python3.12 --version`, or pass `-PythonExe` / `--python`. 32-bit Python cannot install the required packages. |
+| `ensurepip is not available` (Debian/Ubuntu) | Install the matching venv package, for example `sudo apt install python3.11-venv` (or `python3-venv` for the system Python), then run setup again. |
 | pip: `ProxyError`, `Connection timed out`, `Could not fetch URL` | No route to the index. Set `HTTPS_PROXY`, or use the internal mirror (`-IndexUrl`) or an offline wheelhouse (4.4). |
-| pip: `CERTIFICATE_VERIFY_FAILED` | TLS inspection with a company root CA that pip 24.0 does not know: set `PIP_CERT` (4.3). `-TrustedHost` / `--trusted-host` for the mirror is the fallback. |
-| pip: `No matching distribution found for <package>==<version>` | The mirror does not carry that version, or the interpreter is not Python 3.11 64-bit. Ask the mirror administrators to sync it, or use a wheelhouse. Offline: the wheels were downloaded for another platform; download them again with the target's `--platform` / `--python-version` (4.4). |
+| pip: `CERTIFICATE_VERIFY_FAILED` | TLS inspection with a company root CA that an older pip does not know: set `PIP_CERT` (4.3). `-TrustedHost` / `--trusted-host` for the mirror is the fallback. |
+| pip: `No matching distribution found for <package>` | The mirror carries no version within the range in `requirements.txt`, or the interpreter is not a 64-bit Python 3.11 to 3.14. Ask the mirror administrators to sync it, or use a wheelhouse. Offline: the wheels were downloaded for another platform or Python version; download them again with the target's `--platform` / `--python-version` (4.4). |
 | `running scripts is disabled on this system` | Start the scripts with `powershell -NoProfile -ExecutionPolicy Bypass -File ...`, and run `Unblock-File` on files copied from another machine (section 3). |
 | `$'\r': command not found` or `/bin/bash^M: bad interpreter` (Linux) | The `.sh` files have Windows line endings: `sed -i 's/\r$//' scripts/*.sh`. |
-| pip on Windows: `Access is denied`, `WinError 5` or `WinError 32` | Files in the virtual environment are locked: stop the service (section 13, step 2) and any other Python process that uses the environment, then run setup again. Keep virtual environments out of synced folders; if antivirus scanning interferes, ask for the company's standard exclusion for Python environments. Deleting saved runs or the cache can fail the same way while the app has the files open. |
+| pip on Windows: `Access is denied`, `WinError 5` or `WinError 32` | Files in the virtual environment are locked: stop the service (section 13, step 2) and any other Python process that uses the environment, then run setup again. Keep virtual environments out of synced folders; if antivirus scanning interferes, ask for the company's standard exclusion for Python environments. Deleting saved runs or cached datasets can fail the same way while the app has the files open. |
 | Page loads but stays on "Connecting", or shows a connection error | The WebSocket to `/_stcore/stream` is blocked or rejected. Allow WebSocket upgrades and long timeouts on the proxy, forward the `Host` header or set `browser.serverAddress` (section 8), and check that `server.baseUrlPath` matches the published path. A forward proxy configured in the users' browsers may need an exception for the internal host. On RHEL with nginx, a 502 with SELinux denials in the audit log needs `sudo setsebool -P httpd_can_network_connect 1`. |
 | Connection drops every minute or so behind a proxy or load balancer | Its idle timeout is shorter than the WebSocket keep-alive. Raise the timeout, or set `STREAMLIT_SERVER_WEBSOCKET_PING_INTERVAL` to a value below it (in seconds). |
 | Upload refused: "File must be ... or smaller" | Streamlit's `server.maxUploadSize` (1024 MB per file). Split the resumes into several ZIPs, or raise the limit with `STREAMLIT_SERVER_MAX_UPLOAD_SIZE` (and on the proxy). |
 | Upload fails with HTTP 413 (nginx) or 404.13 (IIS) | The proxy's body limit: `client_max_body_size` (nginx) or `maxAllowedContentLength` (IIS), section 8. |
 | Upload fails with HTTP 403 | The XSRF cookie did not reach the app: the page is embedded in a cross-origin frame, or the proxy strips cookies. Serve the app on its own origin; keep XSRF protection on. |
-| Some resumes are skipped with "larger than 10 MB" or ZIP limit warnings | The app's own limits (10 MB per file; 10,000 files and 1,024 MB uncompressed per ZIP; ZIP-bomb guard) are listed in the data-quality section. Split oversized ZIPs. |
-| Service starts and stops again | Read the log (NSSM log file, Event Viewer, or `journalctl -u hiring-screening -e`). Usual causes: wrong virtual environment path, Python installed for one user only, no write access to `.cache/` or the saved-runs folder, port in use. Run the same command interactively as the service account to see the error. |
-| "No LLM API key configured" although a key is set | The key is not visible to the account and folder the app runs as: environment variables set in another session, or `secrets.toml` outside `<project>/.streamlit/`. Check the service definition (section 7). |
-| LLM: HTTP 401/403, 404/410, timeouts or certificate errors | 401/403: wrong key or no access to the model. 404/410: the model was retired; the app tries the fallback models automatically. Timeouts or connection errors: set `HTTPS_PROXY` / `NO_PROXY`. Certificate errors: install the company root CA in the OS certificate store, or set `SSL_CERT_FILE`. |
-| Session resets after a laptop sleeps or the VPN reconnects | Sessions survive about two minutes without a connection (`server.disconnectedSessionTTL`). Save important runs in Run History. Raise the TTL if needed; it keeps more memory in use. |
-| The VM runs out of memory or gets slow with several users | Every open session keeps its own data (roughly 0.3 GB for 3,000 candidates, plus its uploads). Add memory, ask users to close finished tabs, or restart the service outside working hours. |
+| Some resumes are skipped with size, page or ZIP warnings | The app's own limits, listed in the data-quality details: 10 MB and 50 pages per resume; 250 MB per multi-candidate PDF packet (split per candidate before the per-resume limits apply); per ZIP 10,000 resumes and 2,048 MB uncompressed; suspicious compression ratios (ZIP-bomb guard), encrypted members and nested ZIPs are skipped. Split oversized ZIPs. |
+| "This dataset is no longer in the cache (expired or removed)" after **Load** in Recent datasets | The cached dataset passed its retention period or was deleted. Upload the files again; the cache is rebuilt. |
+| **Recent datasets (fast reload)** is empty after a screening, or missing from the sidebar | Empty: the service account cannot write to `data/cache/` (section 7.1). Missing: caching is switched off in Config ("Cache parsed datasets for fast reload"). |
+| Service starts and stops again | Read the log (NSSM log file, Event Viewer, or `journalctl -u hiring-screening -e`). Usual causes: wrong virtual environment path, Python installed for one user only, no write access to `.cache/`, `data/cache/` or the saved-runs folder, port in use. Run the same command interactively as the service account to see the error. |
+| Sidebar badge "Not connected" - "GitHub Copilot proxy not found ..." while VS Code runs on the VM | The app runs under another account and cannot read the VS Code user's connection file. Pin `COPILOT_PROXY_TOKEN` in `.env` or `.streamlit/secrets.toml` and keep the proxy on port 5757 (5.4), then restart the app. |
+| "Could not reach the Copilot proxy at http://127.0.0.1:5757/v1" | VS Code is not running in the signed-in session (for example after a sign-out or a reboot) or the proxy was stopped. Start VS Code; the proxy starts with it. |
+| LLM: HTTP 401, 403 `consent_required`, "Connected, but no models", 404, 429 or timeouts | 401: the pinned token is outdated (after **Rotate Token**): copy it again. 403: allow the extension's access to Copilot in VS Code. No models: sign in to GitHub Copilot, check the licence. 404: choose "(proxy default)" as the model. 429 and timeouts: lower "Max concurrency" or raise the time limits. Details: [COPILOT_PROXY.md](COPILOT_PROXY.md), section 12. |
+| Session resets after a laptop sleeps or the VPN reconnects | Sessions survive about two minutes without a connection (`server.disconnectedSessionTTL`). The parsed dataset stays in **Recent datasets (fast reload)**; save important runs in Run History. Raise the TTL if needed; it keeps more memory in use. |
+| The VM runs out of memory or gets slow with several users | Every open session keeps its own data (its parsed resumes and results, plus its uploads). Add memory, ask users to close finished tabs, or restart the service outside working hours. |

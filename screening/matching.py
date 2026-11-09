@@ -9,8 +9,14 @@ file name (1.0) -> resume email == TA email (0.99) -> TA candidate_id in the res
 (0.97) -> phone last-10 (0.95) -> unique fuzzy name (token_sort_ratio >= 92, margin >= 5;
 score/100 x 0.9). Every exact tier is a dict lookup built once; fuzzy matching only runs
 for leftovers against a prebuilt choices list. When several resumes reach one candidate the
-highest confidence wins (then more words, newer "_v2"/"(2)" version, file name); the rest
-become MATCH_DUPLICATE. Notes never contain names, emails or phone numbers.
+highest confidence wins (then the more resume-like file - more of education / skills /
+projects / experience found - then more words, the primary attachment, newer "_v2"/"(2)"
+version, file name); the rest become MATCH_DUPLICATE. Notes never contain names, emails or
+phone numbers.
+
+Files split from Workday packets are named "{candidate_id}_{Cleaned_Name}.pdf" and match by
+ID; "..._att2.pdf" is a further attachment of the same candidate (the primary resume is kept,
+the attachment is marked as a duplicate).
 """
 from __future__ import annotations
 
@@ -60,6 +66,8 @@ _SEGMENT_SPLIT_RE = re.compile(r"[-_/.]")
 _DIGIT_RE = re.compile(r"\d")
 _COUNTER_RE = re.compile(r"\s*\(\d{1,3}\)\s*$")
 _VERSION_RE = re.compile(r"(?:^|[^a-z0-9])v(?:er(?:sion)?)?[\s_.-]?(\d{1,3})$|\((\d{1,3})\)$", re.I)
+_ATTACHMENT_RE = re.compile(r"[_\s-]att(?:achment)?[_\s-]?(\d{1,2})$", re.I)   # "..._att2" (packet split)
+_RESUME_SECTIONS = ("education", "skills", "projects", "experience")
 _FILENAME_NOISE = frozenset({
     "resume", "resumes", "cv", "curriculum", "vitae", "biodata", "profile", "final", "updated", "latest",
     "new", "copy", "draft", "version", "ver", "rev", "doc", "docx", "pdf", "txt", "file", "my", "the", "of",
@@ -195,6 +203,23 @@ def _version(file_name: str) -> int:
     return int(m.group(1) or m.group(2)) if m else 0
 
 
+def attachment_index(file_name: str) -> int:
+    """1 for a primary file, N for a packet split's further attachment "..._attN.pdf"."""
+    m = _ATTACHMENT_RE.search(Path(str(file_name)).stem.strip())
+    return max(1, int(m.group(1))) if m else 1
+
+
+def _attachment_family(file_name: str) -> str:
+    stem = Path(str(file_name)).stem.strip()
+    return _ATTACHMENT_RE.sub("", stem).lower()
+
+
+def _resume_likeness(p: ParsedResume | None) -> int:
+    """How many core resume sections were found (a cover letter or transcript scores low)."""
+    sections = p.sections if p is not None and isinstance(p.sections, dict) else {}
+    return sum(1 for k in _RESUME_SECTIONS if str(sections.get(k) or "").strip())
+
+
 @dataclass
 class _Match:
     file_hash: str
@@ -205,11 +230,25 @@ class _Match:
     notes: list[str] = field(default_factory=list)
     words: int = 0
     version: int = 0
+    likeness: int = 0       # core resume sections found
+    attachment: int = 1     # 2+ for "..._att2" files split from a packet
 
     def row(self) -> dict[str, Any]:
         return {FILE_HASH: self.file_hash, FILE_NAME: self.file_name, S.CANDIDATE_ID: self.candidate_id,
                 S.MATCH_METHOD: self.method, S.MATCH_CONFIDENCE: round(float(self.confidence), 4),
                 NOTE: S.SEP_NOTES.join(self.notes)}
+
+
+def _rank_key(r: _Match) -> tuple[Any, ...]:
+    """Best resume for one candidate first: confidence, resume-likeness, words, primary attachment,
+    newer version, file name."""
+    return (-r.confidence, -r.likeness, -r.words, r.attachment, -r.version, r.file_name.lower(), r.file_hash)
+
+
+def _new_match(p: ParsedResume, **kw: Any) -> _Match:
+    file_name = Path(str(p.file_name)).name
+    return _Match(p.file_hash, file_name, words=int(p.word_count or 0), version=_version(file_name),
+                  likeness=_resume_likeness(p), attachment=attachment_index(file_name), **kw)
 
 
 def _name_queries(p: ParsedResume) -> list[str]:
@@ -258,8 +297,8 @@ def _match_name(p: ParsedResume, idx: _TAIndex) -> tuple[str, float] | None:
 
 
 def _match_one(p: ParsedResume, idx: _TAIndex) -> _Match:
-    file_name = Path(str(p.file_name)).name
-    out = _Match(p.file_hash, file_name, words=int(p.word_count or 0), version=_version(file_name))
+    out = _new_match(p)
+    file_name = out.file_name
     stem = Path(file_name).stem
     owners = idx.files.get(file_name.lower()) or idx.files.get(stem.lower()) or []
     name_hits = _id_hits(stem.replace(" ", "_"), idx)
@@ -312,7 +351,12 @@ def _match_one(p: ParsedResume, idx: _TAIndex) -> _Match:
         out.notes.append("no TA identifier matched")
     else:
         if email_ids and cid not in email_ids:
-            out.notes.append(f"{IDENTITY_CONFLICT}: resume email belongs to {email_ids[0]}")
+            same_name = idx.name_keys.get(cid) and idx.name_keys.get(cid) == idx.name_keys.get(email_ids[0])
+            if same_name:   # same person applying twice under two IDs (two emails)
+                out.notes.append(f"possible duplicate application: resume email belongs to {email_ids[0]} "
+                                 "(same name)")
+            else:
+                out.notes.append(f"{IDENTITY_CONFLICT}: resume email belongs to {email_ids[0]}")
         if out.method == S.MATCH_TA_FILE and name_hits and cid not in name_hits:
             out.notes.append(f"{IDENTITY_CONFLICT}: file name carries candidate ID {name_hits[0]}")
         if phone_ids and cid not in phone_ids and out.method != S.MATCH_PHONE:
@@ -329,10 +373,14 @@ def _mark_duplicates(results: list[_Match]) -> None:
     for cid, group in groups.items():
         if len(group) < 2:
             continue
-        group.sort(key=lambda r: (-r.confidence, -r.words, -r.version, r.file_name.lower(), r.file_hash))
+        group.sort(key=_rank_key)
+        best = group[0]
         for r in group[1:]:
             r.method = S.MATCH_DUPLICATE
-            r.notes.append(f"duplicate of {group[0].file_name} for {cid}")
+            if _attachment_family(r.file_name) == _attachment_family(best.file_name):
+                r.notes.append(f"additional attachment of {cid}; {best.file_name} linked as the resume")
+            else:
+                r.notes.append(f"duplicate of {best.file_name} for {cid}")
 
 
 def _sorted_resumes(parsed: dict[str, ParsedResume]) -> list[ParsedResume]:
@@ -367,9 +415,8 @@ def _resume_only_matches(resumes: list[ParsedResume], cfg: AppConfig) -> list[_M
     results: list[_Match] = []
     pending: list[tuple[_Match, ParsedResume]] = []
     for p in resumes:
-        file_name = Path(str(p.file_name)).name
-        r = _Match(p.file_hash, file_name, method=S.MATCH_RESUME_ONLY, confidence=CONFIDENCE[S.MATCH_RESUME_ONLY],
-                   words=int(p.word_count or 0), version=_version(file_name))
+        r = _new_match(p, method=S.MATCH_RESUME_ONLY, confidence=CONFIDENCE[S.MATCH_RESUME_ONLY])
+        file_name = r.file_name
         results.append(r)
         emails = set(_emails(p))
         guess = normalize_candidate_id(p.candidate_id_guess) or _filename_id(file_name, pattern)
@@ -459,8 +506,10 @@ def _winners(matches: pd.DataFrame, parsed: dict[str, ParsedResume], valid_ids: 
             issues.append(_issue("warning", f"Possible identity conflict ({note}); verify the resume owner.",
                                  cid, file_name))
         if method == S.MATCH_DUPLICATE:
-            issues.append(_issue("info", "Duplicate resume for this candidate; another file was linked.",
-                                 cid, file_name))
+            text = ("Additional attachment for this candidate (not scored); the primary resume was linked."
+                    if "additional attachment" in note else
+                    "Duplicate resume for this candidate; another file was linked.")
+            issues.append(_issue("info", text, cid, file_name))
             continue
         if method == S.MATCH_NONE or cid is None:
             issues.append(_issue("warning", "Resume could not be linked to any TA candidate.", None, file_name))
@@ -471,12 +520,13 @@ def _winners(matches: pd.DataFrame, parsed: dict[str, ParsedResume], valid_ids: 
             continue
         confidence = rec.get(S.MATCH_CONFIDENCE)
         confidence = float(confidence) if isinstance(confidence, (int, float)) and not math.isnan(confidence) else 0.0
-        linked.setdefault(cid, []).append(_Match(file_hash, file_name or Path(str(p.file_name)).name, cid, method,
-                                                 confidence, words=int(p.word_count or 0),
-                                                 version=_version(file_name)))
+        name = file_name or Path(str(p.file_name)).name
+        linked.setdefault(cid, []).append(_Match(file_hash, name, cid, method, confidence,
+                                                 words=int(p.word_count or 0), version=_version(name),
+                                                 likeness=_resume_likeness(p), attachment=attachment_index(name)))
     winners: dict[str, _Match] = {}
     for cid, group in linked.items():
-        group.sort(key=lambda r: (-r.confidence, -r.words, -r.version, r.file_name.lower(), r.file_hash))
+        group.sort(key=_rank_key)
         winners[cid] = group[0]
         for r in group[1:]:
             issues.append(_issue("info", "Duplicate resume for this candidate; another file was linked.",

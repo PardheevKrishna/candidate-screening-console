@@ -64,6 +64,11 @@ class ParsedResume:
     parse_status: str = "ok"                                 # "ok" | "empty" | "error"
     parse_error: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # Hidden / adversarial text found in the file (excluded from scoring text):
+    # each {"kind": "instruction"|"invisible_chars"|"hidden_text", "snippet": str, "detail": str}
+    injection_findings: list[dict[str, Any]] = field(default_factory=list)
+    # When split from a multi-candidate packet: "<packet file name> p.<first>-<last>"
+    bundle_source: str | None = None
 
 
 @dataclass
@@ -124,6 +129,8 @@ class PipelineResult:
     risk: RiskResult
     quality: DataQualityReport
     config: AppConfig
-    llm_results: dict[str, dict[str, Any]] = field(default_factory=dict)   # candidate_id -> llm rescore
+    # Always {} for new runs (the LLM never changes scores); kept so runs saved by older
+    # versions still load.
+    llm_results: dict[str, dict[str, Any]] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=dict)
     mode: str = "ta+resumes"                       # "ta+resumes" | "ta_only" | "resumes_only"

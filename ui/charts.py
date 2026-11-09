@@ -6,6 +6,7 @@ returns a ``go.Figure`` (an annotated empty figure when there is nothing to draw
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -14,6 +15,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
+from screening import injection as injection_text
 from screening import schema as S
 from ui.theme import (CLEAR_GREEN, GOLD, GOLD_DARK, GREY, GREY_LIGHT, RED, RED_DARK, RISK_COLORS,
                       SLATE, SLATE_2)
@@ -319,3 +321,102 @@ def points_breakdown(earned: Mapping[str, float], available: Mapping[str, float]
     fig.update_yaxes(autorange="reversed")
     fig.update_xaxes(title="Rubric points", range=[0, max(cap + got + [1.0]) * 1.18])
     return _layout(fig, height=260)
+
+
+# ---------------------------------------------------------------------------
+# Integrity helpers shared by the Risk, Deep-Dive and Compare tabs (tolerant, no Streamlit)
+# ---------------------------------------------------------------------------
+TEAM_SIGNAL = "team_github_repo"
+TEAM_PAIR_LABEL = "Team project (likely legitimate)"
+SIGNAL_PAIR_LABEL = "Integrity signal"
+INJECTION_LABEL = "Adversarial text detected in resume (Prompt Injection / Hidden Text)"
+INJECTION_KIND_LABELS: dict[str, str] = {
+    "instruction": "Instruction aimed at screeners or AI tools",
+    "hidden_text": "Hidden text",
+    "invisible_chars": "Invisible characters",
+}
+_INJECTION_PRIORITY = {"instruction": 0, "hidden_text": 1, "invisible_chars": 2}
+_WORD_RE = re.compile(r"[a-z]+")
+_BUNDLE_RE = re.compile(r"^(?P<file>.+?)\s+p\.\s*(?P<first>\d+)(?:\s*-\s*(?P<last>\d+))?\s*$")
+
+
+def team_project_mask(pairs: pd.DataFrame | None) -> pd.Series:
+    """True for pairs linked only by a shared team-project GitHub repo (signal_keys ==
+    "team_github_repo"): teammates listing the same repo on otherwise different resumes."""
+    if pairs is None or pairs.empty:
+        return pd.Series([], dtype=bool)
+    keys = txt(pairs, "signal_keys").map(lambda v: set(split_list(v)))
+    return keys.map(lambda k: bool(k) and k <= {TEAM_SIGNAL}).astype(bool)
+
+
+def pair_types(pairs: pd.DataFrame | None) -> pd.Series:
+    """'Team project (likely legitimate)' or 'Integrity signal' per pair row."""
+    mask = team_project_mask(pairs)
+    return mask.map({True: TEAM_PAIR_LABEL, False: SIGNAL_PAIR_LABEL}).astype(object)
+
+
+def integrity_concern(value: Any) -> bool:
+    """Assessment integrity status that needs review: Workday Medium / High or HackerRank
+    Review / Suspicious / Flagged (schema.INTEGRITY_CONCERN_VALUES); "Not suspicious" is not."""
+    if value is None or (isinstance(value, float) and math.isnan(value)) or value is pd.NA:
+        return False
+    low = str(value).casefold().strip()
+    if not low or low.startswith(("not ", "no ", "non-", "non ")):
+        return False
+    return any(word in S.INTEGRITY_CONCERN_VALUES for word in _WORD_RE.findall(low))
+
+
+def injection_flagged(df: pd.DataFrame) -> pd.Series:
+    """True where the row carries hidden / adversarial resume text (INJECTION_FLAGS)."""
+    return txt(df, S.INJECTION_FLAGS).str.strip() != ""
+
+
+def injection_findings(parsed: Any) -> list[dict[str, str]]:
+    """ParsedResume.injection_findings as clean {kind, snippet, detail} dicts, most serious first
+    ([] for resumes parsed before the field existed)."""
+    out = []
+    for f in getattr(parsed, "injection_findings", None) or []:
+        if isinstance(f, Mapping):
+            out.append({"kind": str(f.get("kind") or "").strip(),
+                        "snippet": " ".join(str(f.get("snippet") or "").split()),
+                        "detail": " ".join(str(f.get("detail") or "").split())})
+    return sorted(out, key=lambda f: _INJECTION_PRIORITY.get(f["kind"], len(_INJECTION_PRIORITY)))
+
+
+def injection_summaries(flags: Any, parsed: Any = None, width: int = 80) -> list[str]:
+    """One line per finding: the parsed resume's findings (injection.finding_summary) when
+    available, else the " | "-joined INJECTION_FLAGS cell."""
+    findings = injection_findings(parsed)
+    if findings:
+        try:
+            return [injection_text.finding_summary(f, width=width) for f in findings]
+        except Exception:  # noqa: BLE001 - wording helper must never break a page
+            return [f"{INJECTION_KIND_LABELS.get(f['kind'], f['kind'])}: {f['snippet']}" for f in findings]
+    return split_list(flags, S.SEP_REASONS)
+
+
+def injection_snippet(flags: Any, parsed: Any = None, width: int = 60) -> str:
+    """Short snippet of the most serious finding (injection.reason_snippet), else the first flag."""
+    findings = injection_findings(parsed)
+    if findings:
+        try:
+            return injection_text.reason_snippet(findings, width=width)
+        except Exception:  # noqa: BLE001
+            return findings[0]["snippet"][:width]
+    parts = split_list(flags, S.SEP_REASONS)
+    return parts[0] if parts else ""
+
+
+def bundle_text(bundle_source: Any) -> str:
+    """'<packet> p.3-4' -> 'From packet <packet>, pages 3-4' ('' when not split from a packet)."""
+    if bundle_source is None or (isinstance(bundle_source, float) and math.isnan(bundle_source)):
+        return ""
+    text = " ".join(str(bundle_source).split())
+    if not text:
+        return ""
+    match = _BUNDLE_RE.match(text)
+    if not match:
+        return f"From packet {text}"
+    first, last = match.group("first"), match.group("last")
+    pages = f"pages {first}-{last}" if last and last != first else f"page {first}"
+    return f"From packet {match.group('file')}, {pages}"

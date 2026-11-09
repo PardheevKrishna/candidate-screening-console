@@ -84,11 +84,18 @@ class EducationConfig:
     w_degree: float = 0.35
     w_cgpa: float = 0.35
     w_certifications: float = 0.20
-    w_tier: float = 0.10  # institution tier; set 0 to ignore (fairness: can proxy socioeconomic status)
+    w_tier: float = 0.10  # used only when tier_enabled
     cgpa_floor: float = 6.0     # <= floor -> 0
     cgpa_ceiling: float = 9.5   # >= ceiling -> 1
     certs_for_full: int = 2
     tier_scores: dict[str, float] = field(default_factory=lambda: {"1": 1.0, "2": 0.7, "3": 0.4})
+    # College tier scoring is OFF unless the TA team turns it on (ideally with an approved
+    # tier list): tiers can act as a proxy for socioeconomic background. When off, the tier
+    # weight is ignored and the remaining education sub-weights are re-normalised.
+    tier_enabled: bool = False
+    # Approved tier list uploaded in the Config tab: normalised college name/alias -> tier label.
+    tier_mapping: dict[str, str] = field(default_factory=dict)
+    tier_match_threshold: int = 90   # rapidfuzz score needed to match a college to the list
 
 
 @dataclass
@@ -106,12 +113,40 @@ class ShortlistConfig:
     # True => High-risk candidates move to "Integrity Hold" and the slot is backfilled.
     exclude_high_risk: bool = False
     review_risk_levels: list[str] = field(default_factory=lambda: ["High", "Medium"])
-    # Candidates in the TA feed without a resume: "zero" scores resume components as 0;
-    # "renormalize" rescales the remaining components to 100.
-    missing_resume_policy: str = "zero"
+    # Candidates without a resume: "zero" scores resume components as 0; "renormalize"
+    # rescales the remaining components to 100; "auto" = renormalize when no resumes were
+    # loaded at all (TA-feed-only run), otherwise zero (no unfair boost for a missing CV).
+    missing_resume_policy: str = "auto"
     # Max share of the shortlist any single college may take (percent of shortlist size;
     # 0 = no cap). Candidates beyond the cap are not shortlisted and the next-best fill the slots.
     college_cap_pct: float = 0.0
+    # Candidate IDs a recruiter disqualifies by hand (administrative exclusion).
+    exclude_candidates: list[str] = field(default_factory=list)
+    # Detected duplicate applications (same person, different email/ID) are made Ineligible,
+    # keeping one application (institutional email preferred, else the earliest ID).
+    auto_disqualify_duplicates: bool = True
+    # Tie-break order after final score (candidate ID is always the last resort).
+    # Keys: see TIE_BREAK_KEYS.
+    tie_break_order: list[str] = field(default_factory=lambda: ["hackerrank_pct", "sub_skills", "sub_experience"])
+
+
+# Tie-break keys -> (label, higher_is_better)
+TIE_BREAK_KEYS: dict[str, tuple[str, bool]] = {
+    "hackerrank_pct": ("HackerRank percentage", True),
+    "coding_marks": ("HackerRank coding-question marks", True),
+    "sub_skills": ("Skills sub-score", True),
+    "sub_experience": ("Experience sub-score", True),
+    "cgpa": ("CGPA (feed, then resume)", True),
+    "submission_time": ("Earliest assessment submission", False),
+}
+
+# One-click rubric presets shown in the Config tab.
+PRESETS: dict[str, dict[str, Any]] = {
+    "with_resumes": {"label": "With Resumes (40/30/20/10)",
+                     "weights": {"hackerrank": 40.0, "skills": 30.0, "experience": 20.0, "education": 10.0}},
+    "no_resumes": {"label": "No Resumes (80/0/0/20)",
+                   "weights": {"hackerrank": 80.0, "skills": 0.0, "experience": 0.0, "education": 20.0}},
+}
 
 
 @dataclass
@@ -139,6 +174,14 @@ class RiskConfig:
     lift_min_count: int = 3
     lift_min: float = 2.0
     lift_alpha: float = 0.05
+    # Legitimate team projects: teammates list the same GitHub repo on otherwise different
+    # resumes. A pair with <= team_max_shared_repos shared repos, resume similarity below
+    # team_max_text_similarity and <= team_max_shared_bullets shared rare bullets counts as a
+    # team project; its repo signal uses team_repo_weight instead of the full weight.
+    team_max_shared_repos: int = 2
+    team_max_text_similarity: float = 0.40
+    team_max_shared_bullets: int = 1
+    team_repo_weight: float = 15.0
     pair_weights: dict[str, float] = field(default_factory=lambda: {
         "shared_answer_hash": 35.0,   # per shared non-trivial answer, capped at 2x
         "shared_github_repo": 35.0,
@@ -165,62 +208,48 @@ class RiskConfig:
         "out_of_window_time": 10.0,
         "copy_paste": 10.0,
         "secure_mode_exits": 10.0,
+        "prompt_injection": 50.0,     # hidden / adversarial text aimed at screeners or AI in the resume
     })
 
 
-# Active LLM provider presets. Provider-specific values live ONLY here and in
-# screening/llm_backends.py - see docs/SWITCH_TO_TACHYON.md for the migration.
+# LLM access goes through the local VS Code extension in vscode-copilot-proxy/, which serves
+# GitHub Copilot models over an OpenAI-style endpoint on this machine only. Provider-specific
+# values live ONLY here and in screening/llm_backends.py.
 LLM_PROVIDERS: dict[str, dict[str, Any]] = {
-    "nvidia": {
-        "label": "NVIDIA NIM",
-        "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "nvidia/nemotron-3-ultra-550b-a55b",
-        "key_env": "NVIDIA_API_KEY",
-        "fallback_models": ["nvidia/nemotron-3.5-bolt-e4b", "meta/llama-3.3-70b-instruct", "google/gemma-4-31b-it"],
-        # Nemotron models "think" before answering; hidden reasoning can eat the whole token
-        # budget (empty reply). Disabling it measured 0 reasoning tokens and ~35% lower latency.
-        "request_extras": {"chat_template_kwargs": {"thinking": False}},
+    "copilot": {
+        "label": "GitHub Copilot (VS Code proxy)",
+        "base_url": "http://127.0.0.1:5757/v1",
+        "model": "",                 # "" = the proxy picks the best available Copilot chat model
+        "key_env": "COPILOT_PROXY_TOKEN",
+        "fallback_models": [],
     },
 }
 
 
 # Never accepted from uploaded profiles (see AppConfig.from_json).
-LLM_CONNECTION_FIELDS = frozenset({
-    "provider", "api_key_env", "backend_factory", "base_url", "fallback_models", "request_extras",
-    "cache_dir",
-})
+LLM_CONNECTION_FIELDS = frozenset({"provider", "api_key_env", "base_url", "fallback_models", "cache_dir"})
 
 
 @dataclass
 class LLMConfig:
-    enabled: bool = True                     # still requires an API key at runtime
-    provider: str = "nvidia"                 # key of LLM_PROVIDERS
-    api_key_env: str = "NVIDIA_API_KEY"      # env var / st.secrets key holding the API key
-    backend_factory: str = ""                # "module:Class" for provider "tachyon" (internal wrapper)
-    base_url: str = "https://integrate.api.nvidia.com/v1"
-    # meta/llama-3.3-70b-instruct now returns HTTP 410 (retired) on the NVIDIA API;
-    # measured 2026-11-05: nemotron-3-ultra ~5 s/call with valid JSON.
-    model: str = "nvidia/nemotron-3-ultra-550b-a55b"
-    # Tried in order when the primary model is retired/unavailable (404/410) or keeps timing out.
-    fallback_models: list[str] = field(default_factory=lambda: [
-        "nvidia/nemotron-3.5-bolt-e4b",
-        "meta/llama-3.3-70b-instruct",
-        "google/gemma-4-31b-it",
-    ])
-    # Extra vendor-specific request fields (sent as the request body's extra fields).
-    request_extras: dict[str, Any] = field(default_factory=lambda: {"chat_template_kwargs": {"thinking": False}})
+    """LLM settings. The LLM only writes rationales (candidate explanations, interview and
+    integrity questions, risk-group and batch summaries); it never changes scores, ranks or cutoffs."""
+
+    enabled: bool = True                     # still requires the proxy to be running
+    provider: str = "copilot"                # key of LLM_PROVIDERS
+    api_key_env: str = "COPILOT_PROXY_TOKEN" # env var / st.secrets key holding the proxy token
+    base_url: str = "http://127.0.0.1:5757/v1"
+    model: str = ""                          # "" = proxy default; or a Copilot model id/family
+    fallback_models: list[str] = field(default_factory=list)
     temperature: float = 0.2
-    max_tokens: int = 2048                   # headroom for models that reason before answering
-    timeout_sec: float = 60.0
-    max_retries: int = 4
-    max_concurrency: int = 8
+    max_tokens: int = 2048
+    timeout_sec: float = 120.0
+    max_retries: int = 3
+    max_concurrency: int = 4
     max_input_chars: int = 6000
     cache_dir: str = ".cache/llm"
-    # Re-scoring: only candidates near the shortlist cutoff,
-    # blended 50/50 with the rule-based experience score.
-    rescore_near_cutoff: bool = True
-    cutoff_band: int = 50                    # ranks within +/- band of the cutoff
-    blend_weight: float = 0.5                # exp = (1-w)*rules + w*llm
+    # "Explain borderline candidates": the first N ranks just below the shortlist cutoff.
+    borderline_band: int = 50
 
     def apply_provider(self, provider: str) -> "LLMConfig":
         """Switch base_url / model / fallbacks / key name to a preset (in place)."""
@@ -230,22 +259,31 @@ class LLMConfig:
         self.provider = provider
         self.api_key_env = preset["key_env"]
         self.base_url = preset["base_url"]
-        self.model = preset["model"]  # "" = let the backend use its own default
+        self.model = preset["model"]
         self.fallback_models = list(preset["fallback_models"])
-        self.backend_factory = preset.get("backend_factory", "")
-        self.request_extras = dict(preset.get("request_extras", {}))
         return self
 
 
 @dataclass
 class ProcessingConfig:
     max_workers: int = 8
-    max_file_mb: float = 10.0
+    max_file_mb: float = 10.0          # single resume file
+    max_bundle_mb: float = 250.0       # multi-candidate PDF packet (e.g. Workday "..._set 1.pdf")
+    split_bundles: bool = True         # split multi-candidate packets into one resume per candidate
     max_zip_members: int = 10000
-    max_zip_total_mb: float = 1024.0
+    max_zip_total_mb: float = 2048.0
     # Pattern used to spot candidate IDs in resume file names / text when the TA
-    # feed's own IDs are not found verbatim.
-    candidate_id_pattern: str = r"\b[A-Z]{2,6}[-_]?\d{3,8}\b"
+    # feed's own IDs are not found verbatim (Workday "C-1234567" and similar).
+    candidate_id_pattern: str = r"\b(?:C-\d{6,8}|[A-Z]{2,6}[-_]?\d{3,8})\b"
+
+
+@dataclass
+class SnapshotConfig:
+    """Fast reload: parsed datasets are cached on disk so a browser refresh does not re-parse."""
+
+    enabled: bool = True
+    ttl_days: int = 7                  # cached datasets older than this are purged
+    cache_dir: str = "data/cache"      # under data/ -> gitignored (contains candidate data)
 
 
 @dataclass
@@ -258,6 +296,7 @@ class AppConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
+    snapshots: SnapshotConfig = field(default_factory=SnapshotConfig)
 
     # ---- serialisation -------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -278,13 +317,15 @@ class AppConfig:
     def from_json(cls, text: str) -> "AppConfig":
         """Load a tuning profile (e.g. an uploaded config file).
 
-        Profiles are untrusted input: LLM *connection* settings (endpoint, key name, backend
-        import path, fallback list, extra request fields, cache folder) are always taken from
-        the code defaults, so a profile can never redirect the API key or candidate data.
+        Profiles are untrusted input: LLM *connection* settings (proxy address, token variable,
+        fallback list, cache folder) and the snapshot cache folder are always taken from the
+        code defaults, so a profile can never redirect the proxy token or candidate data.
         """
         data = json.loads(text)
         if isinstance(data, dict) and isinstance(data.get("llm"), dict):
             data["llm"] = {k: v for k, v in data["llm"].items() if k not in LLM_CONNECTION_FIELDS}
+        if isinstance(data, dict) and isinstance(data.get("snapshots"), dict):
+            data["snapshots"] = {k: v for k, v in data["snapshots"].items() if k != "cache_dir"}
         return cls.from_dict(data)
 
     # ---- validation ----------------------------------------------------
@@ -302,10 +343,11 @@ class AppConfig:
             problems.append(f"Unknown skills mode '{self.skills.mode}'.")
         if self.shortlist.method not in {"top_n", "top_pct", "threshold"}:
             problems.append(f"Unknown shortlist method '{self.shortlist.method}'.")
-        if self.shortlist.missing_resume_policy not in {"zero", "renormalize"}:
+        if self.shortlist.missing_resume_policy not in {"auto", "zero", "renormalize"}:
             problems.append(f"Unknown missing-resume policy '{self.shortlist.missing_resume_policy}'.")
-        if not 0 <= self.llm.blend_weight <= 1:
-            problems.append("LLM blend weight must be between 0 and 1.")
+        unknown = [k for k in self.shortlist.tie_break_order if k not in TIE_BREAK_KEYS]
+        if unknown:
+            problems.append(f"Unknown tie-break rule(s): {', '.join(unknown)}.")
         if self.risk.medium_threshold > self.risk.high_threshold:
             problems.append("Risk medium threshold is above the high threshold.")
         return problems

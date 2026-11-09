@@ -5,8 +5,15 @@ All exports neutralise spreadsheet formula injection: a text cell that begins wi
 '=HYPERLINK(...)' smuggled into a TA feed or resume is shown as text and never evaluated
 by Excel / Google Sheets. Plain signed numbers ("-5", "+919876543210") are left as is.
 
-Integrity flags are written as review evidence ("pattern consistent with ..."), never
-as verdicts.
+Columns are grouped by where their values come from (schema.COLUMN_SOURCE): the assessment
+export (HackerRank), the resume, the academic profile and the integrity engine. The Excel
+"Shortlist" and "All Candidates" sheets show that as a coloured super-header row; CSV files,
+which have a single header row, use prefixed labels instead ("HackerRank: Score",
+"Resume: Skills Pts", "Academic: CGPA", "Integrity: Risk Level") - see labelled_columns().
+
+Integrity flags are written as review evidence ("pattern consistent with ..."), never as
+verdicts. LLM output appears only as clearly labelled notes; the LLM never changes a score,
+rank or cutoff.
 """
 from __future__ import annotations
 
@@ -23,12 +30,12 @@ import pandas as pd
 import xlsxwriter
 
 from . import schema as S
-from .config import AppConfig
+from .config import LLM_PROVIDERS, TIE_BREAK_KEYS, AppConfig
 from .models import PipelineResult
 from .scoring import IN_SHORTLIST, explain_score, order_columns
 
 SHEET_NAMES = [
-    "Summary", "Shortlist", "All Candidates", "Integrity Evidence", "Risk Clusters",
+    "Summary", "Shortlist", "All Candidates", "Ineligible Candidates", "Integrity Evidence", "Risk Clusters",
     "Risk Pairs", "Commonality", "Data Quality", "Config",
 ]
 BRAND_RED = "#D71E28"
@@ -44,10 +51,65 @@ DISCLAIMER = (
     "never present a flag to a candidate as a conclusion."
 )
 
+# ---------------------------------------------------------------------------
+# Column groups (super-header row) and source prefixes (CSV labels)
+# ---------------------------------------------------------------------------
+GROUP_CORE = "Candidate & Outcome"
+GROUP_LLM = "AI Notes (LLM)"
+GROUP_OTHER = "Other"
+GROUP_ORDER = (GROUP_CORE, S.SRC_ASSESSMENT, S.SRC_RESUME, S.SRC_ACADEMIC, S.SRC_INTEGRITY, GROUP_LLM, GROUP_OTHER)
+SOURCE_PREFIX = {S.SRC_ASSESSMENT: "HackerRank", S.SRC_RESUME: "Resume", S.SRC_ACADEMIC: "Academic",
+                 S.SRC_INTEGRITY: "Integrity"}
+GROUP_STYLE: dict[str, tuple[str, str]] = {  # group -> (fill, font colour)
+    GROUP_CORE: ("#333333", "#FFFFFF"),
+    S.SRC_ASSESSMENT: ("#1F4E79", "#FFFFFF"),
+    S.SRC_RESUME: ("#3B6E2B", "#FFFFFF"),
+    S.SRC_ACADEMIC: ("#F1B521", "#1A1A1A"),
+    S.SRC_INTEGRITY: ("#BA0C2F", "#FFFFFF"),
+    GROUP_LLM: ("#5B3A8C", "#FFFFFF"),
+    GROUP_OTHER: ("#7F7F7F", "#FFFFFF"),
+}
+# Identity and screening outcome: no single data source, shown first.
+_CORE_COLUMNS = frozenset({
+    S.RANK, S.STATUS, S.STATUS_REASON, S.CANDIDATE_ID, S.NAME, S.JOB_APPLICATION, S.EMAIL, S.PHONE, S.CITY,
+    S.SOURCE, S.EMAIL_DOMAIN, S.FINAL_SCORE, S.ELIGIBLE, S.INELIGIBILITY, S.TIE_BREAK_NOTE, S.COLLEGE_CAPPED,
+    S.SCORE_NOTES,
+})
+# Derived columns schema.COLUMN_SOURCE does not list, with the source they are derived from.
+_EXTRA_SOURCE: dict[str, str] = {
+    **{c: S.SRC_ASSESSMENT for c in (S.IP_SUBNET, S.IP_ADDRESSES, S.TEST_SLOT, S.PLAGIARISM_MATCH,
+                                     S.PLAGIARISM_MATCH_ID, S.REPORT_URL)},
+    **{c: S.SRC_RESUME for c in (S.RESUME_HASH, S.MATCH_METHOD, S.MATCH_CONFIDENCE, S.EXPERIENCE_SOURCE)},
+    S.DUPLICATE_EVIDENCE: S.SRC_INTEGRITY,
+}
+# Labels used after a source prefix when stripping the prefix word would leave too little.
+_PREFIXED_LABELS = {S.HR_PCT: "Percentage", S.PTS_HR: "Rubric Pts", S.SUB_HR: "Sub-score"}
+
+# Ineligibility rules in display order (Ineligible Candidates sheet, Summary counts).
+RULE_ORDER = (S.RULE_NO_SCORE, S.RULE_MIN_SCORE, S.RULE_MIN_CGPA, S.RULE_GRAD_YEAR, S.RULE_DUPLICATE,
+              S.RULE_EXCLUDED)
+OTHER_RULE = "Other"
+INELIGIBLE_COLUMNS = [S.CANDIDATE_ID, S.NAME, "rule", "candidate_value", "threshold_value", "explanation"]
+# Fallback for runs without the ineligibility column: status-reason text -> rule.
+_REASON_RULES = [
+    (re.compile(r"^no (?:hackerrank|assessment) score", re.I), S.RULE_NO_SCORE),
+    (re.compile(r"^(?:hackerrank|assessment|score)\b.*\bbelow\b", re.I), S.RULE_MIN_SCORE),
+    (re.compile(r"^cgpa\b", re.I), S.RULE_MIN_CGPA),
+    (re.compile(r"^graduation year\b", re.I), S.RULE_GRAD_YEAR),
+    (re.compile(r"duplicate", re.I), S.RULE_DUPLICATE),
+    (re.compile(r"exclu", re.I), S.RULE_EXCLUDED),
+]
+_INJECTION_KINDS = {"instruction": "Instruction aimed at screeners or AI tools",
+                    "invisible_chars": "Invisible characters", "hidden_text": "Hidden text"}
+
 _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 _SIGNED_NUMBER_RE = re.compile(r"[+-](?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_PHONE_RE = re.compile(r"(?<!\w)\+?\d(?:[\s-]?\d){9,}(?!\w)")
 _EXCEL_MAX_CHARS = 32767
 _MAX_LINKS = 10
+_MAX_SNIPPET = 160
 _LEVEL_ORDER = {S.RISK_HIGH: 0, S.RISK_MEDIUM: 1, S.RISK_LOW: 2, S.RISK_CLEAR: 3}
 
 _LABELS: dict[str, str] = {
@@ -67,9 +129,13 @@ _LABELS: dict[str, str] = {
     S.RESUME_CGPA: "Resume CGPA", S.RESUME_DEGREE: "Resume Degree", S.RELEVANCE: "JD Relevance",
     S.EXPERIENCE_SOURCE: "Experience Source", S.LLM_RATIONALE: "LLM Rationale",
     S.SCORE_NOTES: "Score Notes", S.IP_SUBNET: "IP Subnet", S.EMAIL_DOMAIN: "Email Domain",
-    "test_slot": "Test Slot", S.RESUME_HASH: "Resume Hash", S.HAS_RESUME: "Has Resume",
+    S.TEST_SLOT: "Test Slot", S.RESUME_HASH: "Resume Hash", S.HAS_RESUME: "Has Resume",
     S.MATCH_METHOD: "Match Method", S.MATCH_CONFIDENCE: "Match Confidence",
-    S.DATA_FLAGS: "Data Flags",
+    S.DATA_FLAGS: "Data Flags", S.COLLEGE_CAPPED: "College Capped", S.IP_ADDRESSES: "IP Addresses",
+    S.PLAGIARISM_MATCH_ID: "Most Similar Candidate ID",
+    S.INELIGIBILITY: "Ineligibility", S.TIE_BREAK_NOTE: "Tie-break Note", S.CGPA_SOURCE: "CGPA Source",
+    S.TIER_SOURCE: "Tier Source", S.DUPLICATE_OF: "Duplicate Of", S.DUPLICATE_IDS: "Duplicate IDs",
+    S.DUPLICATE_EVIDENCE: "Duplicate Evidence", S.INJECTION_FLAGS: "Hidden Text Flags",
     # risk frames
     "cand_a": "Candidate A", "cand_b": "Candidate B", "name_a": "Name A", "name_b": "Name B",
     "pair_score": "Pair Score", "signals": "Signals", "signal_keys": "Signal Keys",
@@ -88,12 +154,14 @@ _LABELS: dict[str, str] = {
     "population_count": "Population Count", "population_total": "Population Total",
     "population_share": "Population Share", "lift": "Lift", "p_value": "p-value",
     "q_value": "q-value (BH)", "significant": "Significant",
-    # integrity evidence / data quality / llm
+    # integrity evidence / ineligible candidates / data quality / llm
     "individual_flags": "Individual Flags", "linked_candidates": "Linked Candidates",
     "link_evidence": "Link Evidence (pair score: signals)", "ai_notes": "AI Notes (LLM)",
     "ai_headline": "AI Headline (LLM)", "ai_summary": "AI Summary (LLM)",
     "ai_actions": "AI Recommended Actions (LLM)", "severity": "Severity", "stage": "Stage",
     "issue": "Issue", "file_name": "File Name", "key": "Setting",
+    "rule": "Rule", "candidate_value": "Candidate value", "threshold_value": "Threshold",
+    "explanation": "Explanation",
 }
 _INT_COLS = {
     S.RANK, S.N_LINKS, S.N_MATCHED_SKILLS, S.INTERNSHIP_COUNT, S.PROJECT_COUNT, S.CERT_COUNT,
@@ -113,17 +181,20 @@ _PCT_COLS = {"focus_share", "population_share"}
 _SCI_COLS = {"p_value", "q_value"}
 _WIDE_COLS = {
     S.STATUS_REASON, S.RISK_REASONS, S.SCORE_NOTES, S.LLM_RATIONALE, S.SKILLS_FOUND,
-    S.CERTIFICATIONS, S.MATCHED_SKILLS, S.MISSING_SKILLS, "signals", "shared_bullet_examples",
+    S.CERTIFICATIONS, S.MATCHED_SKILLS, S.MISSING_SKILLS, S.INELIGIBILITY, S.TIE_BREAK_NOTE,
+    S.DUPLICATE_EVIDENCE, S.INJECTION_FLAGS, S.ASSESSMENT_COMMENT, "signals", "shared_bullet_examples",
     "shared_traits", "summary", "members", "member_names", "issue", "link_evidence",
-    "individual_flags", "ai_notes", "ai_summary", "ai_actions", "value",
+    "individual_flags", "ai_notes", "ai_summary", "ai_actions", "value", "explanation",
 }
 _SHORTLIST_COLUMNS = [
-    S.RANK, S.CANDIDATE_ID, S.NAME, S.STATUS, S.FINAL_SCORE, S.PTS_HR, S.PTS_SKILLS,
-    S.PTS_EXPERIENCE, S.PTS_EDUCATION, S.HR_PCT, S.MATCHED_SKILLS, S.MISSING_SKILLS, S.COLLEGE,
-    S.COLLEGE_TIER, S.DEGREE, S.BRANCH, S.CGPA, S.GRAD_YEAR, S.EMAIL, S.PHONE, S.RISK_LEVEL,
-    S.RISK_SCORE, S.CLUSTER_ID, S.RISK_REASONS, S.STATUS_REASON, S.EXPERIENCE_SOURCE,
-    S.LLM_RATIONALE, S.SCORE_NOTES,
+    S.RANK, S.CANDIDATE_ID, S.NAME, S.STATUS, S.FINAL_SCORE, S.EMAIL, S.PHONE, S.STATUS_REASON,
+    S.TIE_BREAK_NOTE, S.SCORE_NOTES,
+    S.PTS_HR, S.HR_SCORE, S.HR_PCT, S.CANDIDATE_OPTION,
+    S.PTS_SKILLS, S.PTS_EXPERIENCE, S.MATCHED_SKILLS, S.MISSING_SKILLS,
+    S.PTS_EDUCATION, S.COLLEGE, S.COLLEGE_TIER, S.DEGREE, S.BRANCH, S.CGPA, S.CGPA_SOURCE, S.GRAD_YEAR,
+    S.RISK_LEVEL, S.RISK_SCORE, S.CLUSTER_ID, S.RISK_REASONS, S.DUPLICATE_IDS,
 ]
+_NOTE_TEXT_KEYS = ("summary", "explanation", "rationale", "headline")
 
 
 # ---------------------------------------------------------------------------
@@ -138,15 +209,29 @@ def sanitize_cell(value: Any) -> Any:
 
 
 def sanitize_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """Copy of ``df`` with every text cell (and header) passed through sanitize_cell."""
+    """Copy of ``df`` with every text cell (and header) passed through sanitize_cell.
+
+    Text UTF-8 cannot encode (lone surrogates from broken PDF text) is repaired on the way.
+    """
     out = df.copy()
     for col in out.columns:
         s = out[col]
         if (pd.api.types.is_object_dtype(s.dtype) or pd.api.types.is_string_dtype(s.dtype)
                 or isinstance(s.dtype, pd.CategoricalDtype)):
-            out[col] = s.astype(object).map(sanitize_cell)
-    out.columns = [sanitize_cell(str(c)) for c in out.columns]
+            out[col] = s.astype(object).map(_sanitize_value)
+    out.columns = [sanitize_cell(_safe_text(str(c))) for c in out.columns]
     return out
+
+
+def _sanitize_value(value: Any) -> Any:
+    return sanitize_cell(_safe_text(value) if isinstance(value, str) else value)
+
+
+def _safe_text(text: str) -> str:
+    """Text UTF-8 can encode: split surrogate pairs re-joined, lone surrogates -> U+FFFD."""
+    if _SURROGATE_RE.search(text):
+        return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return text
 
 
 def _isna(value: Any) -> bool:
@@ -195,15 +280,26 @@ def _label(col: Any) -> str:
 
 
 def _text_of(value: Any) -> str:
-    if isinstance(value, (list, tuple, set)):
-        return ", ".join(map(str, value))
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = sorted(value, key=str) if isinstance(value, (set, frozenset)) else list(value)
+        if any(isinstance(v, (dict, list, tuple)) for v in items):
+            return json.dumps(items, default=str, ensure_ascii=False)
+        return ", ".join(map(str, items))
     if isinstance(value, dict):
-        return json.dumps(value, default=str, sort_keys=True)
+        return json.dumps(value, default=str, sort_keys=True, ensure_ascii=False)
     return str(value)
 
 
 def _split_reasons(value: Any) -> list[str]:
     return [p.strip() for p in _clean(value).split(S.SEP_REASONS.strip()) if p.strip()]
+
+
+def _split_notes(value: Any) -> list[str]:
+    return [p.strip() for p in _clean(value).split(S.SEP_NOTES.strip()) if p.strip()]
+
+
+def _split_ids(value: Any) -> list[str]:
+    return [p.strip() for p in _clean(value).split(",") if p.strip()]
 
 
 def _level(value: Any) -> str:
@@ -226,10 +322,30 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def _display_name(name: Any, job_application: Any = None) -> str:
+    """Candidate name; falls back to the Workday "First Last (first last)" application label."""
+    text = _clean(name)
+    if text:
+        return text
+    return re.sub(r"\s*\([^()]*\)\s*$", "", _clean(job_application)).strip()
+
+
 def _name_map(candidates: pd.DataFrame, col: str = S.NAME) -> dict[str, str]:
-    if S.CANDIDATE_ID not in candidates.columns or col not in candidates.columns:
+    """candidate_id -> ``col`` value (names fall back to the Job Application label)."""
+    if S.CANDIDATE_ID not in candidates.columns:
         return {}
-    return {_clean(k): _clean(v) for k, v in zip(candidates[S.CANDIDATE_ID], candidates[col])}
+    ids = candidates[S.CANDIDATE_ID].tolist()
+    if col == S.NAME:
+        names, apps = _col(candidates, S.NAME).tolist(), _col(candidates, S.JOB_APPLICATION).tolist()
+        return {_clean(k): _display_name(n, a) for k, n, a in zip(ids, names, apps)}
+    if col not in candidates.columns:
+        return {}
+    return {_clean(k): _clean(v) for k, v in zip(ids, candidates[col].tolist())}
+
+
+def _redact(text: str) -> str:
+    """Remove email addresses and phone numbers from free text (evidence packs omit contact data)."""
+    return _PHONE_RE.sub("[phone]", _EMAIL_RE.sub("[email]", text))
 
 
 def _links_for(pairs: pd.DataFrame, candidate_id: str) -> pd.DataFrame:
@@ -257,25 +373,291 @@ def _individual_flags(individual: pd.DataFrame, candidate_id: str) -> list[str]:
     return out
 
 
+def _injection_lines(row: Mapping[str, Any], parsed_by_candidate: Mapping[str, Any] | None) -> list[str]:
+    """Hidden / adversarial resume text for one candidate: the INJECTION_FLAGS column, else the
+    linked ParsedResume.injection_findings."""
+    lines = _split_reasons(row.get(S.INJECTION_FLAGS))
+    if lines:
+        return lines
+    resume = (parsed_by_candidate or {}).get(_clean(row.get(S.CANDIDATE_ID)))
+    for finding in getattr(resume, "injection_findings", None) or []:
+        if not isinstance(finding, Mapping):
+            continue
+        kind_key = _clean(finding.get("kind"))
+        kind = _INJECTION_KINDS.get(kind_key) or kind_key.replace("_", " ").capitalize() or "Hidden text"
+        detail = _clean(finding.get("detail"))
+        snippet = " ".join(_clean(finding.get("snippet")).split())
+        if len(snippet) > _MAX_SNIPPET:
+            snippet = snippet[:_MAX_SNIPPET - 3].rstrip() + "..."
+        text = f"{kind}: {detail}" if detail else kind
+        lines.append(f'{text} - "{snippet}"' if snippet else text)
+    return lines
+
+
 def _llm_candidate_text(note: Any) -> str:
     if not isinstance(note, Mapping):
         return _clean(note)
-    parts = [_clean(note.get("summary"))]
+    if note.get("ok") is False:
+        return ""
+    parts = [next((_clean(note.get(k)) for k in _NOTE_TEXT_KEYS if _clean(note.get(k))), "")]
     for key, title in (("strengths", "Strengths"), ("gaps", "Gaps")):
-        items = [_clean(x) for x in note.get(key) or [] if _clean(x)]
+        values = note.get(key)
+        items = [_clean(x) for x in (values if isinstance(values, (list, tuple)) else []) if _clean(x)]
         if items:
             parts.append(f"{title}: {'; '.join(items)}")
     return " ".join(p for p in parts if p)
 
 
+def _candidate_notes(notes: Mapping[str, Any]) -> dict[str, str]:
+    """candidate_id -> AI note text from llm_notes "candidates" and "borderline"."""
+    out: dict[str, list[str]] = {}
+    for key, prefix in (("candidates", ""), ("borderline", "Near the cutoff: ")):
+        store = notes.get(key)
+        if not isinstance(store, Mapping):
+            continue
+        for cid, note in store.items():
+            text = _llm_candidate_text(note)
+            if text:
+                out.setdefault(_clean(cid), []).append(prefix + text)
+    return {cid: "\n".join(dict.fromkeys(texts)) for cid, texts in out.items()}
+
+
+# ---------------------------------------------------------------------------
+# Column sources, groups and labels (shared with the UI)
+# ---------------------------------------------------------------------------
+def column_source(col: Any) -> str:
+    """Data source of a canonical column: schema.SRC_* ("Assessment", "Resume", "Academic",
+    "Integrity") or "" for identity / outcome / unknown columns. Per-question columns
+    (q1_score, q2_hash, ...) and a few derived columns follow the data they come from."""
+    name = str(col)
+    source = S.COLUMN_SOURCE.get(name) or _EXTRA_SOURCE.get(name)
+    if source:
+        return source
+    if S.ANSWER_HASH_RE.match(name) or S.QUESTION_SCORE_RE.match(name) or S.QUESTION_SIMILARITY_RE.match(name):
+        return S.SRC_ASSESSMENT
+    return ""
+
+
+def column_group(col: Any) -> str:
+    """Super-header group of a column (one of GROUP_ORDER)."""
+    source = column_source(col)
+    if source:
+        return source
+    name = str(col)
+    if name in _CORE_COLUMNS:
+        return GROUP_CORE
+    if name == S.LLM_RATIONALE or name.startswith("ai_"):
+        return GROUP_LLM
+    return GROUP_OTHER
+
+
+def column_label(col: Any, *, prefixed: bool = False) -> str:
+    """Display label of a column; ``prefixed`` adds the data source for single-header formats:
+    "HackerRank: Score", "Resume: Skills Pts", "Academic: CGPA", "Integrity: Risk Level"."""
+    label = _label(col)
+    source = column_source(col) if prefixed else ""
+    prefix = SOURCE_PREFIX.get(source)
+    if not prefix:
+        return label
+    short = _PREFIXED_LABELS.get(str(col))
+    if short is None:
+        short = label
+        for word in (prefix, source):  # "HackerRank Score" -> "Score", "Resume CGPA" -> "CGPA"
+            if short.lower().startswith(word.lower() + " ") and len(short) > len(word) + 1:
+                short = short[len(word) + 1:]
+                break
+    return f"{prefix}: {short}"
+
+
+def _unique_labels(columns: list[Any], prefixed: bool) -> list[str]:
+    seen: dict[str, int] = {}
+    out = []
+    for col in columns:
+        label = column_label(col, prefixed=prefixed)
+        n = seen.get(label.casefold(), 0) + 1
+        seen[label.casefold()] = n
+        out.append(label if n == 1 else f"{label} ({n})")
+    return out
+
+
+def column_labels(columns: Iterable[Any], *, prefixed: bool = True) -> dict[Any, str]:
+    """{column: unique display label} - e.g. for st.column_config or renaming a view."""
+    cols = list(columns)
+    return dict(zip(cols, _unique_labels(cols, prefixed)))
+
+
+def _group_positions(columns: list[Any]) -> list[int]:
+    rank = {group: i for i, group in enumerate(GROUP_ORDER)}
+    return sorted(range(len(columns)), key=lambda j: (rank[column_group(columns[j])], j))
+
+
+def group_columns(columns: Iterable[Any]) -> list[Any]:
+    """Columns reordered by group (GROUP_ORDER); the order inside a group is kept."""
+    cols = list(columns)
+    return [cols[j] for j in _group_positions(cols)]
+
+
+def labelled_columns(df: pd.DataFrame, *, group: bool = False) -> pd.DataFrame:
+    """Copy of ``df`` with source-prefixed display labels as headers (for CSV and the UI).
+
+    Values are unchanged. ``group=True`` also orders the columns as the Excel sheets do:
+    candidate & outcome, Assessment, Resume, Academic, Integrity, AI notes, other.
+    """
+    columns = list(df.columns)
+    positions = _group_positions(columns) if group else list(range(len(columns)))
+    out = df.iloc[:, positions].copy()
+    out.columns = _unique_labels([columns[j] for j in positions], prefixed=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Ineligibility (schema.INELIGIBILITY: JSON list of rule violations)
+# ---------------------------------------------------------------------------
+def _rule_item(rule: str, candidate_value: Any, threshold_value: Any, explanation: str) -> dict[str, Any]:
+    return {"rule_violated": rule, "candidate_value": None if _isna(candidate_value) else candidate_value,
+            "threshold_value": None if _isna(threshold_value) else threshold_value, "explanation": explanation}
+
+
+def ineligibility_items(value: Any) -> list[dict[str, Any]]:
+    """One INELIGIBILITY cell (JSON text or a list of dicts) ->
+    [{"rule_violated", "candidate_value", "threshold_value", "explanation"}]. Never raises."""
+    data = value
+    if isinstance(data, (bytes, bytearray)):
+        data = bytes(data).decode("utf-8", "replace")
+    if isinstance(data, str):
+        text = data.strip()
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return [_rule_item("", None, None, text)]
+        if isinstance(data, str):
+            return [_rule_item("", None, None, data.strip())] if data.strip() else []
+    if isinstance(data, np.ndarray):
+        data = data.tolist()
+    if isinstance(data, Mapping):
+        data = [data]
+    if not isinstance(data, (list, tuple)):
+        return []
+    out = []
+    for item in data:
+        if isinstance(item, Mapping):
+            rule = _clean(item.get("rule_violated") or item.get("rule"))
+            out.append(_rule_item(rule, item.get("candidate_value"), item.get("threshold_value"),
+                                  _clean(item.get("explanation"))))
+        elif _clean(item):
+            out.append(_rule_item("", None, None, _clean(item)))
+    return out
+
+
+def _value_text(value: Any) -> str:
+    if value is None or _isna(value):
+        return ""
+    if isinstance(value, float):
+        return _fmt(value, 2)
+    return _text_of(value)
+
+
+def ineligibility_text(value: Any, sep: str = S.SEP_NOTES) -> str:
+    """Readable one-line form of an INELIGIBILITY cell: "Academic CGPA: CGPA 6.80 is below 7.00"."""
+    parts = []
+    for item in ineligibility_items(value):
+        detail = item["explanation"]
+        if not detail:
+            cand, thr = _value_text(item["candidate_value"]), _value_text(item["threshold_value"])
+            detail = f"{cand} (threshold {thr})" if cand and thr else cand or (f"threshold {thr}" if thr else "")
+        rule = item["rule_violated"]
+        parts.append(f"{rule}: {detail}" if rule and detail else rule or detail)
+    return sep.join(p for p in parts if p)
+
+
+def _rule_from_reason(text: str) -> str:
+    for pattern, rule in _REASON_RULES:
+        if pattern.search(text):
+            return rule
+    return ""
+
+
+def _rule_rank(rule: str) -> int:
+    return RULE_ORDER.index(rule) if rule in RULE_ORDER else len(RULE_ORDER)
+
+
+def ineligible_rows(candidates: pd.DataFrame) -> pd.DataFrame:
+    """One row per violated rule (columns INELIGIBLE_COLUMNS), ordered by rule then candidate ID.
+
+    Uses schema.INELIGIBILITY; an Ineligible candidate without it (e.g. a run saved by an older
+    version) gets one row per status-reason part, with the rule inferred from the text.
+    """
+    c = _frame(candidates)
+    if c.empty:
+        return pd.DataFrame(columns=INELIGIBLE_COLUMNS)
+    ids = _col(c, S.CANDIDATE_ID).map(_clean).tolist()
+    names = [_display_name(n, j) for n, j in zip(_col(c, S.NAME).tolist(), _col(c, S.JOB_APPLICATION).tolist())]
+    status = _col(c, S.STATUS).map(_clean).tolist()
+    reasons = _col(c, S.STATUS_REASON).tolist()
+    values = _col(c, S.INELIGIBILITY).tolist()
+    rows = []
+    for i in range(len(c)):
+        items = ineligibility_items(values[i])
+        if not items and status[i] == S.STATUS_INELIGIBLE:
+            items = [_rule_item(_rule_from_reason(p), None, None, p) for p in _split_notes(reasons[i])]
+            items = items or [_rule_item("", None, None, "Ineligible (no reason recorded)")]
+        for item in items:
+            rows.append({S.CANDIDATE_ID: ids[i], S.NAME: names[i], "rule": item["rule_violated"] or OTHER_RULE,
+                         "candidate_value": item["candidate_value"], "threshold_value": item["threshold_value"],
+                         "explanation": item["explanation"]})
+    out = pd.DataFrame(rows, columns=INELIGIBLE_COLUMNS)
+    if out.empty:
+        return out
+    out = (out.assign(_r=out["rule"].map(_rule_rank))
+           .sort_values(["_r", "rule", S.CANDIDATE_ID], kind="mergesort").drop(columns="_r"))
+    return out.reset_index(drop=True)
+
+
+def ineligibility_counts(candidates: pd.DataFrame) -> list[tuple[str, int]]:
+    """[(rule, candidates failing it)] in RULE_ORDER; a candidate can fail several rules."""
+    rows = ineligible_rows(candidates)
+    if rows.empty:
+        return []
+    per_rule = rows.drop_duplicates([S.CANDIDATE_ID, "rule"]).groupby("rule", sort=False).size()
+    return sorted(((str(r), int(n)) for r, n in per_rule.items()), key=lambda t: (_rule_rank(t[0]), t[0]))
+
+
 # ---------------------------------------------------------------------------
 # CSV
 # ---------------------------------------------------------------------------
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """CSV encoded as UTF-8 with BOM (opens cleanly in Excel), formula-injection safe."""
-    text = sanitize_frame(df).to_csv(index=False, lineterminator="\r\n",
-                                     date_format="%Y-%m-%d %H:%M:%S")
-    return text.encode("utf-8-sig")
+def _csv_cell(value: Any) -> Any:
+    if isinstance(value, (list, tuple, set, frozenset, dict, np.ndarray)):
+        data = value.tolist() if isinstance(value, np.ndarray) else value
+        if isinstance(data, (set, frozenset)):
+            data = sorted(data, key=str)
+        return _safe_text(json.dumps(data, default=str, ensure_ascii=False))
+    return _safe_text(value) if isinstance(value, str) else value
+
+
+def _flat_cells(df: pd.DataFrame) -> pd.DataFrame:
+    """Lists / dicts in object columns as JSON text (pandas would write their Python repr)."""
+    out = df
+    for j in range(df.shape[1]):
+        series = df.iloc[:, j]
+        if series.dtype == object and any(isinstance(v, (list, tuple, set, frozenset, dict, np.ndarray))
+                                          for v in series.tolist()):
+            if out is df:
+                out = df.copy()
+            out.isetitem(j, series.map(_csv_cell))
+    return out
+
+
+def to_csv_bytes(df: pd.DataFrame, *, labelled: bool = False) -> bytes:
+    """CSV encoded as UTF-8 with BOM (opens cleanly in Excel), formula-injection safe.
+
+    ``labelled=True`` writes source-prefixed display labels as headers (labelled_columns).
+    """
+    frame = labelled_columns(df) if labelled else df
+    text = sanitize_frame(_flat_cells(frame)).to_csv(index=False, lineterminator="\r\n",
+                                                     date_format="%Y-%m-%d %H:%M:%S")
+    return _safe_text(text).encode("utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +675,9 @@ class _Book:
         self.header = add({"bold": True, "font_color": "#FFFFFF", "bg_color": BRAND_RED,
                            "border": 1, "border_color": "#BA0C2F", "text_wrap": True,
                            "valign": "top"})
+        self.groups = {group: add({"bold": True, "font_color": font, "bg_color": fill, "align": "center",
+                                   "valign": "vcenter", "border": 1, "border_color": "#FFFFFF"})
+                       for group, (fill, font) in GROUP_STYLE.items()}
         self.title = add({"bold": True, "font_size": 16, "font_color": BRAND_RED})
         self.subtitle = add({"italic": True, "font_color": "#555555"})
         self.label = add({"bold": True, "valign": "top"})
@@ -331,7 +716,9 @@ class _Book:
         elif isinstance(value, date):
             ws.write_datetime(r, c, datetime(value.year, value.month, value.day), self.date)
         else:
-            ws.write_string(r, c, sanitize_cell(_text_of(value))[:_EXCEL_MAX_CHARS], fmt)
+            text = sanitize_cell(_safe_text(_text_of(value)))[:_EXCEL_MAX_CHARS]
+            if text:  # empty text stays a blank cell
+                ws.write_string(r, c, text, fmt)
 
     def _column_format(self, col: str, series: pd.Series, wrap: bool) -> Any:
         dtype = series.dtype
@@ -372,7 +759,7 @@ class _Book:
             return row + 2
         wrap_set, widths = set(wrap), dict(widths or {})
         for j, name in enumerate(columns):
-            ws.write_string(row, col + j, sanitize_cell(_label(name)), self.header)
+            ws.write_string(row, col + j, sanitize_cell(_safe_text(_label(name))), self.header)
             series = df.iloc[:, j]
             ws.set_column(col + j, col + j, widths.get(name) or self._width(name, series, name in wrap_set))
         formats = [self._column_format(name, df.iloc[:, j], name in wrap_set)
@@ -387,6 +774,28 @@ class _Book:
         if len(df):
             self._highlight(ws, columns, row + 1, last_row, col)
         return last_row + 2
+
+    def grouped_table(self, ws: Any, df: pd.DataFrame, *, freeze_cols: int | None = 0,
+                      wrap: Iterable[str] = (), widths: Mapping[str, float] | None = None) -> int:
+        """Table whose columns are grouped by data source under a coloured super-header row
+        (row 1: "Candidate & Outcome", "Assessment", "Resume", "Academic", "Integrity", ...)."""
+        columns = list(df.columns)
+        if not columns:
+            return self.table(ws, df, freeze_cols=freeze_cols, wrap=wrap, widths=widths)
+        frame = df.iloc[:, _group_positions(columns)]
+        groups = [column_group(c) for c in frame.columns]
+        start = 0
+        for j in range(1, len(groups) + 1):
+            if j < len(groups) and groups[j] == groups[start]:
+                continue
+            fmt = self.groups[groups[start]]
+            if j - 1 > start:
+                ws.merge_range(0, start, 0, j - 1, groups[start], fmt)
+            else:
+                ws.write_string(0, start, groups[start], fmt)
+            start = j
+        ws.set_row(0, 20)
+        return self.table(ws, frame, row=1, freeze_cols=freeze_cols, wrap=wrap, widths=widths)
 
     def _highlight(self, ws: Any, columns: list[str], first: int, last: int, col0: int) -> None:
         rules = {
@@ -409,7 +818,7 @@ class _Book:
         ws.write_string(row, col, title, self.header)
         ws.write_string(row, col + 1, "", self.header)
         for k, (key, value) in enumerate(items, start=row + 1):
-            ws.write_string(k, col, key, self.label)
+            ws.write_string(k, col, sanitize_cell(_safe_text(str(key))), self.label)
             if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
                 self.cell(ws, k, col + 1, value, self.thousands)
             elif isinstance(value, (float, np.floating)):
@@ -417,6 +826,15 @@ class _Book:
             else:
                 self.cell(ws, k, col + 1, value, self.wrap)
         return row + len(items) + 2
+
+
+def _hidden_text_count(result: PipelineResult, c: pd.DataFrame) -> int | None:
+    if S.INJECTION_FLAGS in c.columns:
+        return int(_col(c, S.INJECTION_FLAGS).map(_clean).astype(bool).sum())
+    parsed = result.parsed_by_candidate or {}
+    if not parsed:
+        return None
+    return sum(1 for p in parsed.values() if getattr(p, "injection_findings", None))
 
 
 def _kpis(result: PipelineResult, cfg: AppConfig) -> list[tuple[str, Any]]:
@@ -452,26 +870,47 @@ def _kpis(result: PipelineResult, cfg: AppConfig) -> list[tuple[str, Any]]:
         ("Resumes parsed", len(result.parsed_resumes or {})),
         ("Resumes linked to candidates", len(result.parsed_by_candidate or {})),
         ("Candidates without a resume", no_resume if S.HAS_RESUME in c.columns else "n/a"),
-        ("LLM re-scored (near cutoff)", len(result.llm_results or {})),
     ]
+    if S.DUPLICATE_OF in c.columns:
+        items.append(("Duplicate applications (same person applied again)",
+                      int(_col(c, S.DUPLICATE_OF).map(_clean).astype(bool).sum())))
+    hidden = _hidden_text_count(result, c)
+    if hidden is not None:
+        items.append(("Resumes with hidden text (excluded from scoring)", hidden))
     return items
 
 
 def _config_highlights(cfg: AppConfig) -> list[tuple[str, Any]]:
-    w, sk, sl, rk, llm = cfg.weights.normalized(), cfg.skills, cfg.shortlist, cfg.risk, cfg.llm
+    w, sk, sl, rk, llm, ed = cfg.weights.normalized(), cfg.skills, cfg.shortlist, cfg.risk, cfg.llm, cfg.education
     if sl.method == "top_pct":
         method = f"Top {_fmt(sl.top_pct)}% of eligible candidates"
     elif sl.method == "threshold":
         method = f"Final score >= {_fmt(sl.threshold)}"
     else:
         method = f"Top {int(sl.top_n):,} eligible candidates"
+    excluded = list(getattr(sl, "exclude_candidates", None) or [])
     knockouts = [f"HackerRank >= {_fmt(sl.min_hackerrank_pct)}%" if sl.min_hackerrank_pct else "",
                  f"CGPA >= {_fmt(sl.min_cgpa, 2)}" if sl.min_cgpa else "",
-                 f"Graduation year in {', '.join(map(str, sl.allowed_grad_years))}" if sl.allowed_grad_years else ""]
+                 f"Graduation year in {', '.join(map(str, sl.allowed_grad_years))}" if sl.allowed_grad_years else "",
+                 "duplicate applications disqualified (one kept per person)"
+                 if getattr(sl, "auto_disqualify_duplicates", False) else "",
+                 f"{len(excluded):,} candidate(s) excluded by recruiters" if excluded else ""]
     skills_rule = (f"per skill - full marks at {sk.skills_for_full_marks} matched skills"
                    if sk.mode != "coverage" else "coverage - matched / required")
     policy = ("High risk -> Integrity Hold, slots backfilled" if sl.exclude_high_risk
               else "Flagged candidates stay on the shortlist for recruiter review")
+    missing_resume = {
+        "auto": "auto - re-normalised when no resumes were loaded, otherwise resume components score 0",
+        "zero": "resume components score 0",
+        "renormalize": "remaining components re-scaled to 100",
+    }.get(sl.missing_resume_policy, str(sl.missing_resume_policy))
+    ties = [TIE_BREAK_KEYS.get(k, (str(k), True))[0] for k in getattr(sl, "tie_break_order", None) or []]
+    tier = (f"on ({len(getattr(ed, 'tier_mapping', None) or {}):,} colleges in the approved tier list)"
+            if getattr(ed, "tier_enabled", False) else "off (tier ignored; other education weights re-normalised)")
+    cap = _float(getattr(sl, "college_cap_pct", 0.0)) or 0.0
+    provider = LLM_PROVIDERS.get(llm.provider, {}).get("label", llm.provider)
+    llm_text = (f"enabled - {provider}, model {llm.model or 'proxy default'}; writes explanations and summaries "
+                "only and never changes scores, ranks or cutoffs" if llm.enabled else "disabled")
     return [
         ("Rubric (points out of 100)",
          f"HackerRank {_fmt(w.hackerrank)} | Skills {_fmt(w.skills)} | Experience {_fmt(w.experience)} "
@@ -479,14 +918,16 @@ def _config_highlights(cfg: AppConfig) -> list[tuple[str, Any]]:
         ("Skills scoring", skills_rule),
         ("Required skills", ", ".join(sk.required_skills) or "none"),
         ("Shortlist rule", method),
+        ("Tie-break order", " > ".join(["Final score", *ties, "Candidate ID"])),
         ("Eligibility knock-outs", "; ".join(k for k in knockouts if k) or "none"),
         ("Integrity policy", f"{policy} (review levels: {', '.join(sl.review_risk_levels) or 'none'})"),
-        ("Missing-resume policy", sl.missing_resume_policy),
+        ("Missing-resume policy", missing_resume),
+        ("College tier scoring", tier),
+        ("College cap", f"at most {_fmt(cap)}% of the shortlist per college" if cap > 0 else "off"),
         ("Risk focus group", f"HackerRank >= {_fmt(rk.focus_threshold_pct)}%"),
         ("Risk thresholds", f"High >= {_fmt(rk.high_threshold)}, Medium >= {_fmt(rk.medium_threshold)}, "
                             f"link >= {_fmt(rk.edge_threshold)}"),
-        ("LLM assist", f"{'enabled' if llm.enabled else 'disabled'} - {llm.model}; blend weight "
-                       f"{_fmt(llm.blend_weight * 100)}% for +/-{llm.cutoff_band} ranks around the cutoff"),
+        ("LLM assist", llm_text),
     ]
 
 
@@ -519,8 +960,8 @@ def _executive_summary(llm_notes: Mapping[str, Any]) -> list[str]:
     return lines
 
 
-def _write_summary(book: _Book, result: PipelineResult, cfg: AppConfig,
-                   llm_notes: Mapping[str, Any]) -> None:
+def _write_summary(book: _Book, result: PipelineResult, cfg: AppConfig, llm_notes: Mapping[str, Any],
+                   candidates: pd.DataFrame) -> None:
     ws = book.wb.add_worksheet("Summary")
     ws.set_column(0, 0, 40)
     ws.set_column(1, 1, 95)
@@ -531,6 +972,11 @@ def _write_summary(book: _Book, result: PipelineResult, cfg: AppConfig,
     ws.write_string(3, 1, DISCLAIMER, book.disclaimer)
     ws.set_row(3, 96)
     row = book.key_values(ws, 5, "Key metrics", _kpis(result, cfg))
+    counts = ineligibility_counts(candidates)
+    if counts:
+        total = int((_col(candidates, S.STATUS).map(_clean) == S.STATUS_INELIGIBLE).sum())
+        row = book.key_values(ws, row, "Ineligible candidates by rule (a candidate can fail several rules)",
+                              [("Ineligible candidates (total)", total), *counts])
     row = book.key_values(ws, row, "Configuration highlights", _config_highlights(cfg))
     quality = _quality_items(result)
     if quality:
@@ -545,19 +991,34 @@ def _write_summary(book: _Book, result: PipelineResult, cfg: AppConfig,
                         [("", line) for line in summary])
 
 
-def _integrity_frame(result: PipelineResult, cfg: AppConfig, llm_candidates: Mapping[str, Any]) -> pd.DataFrame:
+def _all_candidates_frame(candidates: pd.DataFrame, ai_notes: Mapping[str, str]) -> pd.DataFrame:
+    view = candidates.copy()
+    if S.INELIGIBILITY in view.columns:
+        view[S.INELIGIBILITY] = [ineligibility_text(v) for v in view[S.INELIGIBILITY].tolist()]
+    if S.LLM_RATIONALE in view.columns and not view[S.LLM_RATIONALE].map(_clean).astype(bool).any():
+        view = view.drop(columns=[S.LLM_RATIONALE])  # legacy re-score rationale, empty since re-scoring was removed
+    if ai_notes and S.CANDIDATE_ID in view.columns:
+        view["ai_notes"] = [ai_notes.get(_clean(cid), "") for cid in view[S.CANDIDATE_ID].tolist()]
+    return view
+
+
+def _integrity_frame(result: PipelineResult, cfg: AppConfig, ai_notes: Mapping[str, str]) -> pd.DataFrame:
     c = _frame(result.candidates)
     columns = [S.CANDIDATE_ID, S.NAME, S.COLLEGE, S.STATUS, S.RANK, S.FINAL_SCORE, S.HR_PCT,
                S.RISK_LEVEL, S.RISK_SCORE, S.CLUSTER_ID, S.RISK_REASONS, "individual_flags",
-               S.N_LINKS, "linked_candidates", "link_evidence"]
-    if llm_candidates:
+               S.INJECTION_FLAGS, S.N_LINKS, "linked_candidates", "link_evidence"]
+    if ai_notes:
         columns.append("ai_notes")
     if c.empty or S.CANDIDATE_ID not in c.columns:
         return pd.DataFrame(columns=columns)
+    parsed = result.parsed_by_candidate or {}
     levels = _col(c, S.RISK_LEVEL).map(_level)
     flag_levels = {S.RISK_HIGH, S.RISK_MEDIUM} | {_level(x) for x in cfg.shortlist.review_risk_levels or []}
     flag_levels.discard(S.RISK_CLEAR)
-    mask = levels.isin(flag_levels) | _col(c, S.STATUS).map(_clean).isin([S.STATUS_REVIEW, S.STATUS_HOLD])
+    hidden_ids = {str(k) for k, p in parsed.items() if getattr(p, "injection_findings", None)}
+    hidden = _col(c, S.INJECTION_FLAGS).map(_clean).astype(bool) | c[S.CANDIDATE_ID].map(_clean).isin(hidden_ids)
+    mask = (levels.isin(flag_levels) | _col(c, S.STATUS).map(_clean).isin([S.STATUS_REVIEW, S.STATUS_HOLD])
+            | hidden)
     risk = result.risk
     pairs = _frame(risk.pairs) if risk else pd.DataFrame()
     individual = _frame(risk.individual) if risk else pd.DataFrame()
@@ -573,17 +1034,18 @@ def _integrity_frame(result: PipelineResult, cfg: AppConfig, llm_candidates: Map
         if len(links) > _MAX_LINKS:
             evidence.append(f"... and {len(links) - _MAX_LINKS} more linked candidates (see Risk Pairs)")
         item = {
-            S.CANDIDATE_ID: cid, S.NAME: rec.get(S.NAME), S.COLLEGE: rec.get(S.COLLEGE),
+            S.CANDIDATE_ID: cid, S.NAME: names.get(cid) or rec.get(S.NAME), S.COLLEGE: rec.get(S.COLLEGE),
             S.STATUS: rec.get(S.STATUS), S.RANK: rec.get(S.RANK), S.FINAL_SCORE: rec.get(S.FINAL_SCORE),
             S.HR_PCT: rec.get(S.HR_PCT), S.RISK_LEVEL: _level(rec.get(S.RISK_LEVEL)),
             S.RISK_SCORE: rec.get(S.RISK_SCORE), S.CLUSTER_ID: rec.get(S.CLUSTER_ID),
             S.RISK_REASONS: "\n".join(_split_reasons(rec.get(S.RISK_REASONS))),
             "individual_flags": "\n".join(_individual_flags(individual, cid)),
+            S.INJECTION_FLAGS: "\n".join(_injection_lines(rec, parsed)),
             S.N_LINKS: len(links), "linked_candidates": S.SEP_LIST.join(links["other"].tolist()),
             "link_evidence": "\n".join(evidence),
         }
-        if llm_candidates:
-            item["ai_notes"] = _llm_candidate_text(llm_candidates.get(cid))
+        if ai_notes:
+            item["ai_notes"] = ai_notes.get(cid, "")
         rows.append(item)
     out = pd.DataFrame(rows, columns=columns)
     if out.empty:
@@ -600,6 +1062,7 @@ def _clusters_frame(result: PipelineResult, llm_clusters: Mapping[str, Any]) -> 
     if clusters.empty or not llm_clusters or "cluster_id" not in clusters.columns:
         return clusters
     notes = [llm_clusters.get(_clean(cid)) for cid in clusters["cluster_id"]]
+    notes = [n if isinstance(n, Mapping) and n.get("ok") is not False else None for n in notes]
     get = lambda n, k: n.get(k) if isinstance(n, Mapping) else None  # noqa: E731
     clusters["ai_headline"] = [_clean(get(n, "headline")) for n in notes]
     clusters["ai_summary"] = [_clean(get(n, "summary")) for n in notes]
@@ -658,37 +1121,47 @@ def _write_data_quality(book: _Book, result: PipelineResult) -> None:
 def build_excel_report(result: PipelineResult, llm_notes: Mapping[str, Any] | None = None) -> bytes:
     """Recruiter workbook (xlsxwriter) with the sheets in ``SHEET_NAMES``.
 
-    llm_notes (optional; every key optional):
+    "Shortlist" and "All Candidates" group their columns by data source under a coloured
+    super-header row (row 1; column labels in row 2). "Ineligible Candidates" lists one row per
+    violated eligibility rule; the Summary sheet counts them by rule.
+
+    llm_notes (optional; every key optional; notes with "ok": False are skipped):
       "executive_summary": str or {"ok", "markdown"}           -> Summary sheet
       "clusters":   {cluster_id: {"headline", "summary", "recommended_actions"}} -> Risk Clusters
-      "candidates": {candidate_id: {"summary", "strengths", "gaps"}}             -> Shortlist,
-                                                                                    Integrity Evidence
+      "candidates": {candidate_id: {"summary", "strengths", "gaps"}}   -> "AI Notes (LLM)" on
+                    Shortlist, All Candidates and Integrity Evidence
+      "borderline": {candidate_id: {...same shape...}} - explanations for candidates just below the
+                    cutoff, shown in the same column prefixed "Near the cutoff:"
     """
     cfg = result.config or AppConfig()
     notes = llm_notes if isinstance(llm_notes, Mapping) else {}
-    llm_candidates = notes.get("candidates") if isinstance(notes.get("candidates"), Mapping) else {}
+    ai_notes = _candidate_notes(notes)
     llm_clusters = notes.get("clusters") if isinstance(notes.get("clusters"), Mapping) else {}
     candidates = order_columns(_frame(result.candidates))
 
     buffer = io.BytesIO()
     book = _Book(buffer)
-    _write_summary(book, result, cfg, notes)
+    _write_summary(book, result, cfg, notes, candidates)
 
     # Shortlist: shortlisted + integrity review, by rank
     listed = candidates.loc[_col(candidates, S.STATUS).map(_clean).isin(IN_SHORTLIST)]
     if S.RANK in listed.columns:
         listed = listed.sort_values(S.RANK, kind="mergesort", na_position="last")
     shortlist = listed[[c for c in _SHORTLIST_COLUMNS if c in listed.columns]].copy()
-    if llm_candidates and S.CANDIDATE_ID in shortlist.columns:
-        shortlist["ai_notes"] = [_llm_candidate_text(llm_candidates.get(_clean(cid)))
-                                 for cid in shortlist[S.CANDIDATE_ID]]
-    book.table(book.wb.add_worksheet("Shortlist"), shortlist, freeze_cols=3,
-               widths={S.STATUS_REASON: 55.0, S.RISK_REASONS: 60.0})
+    if ai_notes and S.CANDIDATE_ID in shortlist.columns:
+        shortlist["ai_notes"] = [ai_notes.get(_clean(cid), "") for cid in shortlist[S.CANDIDATE_ID].tolist()]
+    book.grouped_table(book.wb.add_worksheet("Shortlist"), shortlist, freeze_cols=3,
+                       widths={S.STATUS_REASON: 55.0, S.RISK_REASONS: 60.0, S.TIE_BREAK_NOTE: 50.0})
 
-    book.table(book.wb.add_worksheet("All Candidates"), candidates, freeze_cols=0)
-    book.table(book.wb.add_worksheet("Integrity Evidence"), _integrity_frame(result, cfg, llm_candidates),
-               freeze_cols=2, wrap=(S.RISK_REASONS, "individual_flags", "link_evidence", "ai_notes"),
-               widths={S.RISK_REASONS: 60.0, "link_evidence": 90.0, "individual_flags": 40.0})
+    book.grouped_table(book.wb.add_worksheet("All Candidates"), _all_candidates_frame(candidates, ai_notes),
+                       freeze_cols=0)
+    book.table(book.wb.add_worksheet("Ineligible Candidates"), ineligible_rows(candidates), freeze_cols=2,
+               wrap=("explanation",), widths={"explanation": 80.0, "rule": 24.0})
+    book.table(book.wb.add_worksheet("Integrity Evidence"), _integrity_frame(result, cfg, ai_notes),
+               freeze_cols=2, wrap=(S.RISK_REASONS, "individual_flags", S.INJECTION_FLAGS, "link_evidence",
+                                    "ai_notes"),
+               widths={S.RISK_REASONS: 60.0, "link_evidence": 90.0, "individual_flags": 40.0,
+                       S.INJECTION_FLAGS: 60.0})
     book.table(book.wb.add_worksheet("Risk Clusters"), _clusters_frame(result, llm_clusters), freeze_cols=1)
     book.table(book.wb.add_worksheet("Risk Pairs"), _pairs_frame(result), freeze_cols=2)
     book.table(book.wb.add_worksheet("Commonality"),
@@ -707,7 +1180,7 @@ def build_excel_report(result: PipelineResult, llm_notes: Mapping[str, Any] | No
 # ---------------------------------------------------------------------------
 def _md(value: Any) -> str:
     """Single-line markdown-safe text (escapes table pipes and emphasis characters)."""
-    text = " ".join(_clean(value).split())
+    text = _safe_text(" ".join(_clean(value).split()))
     return re.sub(r"([\\`*_\[\]<>|#])", r"\\\1", text)
 
 
@@ -719,6 +1192,26 @@ def _find_row(candidates: pd.DataFrame, candidate_id: str) -> dict[str, Any] | N
     if hit.empty:
         hit = candidates.loc[ids.str.upper() == candidate_id.upper()]
     return None if hit.empty else hit.iloc[0].to_dict()
+
+
+def _duplicate_lines(row: Mapping[str, Any], names: Mapping[str, str], cfg: AppConfig) -> list[str]:
+    """Markdown bullet texts about duplicate applications (contact details removed)."""
+    primary = _clean(row.get(S.DUPLICATE_OF))
+    others = _split_ids(row.get(S.DUPLICATE_IDS))
+    lines = []
+    if primary:
+        text = (f"This application appears to come from the same person as {_md(primary)} "
+                f"({_md(names.get(primary)) or 'name unknown'}).")
+        if getattr(cfg.shortlist, "auto_disqualify_duplicates", False):
+            text += " One application per person is kept, so this one is not ranked."
+        lines.append(text)
+    if others:
+        lines.append("The same person also applied as: "
+                     + ", ".join(f"{_md(o)} ({_md(names.get(o)) or 'name unknown'})" for o in others) + ".")
+    evidence = _redact(_clean(row.get(S.DUPLICATE_EVIDENCE)))
+    if lines and evidence:
+        lines.append(f"Evidence: {_md(evidence)}")
+    return lines
 
 
 def _link_details(link: Mapping[str, Any], cfg: AppConfig) -> tuple[list[str], list[str]]:
@@ -774,8 +1267,9 @@ def _link_details(link: Mapping[str, Any], cfg: AppConfig) -> tuple[list[str], l
 
 
 def build_evidence_pack(result: PipelineResult, candidate_id: str) -> str:
-    """Markdown evidence pack for recruiters: profile, score breakdown, risk reasons,
-    linked candidates with the shared evidence, and neutral verification steps."""
+    """Markdown evidence pack for recruiters: profile, score breakdown, duplicate applications,
+    risk reasons, hidden resume text, linked candidates with the shared evidence, and neutral
+    verification steps. Contact details (email, phone) are never included."""
     cid = _clean(candidate_id)
     candidates = _frame(result.candidates)
     row = _find_row(candidates, cid)
@@ -789,19 +1283,23 @@ def build_evidence_pack(result: PipelineResult, candidate_id: str) -> str:
     level = _level(row.get(S.RISK_LEVEL))
     eligible_n = int(_col(candidates, S.ELIGIBLE).map(_truthy).sum())
     rank = _float(row.get(S.RANK))
+    name = names.get(cid) or _display_name(row.get(S.NAME), row.get(S.JOB_APPLICATION))
 
     out = [f"# Integrity evidence pack: {_md(cid)}", "",
            f"_Generated {_now()} for internal recruiter review. Integrity flags are evidence for "
            f"human review, not findings of misconduct._", "",
            "## Candidate", "", "| Field | Value |", "|---|---|",
            f"| Candidate ID | {_md(cid)} |",
-           f"| Name | {_md(row.get(S.NAME)) or '-'} |",
+           f"| Name | {_md(name) or '-'} |",
            f"| College | {_md(row.get(S.COLLEGE)) or '-'} |",
            f"| Status | {_md(row.get(S.STATUS)) or '-'} |",
            f"| Rank | {f'{int(rank):,} of {eligible_n:,} eligible' if rank else '-'} |",
            f"| Status reason | {_md(row.get(S.STATUS_REASON)) or '-'} |", "",
            "## Score breakdown", ""]
     out += [f"- {_md(line)}" for line in explain_score(row, cfg)]
+    duplicates = _duplicate_lines(row, names, cfg)
+    if duplicates:
+        out += ["", "## Duplicate applications", ""] + [f"- {line}" for line in duplicates]
 
     out += ["", f"## Integrity assessment: {level} risk", ""]
     risk_score = _float(row.get(S.RISK_SCORE))
@@ -812,7 +1310,8 @@ def build_evidence_pack(result: PipelineResult, candidate_id: str) -> str:
         out += [f"**{level}** ({', '.join(f for f in facts if f)})", ""]
     reasons = _split_reasons(row.get(S.RISK_REASONS))
     flags = _individual_flags(_frame(risk.individual if risk else None), cid)
-    if level == S.RISK_CLEAR and not reasons and not flags:
+    hidden = _injection_lines(row, result.parsed_by_candidate)
+    if level == S.RISK_CLEAR and not reasons and not flags and not hidden:
         out += ["No integrity flags were raised for this candidate. No verification beyond the "
                 "standard process is suggested.", ""]
         return "\n".join(out)
@@ -820,6 +1319,9 @@ def build_evidence_pack(result: PipelineResult, candidate_id: str) -> str:
         out += ["Reasons (strongest first):", ""] + [f"- {_md(r)}" for r in reasons] + [""]
     if flags:
         out += ["Individual signals:", ""] + [f"- {_md(f)}" for f in flags] + [""]
+    if hidden:
+        out += ["Hidden text found in the resume file (not visible to a reader; excluded from scoring):", ""]
+        out += [f"- {_md(h)}" for h in hidden] + [""]
     session = [f"started {_md(row.get(S.TEST_START))}" if _clean(row.get(S.TEST_START)) else "",
                f"submitted {_md(row.get(S.SUBMISSION_TIME))}" if _clean(row.get(S.SUBMISSION_TIME)) else "",
                f"{_fmt(_float(row.get(S.COMPLETION_MIN)))} min" if _float(row.get(S.COMPLETION_MIN)) is not None else "",
@@ -828,7 +1330,7 @@ def build_evidence_pack(result: PipelineResult, candidate_id: str) -> str:
         out += [f"Assessment session: {', '.join(s for s in session if s)}.", ""]
 
     links = _links_for(_frame(risk.pairs if risk else None), cid)
-    themes: list[str] = []
+    themes: list[str] = ["text hidden from human readers in the resume"] if hidden else []
     if not links.empty:
         shown = links.head(_MAX_LINKS)
         out += ["## Linked candidates", "", "| Candidate | Name | College | Pair score | Signals |",
@@ -875,6 +1377,10 @@ def build_evidence_pack(result: PipelineResult, candidate_id: str) -> str:
         "Proctored re-assessment with identity verification (photo ID, camera on) if the pattern is "
         "not explained by the steps above.",
     ]
+    if hidden:
+        steps.insert(0, "Open the original resume file and review the hidden text listed above, then ask the "
+                        "candidate to confirm the resume's content and how it was prepared (templates and "
+                        "online resume tools can add hidden text).")
     if any(t in unique for t in ("a shared test location or network", "synchronised test sessions",
                                  "one person taking both sessions")):
         steps.append("Check with the placement cell whether the linked candidates were in the same lab or "

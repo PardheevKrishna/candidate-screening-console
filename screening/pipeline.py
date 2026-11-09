@@ -1,13 +1,14 @@
-"""Pipeline orchestration: ingest -> parse -> match -> score -> risk -> shortlist.
+"""Pipeline orchestration: ingest -> parse -> match -> duplicates -> score -> risk -> shortlist.
 
 Split in two so the UI stays fast:
 
-* prepare_data()  - heavy, config-light (file parsing, matching). Run once per upload.
+* prepare_data()  - heavy, config-light (file parsing, matching, duplicate applications).
+                    Run once per upload.
 * evaluate()      - fast, config-heavy (scoring, risk, shortlist). Re-run on every
                     rubric / threshold change, reusing the prepared data.
 
-LLM re-scoring only touches candidates near the shortlist cutoff and is blended
-50/50 (configurable) with the rule-based experience score.
+Scores, ranks and cutoffs are rule-based only. LLM features (rationales, questions and
+summaries) write text next to the results and never feed back into them.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from . import ingest, matching, resume_parser, risk, scoring
+from . import duplicates, ingest, matching, resume_parser, risk, scoring
 from . import schema as S
 from .config import AppConfig
 from .models import DataQualityReport, ParsedResume, PipelineResult, ResumeDoc, RiskResult
@@ -28,8 +29,13 @@ ProgressCB = Callable[[str, int, int, str], None]
 
 RISK_MERGE_COLUMNS = [
     S.IS_FOCUS, S.RISK_SCORE, S.RISK_LEVEL, S.RISK_REASONS, S.CLUSTER_ID,
-    S.N_LINKS, S.MAX_PAIR_SCORE, S.INDIVIDUAL_SCORE,
+    S.N_LINKS, S.MAX_PAIR_SCORE, S.INDIVIDUAL_SCORE, S.INJECTION_FLAGS,
 ]
+_RISK_DEFAULTS: dict[str, Any] = {
+    S.IS_FOCUS: False, S.RISK_SCORE: 0.0, S.RISK_LEVEL: S.RISK_CLEAR, S.RISK_REASONS: "",
+    S.CLUSTER_ID: "", S.N_LINKS: 0, S.MAX_PAIR_SCORE: 0.0, S.INDIVIDUAL_SCORE: 0.0,
+    S.INJECTION_FLAGS: "",
+}
 
 
 @dataclass
@@ -40,9 +46,9 @@ class PreparedData:
     quality: DataQualityReport
     parsed: dict[str, ParsedResume]                 # file_hash -> ParsedResume
     matches: pd.DataFrame
-    base: pd.DataFrame                              # one row per candidate (TA + linkage columns)
+    base: pd.DataFrame                              # one row per candidate (TA + linkage + duplicate columns)
     parsed_by_candidate: dict[str, ParsedResume]    # candidate_id -> ParsedResume
-    mode: str = "ta+resumes"
+    mode: str = "ta+resumes"                        # "ta+resumes" | "ta_only" | "resumes_only"
     timings: dict[str, float] = field(default_factory=dict)
 
 
@@ -73,7 +79,10 @@ def prepare_data(
 
     # 2. Resumes ------------------------------------------------------------
     t = time.perf_counter()
-    docs, issues = resume_parser.expand_uploads(resume_docs, cfg.processing)
+    def expand_cb(done: int, total: int, detail: str) -> None:
+        cb("Reading resume files", done, total, detail)
+
+    docs, issues = resume_parser.expand_uploads(resume_docs, cfg.processing, progress_cb=expand_cb)
     quality.extend(issues)
 
     def parse_cb(done: int, total: int, name: str) -> None:
@@ -101,6 +110,18 @@ def prepare_data(
     cb("Matching resumes", 1, 1, f"{len(parsed_by_candidate):,} linked")
     timings["match"] = time.perf_counter() - t
 
+    # 4. Duplicate applications (same person, several candidate IDs) --------
+    t = time.perf_counter()
+    cb("Checking duplicate applications", 0, 1, "")
+    try:
+        base, dup_issues = duplicates.detect_duplicates(base, parsed_by_candidate)
+        quality.extend(dup_issues)
+    except Exception as exc:  # noqa: BLE001 - a detection failure must not stop the run
+        quality.add("warning", duplicates.STAGE,
+                    f"Duplicate-application check failed ({type(exc).__name__}); duplicates were not marked.")
+    cb("Checking duplicate applications", 1, 1, "")
+    timings["duplicates"] = time.perf_counter() - t
+
     if ta_df is None:
         mode = "resumes_only"
     elif not parsed:
@@ -113,23 +134,13 @@ def prepare_data(
 def _merge_risk(scored: pd.DataFrame, risk_res: RiskResult) -> pd.DataFrame:
     out = scored.drop(columns=[c for c in RISK_MERGE_COLUMNS if c in scored.columns])
     cr = risk_res.candidate_risk
-    if cr is None or cr.empty:
-        out[S.IS_FOCUS] = False
-        out[S.RISK_SCORE] = 0.0
-        out[S.RISK_LEVEL] = S.RISK_CLEAR
-        out[S.RISK_REASONS] = ""
-        out[S.CLUSTER_ID] = ""
-        out[S.N_LINKS] = 0
-        out[S.MAX_PAIR_SCORE] = 0.0
-        out[S.INDIVIDUAL_SCORE] = 0.0
+    if cr is None or cr.empty or S.CANDIDATE_ID not in cr.columns or S.CANDIDATE_ID not in out.columns:
+        for col, default in _RISK_DEFAULTS.items():
+            out[col] = default
         return out
     keep = [S.CANDIDATE_ID] + [c for c in RISK_MERGE_COLUMNS if c in cr.columns]
     out = out.merge(cr[keep], on=S.CANDIDATE_ID, how="left")
-    defaults: dict[str, Any] = {
-        S.IS_FOCUS: False, S.RISK_SCORE: 0.0, S.RISK_LEVEL: S.RISK_CLEAR, S.RISK_REASONS: "",
-        S.CLUSTER_ID: "", S.N_LINKS: 0, S.MAX_PAIR_SCORE: 0.0, S.INDIVIDUAL_SCORE: 0.0,
-    }
-    for col, default in defaults.items():
+    for col, default in _RISK_DEFAULTS.items():
         if col not in out.columns:
             out[col] = default
         else:
@@ -141,21 +152,20 @@ def _merge_risk(scored: pd.DataFrame, risk_res: RiskResult) -> pd.DataFrame:
 def evaluate(
     prepared: PreparedData,
     cfg: AppConfig,
-    llm_results: dict[str, dict[str, Any]] | None = None,
     *,
     risk_result: RiskResult | None = None,
 ) -> PipelineResult:
     """Score, run risk analysis, shortlist. Fast enough to re-run on every config change.
 
-    llm_results: candidate_id -> {"ok": bool, "score": 0..1, ...} from llm re-scoring.
-    Only candidates inside the *rule-based* cutoff band get the LLM blend, so the
-    result is deterministic for a given config + LLM cache.
-    Pass risk_result to reuse an existing analysis when only rubric weights changed.
+    Deterministic for given prepared data + config (no LLM input). The run mode
+    (``prepared.mode``) decides the "auto" missing-resume policy. Pass ``risk_result`` to reuse
+    an existing analysis when only rubric weights changed.
     """
     timings = dict(prepared.timings)
+    mode = getattr(prepared, "mode", "ta+resumes")
 
     t = time.perf_counter()
-    scored = scoring.score_candidates(prepared.base, prepared.parsed_by_candidate, cfg, None)
+    scored = scoring.score_candidates(prepared.base, prepared.parsed_by_candidate, cfg, mode=mode)
     timings["score"] = time.perf_counter() - t
 
     t = time.perf_counter()
@@ -165,20 +175,6 @@ def evaluate(
 
     t = time.perf_counter()
     ranked = scoring.apply_shortlist(_merge_risk(scored, risk_res), cfg)
-
-    applied: dict[str, dict[str, Any]] = {}
-    if llm_results and cfg.llm.enabled:
-        band = set(scoring.cutoff_band_ids(ranked, cfg))
-        # Pass the full result dicts (score + rationale) so LLM_RATIONALE reaches the table.
-        llm_exp = {
-            cid: r
-            for cid, r in llm_results.items()
-            if cid in band and r.get("ok") and r.get("score") is not None
-        }
-        if llm_exp:
-            rescored = scoring.score_candidates(prepared.base, prepared.parsed_by_candidate, cfg, llm_exp)
-            ranked = scoring.apply_shortlist(_merge_risk(rescored, risk_res), cfg)
-            applied = {cid: llm_results[cid] for cid in llm_exp}
     timings["shortlist"] = time.perf_counter() - t
 
     return PipelineResult(
@@ -189,34 +185,9 @@ def evaluate(
         risk=risk_res,
         quality=prepared.quality,
         config=cfg,
-        llm_results=applied,
         timings=timings,
-        mode=prepared.mode,
+        mode=mode,
     )
-
-
-def run_llm_rescore(
-    prepared: PreparedData,
-    cfg: AppConfig,
-    client: Any,
-    *,
-    progress_cb: ProgressCB | None = None,
-) -> dict[str, dict[str, Any]]:
-    """LLM double-check of the experience score for candidates near the cutoff.
-
-    Returns candidate_id -> result dict; feed it back into evaluate().
-    """
-    from . import llm  # local import: optional dependency path
-
-    rules_only = evaluate(prepared, cfg, None)
-    band_ids = scoring.cutoff_band_ids(rules_only.candidates, cfg)
-    cb = progress_cb or _noop
-
-    def llm_cb(done: int, total: int, detail: str) -> None:
-        cb("LLM re-scoring (near cutoff)", done, total, detail)
-
-    return llm.rescore_candidates(band_ids, rules_only.candidates, prepared.parsed_by_candidate,
-                                  cfg, client, progress_cb=llm_cb)
 
 
 def run_pipeline(
@@ -225,37 +196,62 @@ def run_pipeline(
     cfg: AppConfig | None = None,
     *,
     mapping_override: dict[str, str] | None = None,
-    llm_client: Any = None,
     progress_cb: ProgressCB | None = None,
 ) -> PipelineResult:
-    """One-shot convenience used by tests and scripts."""
+    """One-shot convenience used by tests and scripts (prepare_data + evaluate, no LLM)."""
     cfg = cfg or AppConfig()
     prepared = prepare_data(ta_file, resume_docs, cfg, mapping_override=mapping_override,
                             progress_cb=progress_cb)
-    llm_results = None
-    if llm_client is not None and cfg.llm.enabled and cfg.llm.rescore_near_cutoff:
-        llm_results = run_llm_rescore(prepared, cfg, llm_client, progress_cb=progress_cb)
-    return evaluate(prepared, cfg, llm_results)
+    return evaluate(prepared, cfg)
 
 
 # ---------------------------------------------------------------------------
 # Sample data
 # ---------------------------------------------------------------------------
 DEFAULT_SAMPLE_DIR = Path(__file__).resolve().parent.parent / "data" / "sample"
+SAMPLE_TA_FILE = "test_scores_export.xlsx"   # Workday assessment export (2 sheets)
+SAMPLE_RESUME_ZIP = "Resume.zip"             # "Resume/" folder of multi-candidate PDF packets
+SAMPLE_JD_FILE = "job_description.txt"
+LEGACY_TA_FILE = "ta_feed.csv"               # older synthetic layout
+LEGACY_RESUME_DIR = "resumes"
+
+
+def _sample_ta_path(base: Path) -> Path | None:
+    for name in (SAMPLE_TA_FILE, LEGACY_TA_FILE):
+        if (base / name).is_file():
+            return base / name
+    return None
+
+
+def sample_dataset_available(sample_dir: str | Path | None = None) -> bool:
+    """True when the sample folder holds a TA export and/or resumes that load_sample_dataset reads."""
+    base = Path(sample_dir) if sample_dir else DEFAULT_SAMPLE_DIR
+    return (_sample_ta_path(base) is not None or (base / SAMPLE_RESUME_ZIP).is_file()
+            or (base / LEGACY_RESUME_DIR).is_dir())
 
 
 def load_sample_dataset(
     sample_dir: str | Path | None = None,
 ) -> tuple[tuple[str, bytes] | None, list[ResumeDoc], str | None]:
-    """Load the synthetic dataset written by generate_mock_data.py.
+    """Load the synthetic Workday-style dataset written by generate_mock_data.py.
+
+    * TA file: ``test_scores_export.xlsx`` (falls back to an older ``ta_feed.csv``)
+    * resumes: ``Resume.zip`` as one upload (expanded and split by resume_parser); without it,
+      the files of an older ``resumes/`` folder
+    * job description: ``job_description.txt``
 
     Returns (ta_file, resume_docs, job_description_text). Missing pieces are None/[].
     """
     base = Path(sample_dir) if sample_dir else DEFAULT_SAMPLE_DIR
-    ta_path = base / "ta_feed.csv"
-    ta_file = (ta_path.name, ta_path.read_bytes()) if ta_path.exists() else None
-    resume_dir = base / "resumes"
-    docs = resume_parser.load_resume_folder(resume_dir) if resume_dir.exists() else []
-    jd_path = base / "job_description.txt"
-    jd = jd_path.read_text(encoding="utf-8") if jd_path.exists() else None
+    ta_path = _sample_ta_path(base)
+    ta_file = (ta_path.name, ta_path.read_bytes()) if ta_path is not None else None
+    zip_path = base / SAMPLE_RESUME_ZIP
+    if zip_path.is_file():
+        docs = [ResumeDoc(SAMPLE_RESUME_ZIP, zip_path.read_bytes(), source="folder")]
+    elif (base / LEGACY_RESUME_DIR).is_dir():
+        docs = resume_parser.load_resume_folder(base / LEGACY_RESUME_DIR)
+    else:
+        docs = []
+    jd_path = base / SAMPLE_JD_FILE
+    jd = jd_path.read_text(encoding="utf-8") if jd_path.is_file() else None
     return ta_file, docs, jd

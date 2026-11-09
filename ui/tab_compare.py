@@ -1,6 +1,7 @@
 """Compare Candidates tab - two to four candidates side by side.
 
-Header cards, a metric-by-metric table with the best value of each numeric row highlighted,
+Header cards, a metric-by-metric table grouped by data source (outcome, then "HackerRank:",
+"Resume:", "Academic:" and "Integrity:" rows) with the best value of each numeric row highlighted,
 the required-skills matrix (implied skills count as matched, exactly as in scoring), an
 overlaid sub-score radar, resume highlights and a CSV export of the comparison. The selection
 lives in ``state.K_COMPARE_IDS`` so the Individual Deep-Dive "Add to compare" button feeds it.
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -18,14 +20,16 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from screening import export
 from screening import schema as S
 from screening import skills as skill_taxonomy
 from screening.config import AppConfig
 from screening.models import ParsedResume, PipelineResult
 from ui import charts, state, theme
 from ui.charts import SHORTLIST_STATUSES, SUB_LABELS, split_list, txt
-from ui.tab_deepdive import COMPARE_MAX, MATCH_LABELS, candidate_options, clean_compare_ids
-from ui.tab_shortlist import csv_bytes
+from ui.tab_deepdive import (COMPARE_MAX, MATCH_LABELS, candidate_options, cgpa_value, clean_compare_ids,
+                              ineligibility_lines)
+from ui.tab_shortlist import csv_bytes, ineligible_table
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +50,12 @@ RADAR_SYMBOLS = ("circle", "square", "diamond", "triangle-up")
 _FONT = "Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
 
 Cell = tuple[Any, str, float]  # (value for the CSV, text shown in the table, number compared for "best")
+# Row groups in display order: outcome rows (no prefix), then one group per data source.
+SOURCE_ORDER = ("", S.SRC_ASSESSMENT, S.SRC_RESUME, S.SRC_ACADEMIC, S.SRC_INTEGRITY)
+SOURCE_PREFIX: dict[str, str] = {**{S.SRC_ASSESSMENT: "HackerRank", S.SRC_RESUME: "Resume",
+                                    S.SRC_ACADEMIC: "Academic", S.SRC_INTEGRITY: "Integrity"},
+                                 **dict(getattr(export, "SOURCE_PREFIX", None) or {})}
+_MORE_RE = re.compile(r"^\+(\d+) more$")
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +169,13 @@ class Metric:
     sources: tuple[str, ...]              # the row is shown when any of these columns exists
     cell: Callable[[pd.Series], Cell]
     better: str | None = None             # "high" / "low": highlight the best value; None: not ranked
+    group: str = ""                       # data source (schema.SRC_*); "" = candidate & outcome
+
+
+def source_label(group: str, label: str) -> str:
+    """'Resume: Skills pts' - the data source as a prefix ('' group: the label unchanged)."""
+    prefix = SOURCE_PREFIX.get(group, group)
+    return f"{prefix}: {label}" if prefix else label
 
 
 @dataclass(frozen=True)
@@ -173,21 +190,22 @@ def _csv_value(value: float) -> float | int:
 
 
 def _numeric(label: str, sources: tuple[str, ...], digits: int, better: str | None = None, *,
-             prefix: str = "", suffix: str = "", compact: bool = False) -> Metric:
+             prefix: str = "", suffix: str = "", compact: bool = False, group: str = "") -> Metric:
     def cell(row: pd.Series) -> Cell:
         value = _number(row, *sources)
         if math.isnan(value):
             return math.nan, "-", math.nan
         shown = _compact(value, digits) if compact else f"{value:.{digits}f}"
         return _csv_value(value), f"{prefix}{shown}{suffix}", round(value, digits)
-    return Metric(label, sources, cell, better)
+    return Metric(source_label(group, label), sources, cell, better, group)
 
 
-def _textual(label: str, sources: tuple[str, ...], show: Callable[[str], str] | None = None) -> Metric:
+def _textual(label: str, sources: tuple[str, ...], show: Callable[[str], str] | None = None, *,
+             group: str = "") -> Metric:
     def cell(row: pd.Series) -> Cell:
         value = _text(row, *sources)
         return value, (show(value) if show is not None and value else value) or "-", math.nan
-    return Metric(label, sources, cell)
+    return Metric(source_label(group, label), sources, cell, None, group)
 
 
 def _skills_cell(required_total: int) -> Callable[[pd.Series], Cell]:
@@ -228,30 +246,70 @@ def _tier(value: str) -> str:
     return f"Tier {value}" if value.isdigit() else value
 
 
+def _cgpa_cell(row: pd.Series) -> Cell:
+    value, from_resume = cgpa_value(row)
+    if math.isnan(value):
+        return math.nan, "-", math.nan
+    return _csv_value(value), f"{value:.2f}" + (" (from resume)" if from_resume else ""), round(value, 2)
+
+
+def _ineligibility_cell(row: pd.Series) -> Cell:
+    """Rules the candidate failed ('-' when eligible); the CSV keeps 'Rule: explanation' text."""
+    rules = [r for r in dict.fromkeys(txt(ineligible_table(pd.DataFrame([row.to_dict()])), "rule")) if r]
+    if not rules:
+        return "", "-", math.nan
+    return S.SEP_NOTES.join(ineligibility_lines(row)), ", ".join(rules), math.nan
+
+
+def _injection_count(parts: list[str]) -> int:
+    count = 0
+    for part in parts:
+        more = _MORE_RE.match(part)
+        count += int(more.group(1)) if more else 1
+    return count
+
+
+def _injection_cell(row: pd.Series) -> Cell:
+    """Hidden / adversarial resume text: number of findings ('None' when the resume is clean)."""
+    parts = split_list(_raw(row, S.INJECTION_FLAGS), S.SEP_REASONS)
+    if not parts:
+        return "", "None", math.nan
+    n = _injection_count(parts)
+    return S.SEP_REASONS.join(parts), f"{n} finding{'s' if n != 1 else ''}", math.nan
+
+
 def metric_rows(required_total: int = 0) -> list[Metric]:
-    """Every row the comparison table can show, in display order."""
-    points = [(S.PTS_HR, "HackerRank pts"), (S.PTS_SKILLS, "Skills pts"), (S.PTS_EXPERIENCE, "Experience pts"),
-              (S.PTS_EDUCATION, "Education pts")]
+    """Every row the comparison table can show, in display order: candidate & outcome rows, then
+    one group per data source (Assessment, Resume, Academic, Integrity) with prefixed labels."""
+    a, r, c, i = S.SRC_ASSESSMENT, S.SRC_RESUME, S.SRC_ACADEMIC, S.SRC_INTEGRITY
     return [
         _numeric("Rank", (S.RANK,), 0, "low", prefix="#"),
         _textual("Status", (S.STATUS,)),
         _numeric("Final score", (S.FINAL_SCORE,), 1, "high"),
-        _numeric("HackerRank %", (S.HR_PCT,), 1, "high", suffix="%", compact=True),
-        *[_numeric(label, (column,), 1, "high") for column, label in points],
-        Metric("Required skills matched", (S.N_MATCHED_SKILLS, S.MATCHED_SKILLS, S.MISSING_SKILLS),
-               _skills_cell(required_total), "high"),
-        _numeric("Internships", (S.INTERNSHIP_COUNT,), 0, "high"),
-        _numeric("Experience months", (S.EXPERIENCE_MONTHS,), 1, "high", compact=True),
-        _numeric("Projects", (S.PROJECT_COUNT,), 0, "high"),
-        Metric("Certifications", (S.CERT_COUNT, S.CERTIFICATIONS), _cert_cell, "high"),
-        _textual("Degree", (S.DEGREE, S.RESUME_DEGREE)),
-        _textual("Branch", (S.BRANCH,)),
-        _numeric("CGPA", (S.CGPA, S.RESUME_CGPA), 2, "high"),
-        _textual("College tier", (S.COLLEGE_TIER,), _tier),
-        Metric("Risk level", (S.RISK_LEVEL,), _risk_level_cell),
-        _numeric("Risk score", (S.RISK_SCORE,), 0, "low"),
-        _textual("Cluster", (S.CLUSTER_ID,)),
-        Metric("Resume match method", (S.MATCH_METHOD, S.HAS_RESUME), _match_cell),
+        Metric("Ineligibility", (S.INELIGIBILITY,), _ineligibility_cell),
+        _textual("Tie-break note", (S.TIE_BREAK_NOTE,)),
+        _numeric("Percentage", (S.HR_PCT,), 1, "high", suffix="%", compact=True, group=a),
+        _numeric("Rubric pts", (S.PTS_HR,), 1, "high", group=a),
+        _numeric("Skills pts", (S.PTS_SKILLS,), 1, "high", group=r),
+        _numeric("Experience pts", (S.PTS_EXPERIENCE,), 1, "high", group=r),
+        Metric(source_label(r, "Required skills matched"), (S.N_MATCHED_SKILLS, S.MATCHED_SKILLS, S.MISSING_SKILLS),
+               _skills_cell(required_total), "high", r),
+        _numeric("Internships", (S.INTERNSHIP_COUNT,), 0, "high", group=r),
+        _numeric("Experience months", (S.EXPERIENCE_MONTHS,), 1, "high", compact=True, group=r),
+        _numeric("Projects", (S.PROJECT_COUNT,), 0, "high", group=r),
+        Metric(source_label(r, "Certifications"), (S.CERT_COUNT, S.CERTIFICATIONS), _cert_cell, "high", r),
+        Metric(source_label(r, "Match method"), (S.MATCH_METHOD, S.HAS_RESUME), _match_cell, None, r),
+        _numeric("Education pts", (S.PTS_EDUCATION,), 1, "high", group=c),
+        _textual("Degree", (S.DEGREE, S.RESUME_DEGREE), group=c),
+        _textual("Branch", (S.BRANCH,), group=c),
+        Metric(source_label(c, "CGPA"), (S.CGPA, S.RESUME_CGPA), _cgpa_cell, "high", c),
+        _textual("College tier", (S.COLLEGE_TIER,), _tier, group=c),
+        Metric(source_label(i, "Risk level"), (S.RISK_LEVEL,), _risk_level_cell, None, i),
+        _numeric("Risk score", (S.RISK_SCORE,), 0, "low", group=i),
+        _textual("Cluster", (S.CLUSTER_ID,), group=i),
+        _textual("Duplicate of", (S.DUPLICATE_OF,), group=i),
+        _textual("Merged duplicates", (S.DUPLICATE_IDS,), group=i),
+        Metric(source_label(i, "Hidden-text flags"), (S.INJECTION_FLAGS,), _injection_cell, None, i),
     ]
 
 
@@ -468,8 +526,9 @@ def _table(comparison: Comparison, export_frame: pd.DataFrame) -> None:
         st.dataframe(styled, hide_index=True, width="stretch", height=42 + 35 * len(comparison.display),
                      column_config={METRIC: st.column_config.TextColumn(METRIC, pinned=True)})
     note, download = st.columns([2, 1], vertical_alignment="center")
-    note.caption("Highlighted cells mark the best value in each numeric row, compared as shown "
-                 "(lower is better for rank and risk score).")
+    note.caption("Rows are grouped by data source: outcome, then HackerRank (assessment), Resume (self-reported), "
+                 "Academic and Integrity. Highlighted cells mark the best value in each numeric row, compared as "
+                 "shown (lower is better for rank and risk score).")
     download.download_button("Download comparison (CSV)", data=partial(csv_bytes, export_frame),
                              file_name="candidate_comparison.csv", mime="text/csv", on_click="ignore",
                              icon=":material/download:", key="cmp_dl_csv", width="stretch")
@@ -523,6 +582,8 @@ def _candidate_details(row: pd.Series, parsed: ParsedResume | None) -> None:
         else:
             st.caption("No internships detected.")
     st.markdown("**Integrity signals**")
+    if split_list(_raw(row, S.INJECTION_FLAGS), S.SEP_REASONS):
+        st.warning(charts.INJECTION_LABEL, icon=":material/gpp_bad:")
     reasons = split_list(_raw(row, S.RISK_REASONS), S.SEP_REASONS)
     if reasons:
         st.markdown("\n".join(f"- {theme.md_escape(r)}" for r in reasons))

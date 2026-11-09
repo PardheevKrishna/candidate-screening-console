@@ -4,21 +4,29 @@ Each run is one folder ``<base_dir>/<run_id>/`` (run_id ``YYYYMMDD-HHMMSS-<6 hex
 
     meta.json              label, created_at (ISO 8601), dataset label, mode, counts, app version,
                            config, timings and a manifest of the stored tables
-    candidates.parquet     PipelineResult.candidates
+    candidates.parquet     PipelineResult.candidates (every column, e.g. ineligibility, tie-break
+                           notes, CGPA / tier sources, duplicate links, hidden-text flags)
     base.parquet           PreparedData.base
     ta.parquet             PreparedData.ta_df (absent for resume-only runs)
     matches.parquet        PreparedData.matches
     risk_<name>.parquet    RiskResult tables (candidate_risk, pairs, clusters, commonality, individual)
     risk_meta.json         RiskResult focus_ids, params and warnings
     quality.json           DataQualityReport fields
-    parsed.json.gz         every ParsedResume keyed by file_hash, plus the candidate -> resume links
-    llm.json               the session's LLM outputs (re-scores, rationales, summaries) and the
-                           re-scores applied to the result
+    parsed.json.gz         every ParsedResume keyed by file_hash (incl. injection findings and the
+                           packet a resume was split from), plus the candidate -> resume links
+    llm.json               every LLM output of the session: executive summary, candidate
+                           explanations (incl. borderline ones) and risk-group summaries. The LLM
+                           only writes text; it never changed a saved score, rank or cutoff.
+
+The prepared-data part (ta / base / matches tables, quality.json, parsed.json.gz) is written by
+write_prepared() and read by read_prepared(), which snapshots.py reuses for its fast-reload cache.
 
 Only JSON, Parquet and gzipped JSON are written - never pickle - so opening a saved run cannot
-execute code. A run is written into a temporary sibling folder and moved into place with a single
-rename, so other readers never see a half-written run. Run ids are validated against a strict
-pattern and resolved inside ``base_dir`` only.
+execute code. Text that UTF-8 cannot encode (lone UTF-16 surrogates left by PDF text extraction)
+is repaired on the way out: split surrogate pairs are re-joined and lone surrogates become U+FFFD.
+A run is written into a temporary sibling folder and moved into place with a single rename, so
+other readers never see a half-written run. Run ids are validated against a strict pattern and
+resolved inside ``base_dir`` only.
 
 Saved runs hold candidate personal data (names, contact details, resume text and integrity
 evidence), so the organisation's data-retention policy applies to the runs folder.
@@ -38,8 +46,8 @@ import shutil
 import stat
 import sys
 import time
-from collections.abc import Callable
-from dataclasses import asdict, fields, is_dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import MISSING, asdict, fields, is_dataclass
 from datetime import date, datetime, time as dtime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -68,9 +76,19 @@ IN_SHORTLIST = (S.STATUS_SHORTLISTED, S.STATUS_REVIEW)
 COUNT_KEYS = ["candidates", "shortlisted", "in_review", "high", "medium", "perfect_scorers", "clusters"]
 LIST_COLUMNS = ["run_id", "label", "created_at", "dataset", "mode", *COUNT_KEYS, "size_mb"]
 RISK_FRAMES = ("candidate_risk", "pairs", "clusters", "commonality", "individual")
+PREPARED_FRAMES = ("base", "matches", "ta")
 DIFF_COLUMNS = [S.CANDIDATE_ID, S.NAME, S.COLLEGE, "rank_before", "rank_after", "rank_change", "status_before",
                 "status_after", "score_before", "score_after", "reason_after", "shortlisted_before",
                 "shortlisted_after"]
+
+# LLM outputs kept with a run (llm.json "state"). Stores map an id to the LLM's output dict:
+#   "explain":    candidate_id -> explanation {"ok", "summary", "strengths", "gaps", ...}
+#   "borderline": candidate_id -> explanation of a candidate just below the shortlist cutoff
+#   "clusters":   cluster_id   -> risk-group summary {"ok", "headline", "summary", ...}
+# "executive" is the executive summary {"ok", "markdown", ...} or None. Other keys are kept as given.
+LLM_TEXT_STORES = ("explain", "borderline", "clusters")
+LLM_STATE_KEYS = ("executive", *LLM_TEXT_STORES)
+_LEGACY_LLM_KEYS = frozenset({"rescore"})  # LLM re-scoring was removed: never saved or restored
 
 _REQUIRED_FILES = ("meta.json", "candidates.parquet", "base.parquet", "risk_meta.json", "quality.json",
                    "parsed.json.gz")
@@ -81,8 +99,12 @@ _PARQUET_KEY = b"screening.runs"
 _TAG = "$t"
 _ARROW_ERRORS = (pa.ArrowException, TypeError, ValueError)
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
 _PARSED_FIELDS = frozenset(f.name for f in fields(ParsedResume))
+_PARSED_CONTAINERS = {f.name: f.default_factory for f in fields(ParsedResume) if f.default_factory is not MISSING}
 _QUALITY_FIELDS = frozenset(f.name for f in fields(DataQualityReport))
+# Saved configs are data: these snapshot settings always come from the running app.
+_LOCAL_SNAPSHOT_FIELDS = frozenset({"cache_dir"})
 
 
 class RunStoreError(Exception):
@@ -94,9 +116,28 @@ class RunStoreError(Exception):
 # ---------------------------------------------------------------------------
 def clean_label(label: object, default: str = DEFAULT_LABEL) -> str:
     """Single-line label without control characters, at most MAX_LABEL_LEN characters."""
-    text = _CONTROL_CHARS.sub(" ", "" if label is None else str(label))
+    text = _CONTROL_CHARS.sub(" ", "" if label is None else fix_surrogates(str(label)))
     text = re.sub(r"\s+", " ", text).strip()[:MAX_LABEL_LEN].rstrip()
     return text or default
+
+
+def fix_surrogates(text: Any) -> Any:
+    """``text`` with only characters UTF-8 can encode (other values are returned unchanged).
+
+    PDF text extraction can leave lone UTF-16 surrogates (e.g. a broken ToUnicode map): UTF-8 -
+    and therefore JSON files, Parquet and pandas string columns - cannot hold them. Split
+    surrogate pairs are re-joined into the character they encode; lone surrogates become U+FFFD.
+    """
+    if not isinstance(text, str) or not _SURROGATE_RE.search(text):
+        return text
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+
+
+def _utf8(text: str) -> bytes:
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        return fix_surrogates(text).encode("utf-8")
 
 
 def _os_reason(exc: OSError) -> str:
@@ -116,6 +157,11 @@ def _retry(fn: Callable[..., Any], *args: Any, attempts: int = 5, delay: float =
     return None  # pragma: no cover - loop always returns or raises
 
 
+def move_path(src: str | Path, dst: str | Path) -> None:
+    """os.replace with brief retries while another program holds a file open (Windows)."""
+    _retry(os.replace, src, dst)
+
+
 def _make_writable(func: Callable[..., Any], path: str, *_exc: Any) -> None:
     """rmtree error handler: clear the read-only bit and retry once."""
     try:
@@ -125,8 +171,9 @@ def _make_writable(func: Callable[..., Any], path: str, *_exc: Any) -> None:
         pass
 
 
-def _remove_tree(path: Path) -> None:
+def remove_tree(path: str | Path) -> None:
     """Best-effort recursive delete (never raises)."""
+    path = Path(path)
     try:
         if not path.exists():
             return
@@ -135,11 +182,34 @@ def _remove_tree(path: Path) -> None:
         else:  # pragma: no cover - exercised on Python 3.11 only
             shutil.rmtree(path, onerror=_make_writable)
     except OSError as exc:
-        log.warning("Could not remove a runs work folder (%s)", _os_reason(exc))
+        log.warning("Could not remove a work folder (%s)", _os_reason(exc))
+
+
+_remove_tree = remove_tree  # backwards-compatible alias
+
+
+def folder_size_mb(folder: str | Path) -> float:
+    """Total size of the files directly inside ``folder`` in MB (NaN when unreadable)."""
+    total = 0
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+    except OSError:
+        return float("nan")
+    return round(total / (1024 * 1024), 3)
+
+
+_folder_mb = folder_size_mb  # backwards-compatible alias
 
 
 def _frame_or_empty(value: Any) -> pd.DataFrame:
     return value if isinstance(value, pd.DataFrame) else pd.DataFrame()
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _text(df: pd.DataFrame, name: str) -> pd.Series:
@@ -208,15 +278,19 @@ def _json_bytes(obj: Any, *, compact: bool = False) -> bytes:
         text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=_json_default)
     else:
         text = json.dumps(_plain(obj), ensure_ascii=False, indent=2, default=_json_default)
-    return text.encode("utf-8")
+    return _utf8(text)
 
 
-def _write_json(path: Path, obj: Any) -> None:
-    path.write_bytes(_json_bytes(obj))
+def write_json(path: str | Path, obj: Any) -> None:
+    """Pretty UTF-8 JSON (numpy / pandas / dataclass values converted, surrogates repaired)."""
+    Path(path).write_bytes(_json_bytes(obj))
 
 
-def _read_json(path: Path) -> Any:
-    return json.loads(path.read_bytes().decode("utf-8"))
+def read_json(path: str | Path) -> Any:
+    return json.loads(Path(path).read_bytes().decode("utf-8"))
+
+
+_write_json, _read_json = write_json, read_json  # backwards-compatible aliases
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +396,7 @@ def _dec(value: Any) -> Any:
 
 
 def _dumps_cell(value: Any) -> str:
-    return json.dumps(_enc(value), ensure_ascii=False, separators=(",", ":"))
+    return fix_surrogates(json.dumps(_enc(value), ensure_ascii=False, separators=(",", ":")))
 
 
 def _loads_cell(text: Any) -> Any:
@@ -347,6 +421,31 @@ def _needs_json(series: pd.Series) -> bool:
     return not all(isinstance(v, datetime) for v in values)  # keep datetimes native
 
 
+def _holds_python_strings(series: pd.Series) -> bool:
+    """Object or python-backed string column (Arrow-backed strings cannot hold surrogates)."""
+    dtype = series.dtype
+    return dtype == object or (isinstance(dtype, pd.StringDtype) and dtype.storage == "python")
+
+
+def _has_surrogates(values: list[Any]) -> bool:
+    texts = [v for v in values if isinstance(v, str)]
+    return bool(texts) and _SURROGATE_RE.search("\n".join(texts)) is not None
+
+
+def _without_surrogates(series: pd.Series) -> pd.Series:
+    values = [fix_surrogates(v) for v in series.tolist()]
+    return pd.Series(values, index=series.index, dtype=series.dtype, name=series.name)
+
+
+def _index_without_surrogates(index: pd.Index) -> pd.Index:
+    if isinstance(index, pd.MultiIndex) or index.dtype != object:
+        return index
+    values = index.tolist()
+    if not _has_surrogates(values):
+        return index
+    return pd.Index([fix_surrogates(v) for v in values], dtype=object, name=index.name)
+
+
 def _json_column(series: pd.Series) -> pd.Series:
     return pd.Series([_dumps_cell(v) for v in series.tolist()], index=series.index, dtype=object)
 
@@ -355,15 +454,20 @@ def _encode_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     info: dict[str, Any] = {"format": FORMAT_VERSION, "json_columns": []}
     out = df.copy(deep=False)
     names = list(out.columns)
-    if not all(isinstance(c, str) for c in names) or len(set(names)) != len(names):
+    if (not all(isinstance(c, str) for c in names) or len(set(names)) != len(names)
+            or _has_surrogates(names)):
         info["names"] = [_enc(c) for c in names]
         info["multiindex"] = isinstance(out.columns, pd.MultiIndex)
         info["level_names"] = [_enc(n) for n in out.columns.names]
         out.columns = [f"__col{i}" for i in range(len(names))]
+    out.index = _index_without_surrogates(out.index)
     for name in out.columns:
-        if _needs_json(out[name]):
-            out[name] = _json_column(out[name])
+        series = out[name]
+        if _needs_json(series):
+            out[name] = _json_column(series)
             info["json_columns"].append(name)
+        elif _holds_python_strings(series) and _has_surrogates(series.tolist()):
+            out[name] = _without_surrogates(series)
     return out, info
 
 
@@ -388,11 +492,14 @@ def _to_table(frame: pd.DataFrame, info: dict[str, Any]) -> pa.Table:
 
 
 def write_frame(df: pd.DataFrame, path: str | Path) -> None:
-    """Write ``df`` to Parquet so that read_frame() returns an equal frame (no pickle involved)."""
+    """Write ``df`` to Parquet so that read_frame() returns an equal frame (no pickle involved).
+
+    Lone UTF-16 surrogates in text cells, column names or the index are repaired (fix_surrogates).
+    """
     frame, info = _encode_frame(df)
     table = _to_table(frame, info)
     metadata = dict(table.schema.metadata or {})
-    metadata[_PARQUET_KEY] = json.dumps(info, ensure_ascii=False).encode("utf-8")
+    metadata[_PARQUET_KEY] = _utf8(json.dumps(info, ensure_ascii=False))
     pq.write_table(table.replace_schema_metadata(metadata), str(path), compression="zstd")
 
 
@@ -415,6 +522,14 @@ def read_frame(path: str | Path) -> pd.DataFrame:
     return df
 
 
+def _optional_frame(path: Path, stored: Any) -> pd.DataFrame | None:
+    if stored is False:
+        return None
+    if stored is None and not path.exists():  # manifest silent and no file: treat as absent
+        return None
+    return read_frame(path)
+
+
 # ---------------------------------------------------------------------------
 # Parsed resumes
 # ---------------------------------------------------------------------------
@@ -430,6 +545,14 @@ def _resume_from(key: str, data: Any) -> ParsedResume:
     if not isinstance(data, dict):
         raise ValueError("parsed resume record is not an object")
     kwargs = {k: v for k, v in data.items() if k in _PARSED_FIELDS}
+    for name, factory in _PARSED_CONTAINERS.items():  # damaged / missing containers -> empty
+        default = factory()
+        if name in kwargs and not isinstance(kwargs[name], type(default)):
+            kwargs[name] = default
+    if "injection_findings" in kwargs:
+        kwargs["injection_findings"] = [f for f in kwargs["injection_findings"] if isinstance(f, dict)]
+    if kwargs.get("bundle_source") is not None:
+        kwargs["bundle_source"] = str(kwargs["bundle_source"])
     kwargs.setdefault("file_name", "")
     kwargs.setdefault("file_hash", key)
     return ParsedResume(**kwargs)
@@ -437,8 +560,9 @@ def _resume_from(key: str, data: Any) -> ParsedResume:
 
 def _parsed_payload(parsed: dict[str, Any], by_candidate: dict[str, Any]) -> dict[str, Any]:
     """All parsed resumes plus candidate -> resume links (shared objects are stored once)."""
-    records = {str(k): _resume_dict(p) for k, p in (parsed or {}).items()}
-    key_of = {id(p): str(k) for k, p in (parsed or {}).items()}
+    parsed = parsed or {}
+    records = {str(k): _resume_dict(p) for k, p in parsed.items()}
+    key_of = {id(p): str(k) for k, p in parsed.items()}
     links: dict[str, str] = {}
     extra: dict[str, dict[str, Any]] = {}
     for cid, resume in (by_candidate or {}).items():
@@ -483,17 +607,91 @@ def _read_parsed(path: Path, base: pd.DataFrame) -> tuple[dict[str, ParsedResume
 def config_from_saved(data: Any) -> AppConfig:
     """AppConfig from a saved run, read like an uploaded profile (AppConfig.from_json).
 
-    Saved runs are data, not trusted settings: LLM connection fields (endpoint, key name, backend,
-    cache folder) always come from the running code, so an edited run file cannot redirect the API
-    key or candidate data.
+    Saved runs are data, not trusted settings: LLM connection fields (endpoint, key name, fallback
+    list, cache folder) and the snapshot cache folder always come from the running code, so an
+    edited run file cannot redirect the proxy token or candidate data.
     """
-    return AppConfig.from_json(json.dumps(data if isinstance(data, dict) else {}, default=str))
+    payload = dict(data) if isinstance(data, Mapping) else {}
+    snapshots = payload.get("snapshots")
+    if isinstance(snapshots, Mapping):
+        payload["snapshots"] = {k: v for k, v in snapshots.items() if k not in _LOCAL_SNAPSHOT_FIELDS}
+    return AppConfig.from_json(json.dumps(payload, default=str))
 
 
 def _quality_from(data: Any) -> DataQualityReport:
     if not isinstance(data, dict):
         return DataQualityReport()
     return DataQualityReport(**{k: v for k, v in data.items() if k in _QUALITY_FIELDS})
+
+
+def _quality_dict(quality: DataQualityReport | None) -> dict[str, Any]:
+    if quality is None or not is_dataclass(quality):
+        return {}
+    return {f.name: getattr(quality, f.name) for f in fields(quality)}
+
+
+# ---------------------------------------------------------------------------
+# Prepared data (shared with snapshots.py)
+# ---------------------------------------------------------------------------
+def write_prepared(folder: str | Path, prepared: PreparedData, *, compresslevel: int = 6) -> dict[str, bool]:
+    """Write the prepared-data files of a run or snapshot into ``folder`` (which must exist).
+
+    base.parquet, matches.parquet, ta.parquet (tables that are None are skipped), quality.json and
+    parsed.json.gz (every ParsedResume plus the candidate -> resume links, gzip ``compresslevel``).
+    Returns the table manifest {"base": True, "matches": bool, "ta": bool} for read_prepared().
+    """
+    folder = Path(folder)
+    if prepared is None or not isinstance(getattr(prepared, "base", None), pd.DataFrame):
+        raise RunStoreError("Nothing to save: there is no prepared data.")
+    tables = {"base": prepared.base, "matches": prepared.matches, "ta": prepared.ta_df}
+    manifest: dict[str, bool] = {}
+    for name, frame in tables.items():
+        manifest[name] = isinstance(frame, pd.DataFrame)
+        if manifest[name]:
+            write_frame(frame, folder / f"{name}.parquet")
+    write_json(folder / "quality.json", _quality_dict(prepared.quality))
+    payload = _parsed_payload(prepared.parsed, prepared.parsed_by_candidate)
+    (folder / "parsed.json.gz").write_bytes(
+        gzip.compress(_json_bytes(payload, compact=True), compresslevel=compresslevel))
+    return manifest
+
+
+def read_prepared(folder: str | Path, frames: Mapping[str, Any] | None = None, *, mode: str = "ta+resumes",
+                  timings: Mapping[str, Any] | None = None) -> PreparedData:
+    """PreparedData from files written by write_prepared(); ``frames`` is its returned manifest.
+
+    Parsed resumes are shared objects: every parsed_by_candidate value is the same object as the
+    matching ``parsed`` entry, exactly as pipeline.prepare_data builds them. Raises on missing or
+    damaged files (callers turn that into their own error or cache miss).
+    """
+    folder = Path(folder)
+    frames = frames if isinstance(frames, Mapping) else {}
+    base = read_frame(folder / "base.parquet")
+    matches = _optional_frame(folder / "matches.parquet", frames.get("matches"))
+    ta_df = _optional_frame(folder / "ta.parquet", frames.get("ta"))
+    quality = _quality_from(read_json(folder / "quality.json"))
+    parsed, by_candidate = _read_parsed(folder / "parsed.json.gz", base)
+    return PreparedData(ta_df=ta_df, quality=quality, parsed=parsed, matches=matches, base=base,
+                        parsed_by_candidate=by_candidate, mode=str(mode or "ta+resumes"),
+                        timings=_mapping(timings))
+
+
+# ---------------------------------------------------------------------------
+# LLM outputs
+# ---------------------------------------------------------------------------
+def normalize_llm_state(state: Any) -> dict[str, Any]:
+    """The session's LLM outputs as a saved run keeps them.
+
+    Every key is kept except legacy re-scores ("rescore": the LLM no longer changes scores).
+    "explain", "borderline" and "clusters" are always dicts; "executive" is a dict or None.
+    """
+    source = state if isinstance(state, Mapping) else {}
+    out = {str(k): v for k, v in source.items() if str(k) not in _LEGACY_LLM_KEYS}
+    for key in LLM_TEXT_STORES:
+        out[key] = _mapping(out.get(key))
+    executive = out.get("executive")
+    out["executive"] = dict(executive) if isinstance(executive, Mapping) and executive else None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -656,18 +854,6 @@ def _count(value: Any) -> int | None:
     return int(value)
 
 
-def _folder_mb(folder: Path) -> float:
-    total = 0
-    try:
-        with os.scandir(folder) as entries:
-            for entry in entries:
-                if entry.is_file(follow_symlinks=False):
-                    total += entry.stat(follow_symlinks=False).st_size
-    except OSError:
-        return float("nan")
-    return round(total / (1024 * 1024), 3)
-
-
 class RunStore:
     """Saved screening runs under ``base_dir`` (env SCREENING_RUNS_DIR, else <project>/runs).
 
@@ -696,7 +882,7 @@ class RunStore:
 
     def _read_meta(self, folder: Path) -> dict[str, Any]:
         try:
-            meta = _read_json(folder / "meta.json")
+            meta = read_json(folder / "meta.json")
         except FileNotFoundError as exc:
             raise RunStoreError(f"Saved run {folder.name} is incomplete (meta.json is missing).") from exc
         except (OSError, ValueError) as exc:
@@ -714,21 +900,7 @@ class RunStore:
 
     def _housekeeping(self) -> None:
         """Remove leftovers of interrupted saves/deletes (best effort)."""
-        try:
-            entries = list(os.scandir(self.base_dir))
-        except OSError:
-            return
-        now = time.time()
-        for entry in entries:
-            try:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                stale_tmp = (entry.name.startswith(_TMP_PREFIX)
-                             and now - entry.stat(follow_symlinks=False).st_mtime > _STALE_TMP_SECONDS)
-                if stale_tmp or entry.name.startswith(_TRASH_PREFIX):
-                    _remove_tree(Path(entry.path))
-            except OSError:
-                continue
+        sweep_work_folders(self.base_dir)
 
     # ---- save -----------------------------------------------------------
     def save(self, prepared: PreparedData, result: PipelineResult, label: str,
@@ -737,8 +909,9 @@ class RunStore:
 
         ``result`` must come from ``pipeline.evaluate(prepared, ...)``: parsed resumes, matches and
         the data-quality report are stored once and shared by both objects on load. ``llm_state``
-        holds the session's LLM outputs, e.g. {"rescore": {...}, "explain": {...}, "clusters": {...},
-        "executive": {...} | None}; it is returned unchanged by load().
+        holds every LLM output of the session - {"executive": {...} | None, "explain": {...},
+        "borderline": {...}, "clusters": {...}, ...}; load() returns it as normalize_llm_state()
+        shapes it. ``result.llm_results`` may be empty (the LLM no longer re-scores candidates).
         """
         if prepared is None or not isinstance(getattr(prepared, "base", None), pd.DataFrame):
             raise RunStoreError("Nothing to save: this run has no prepared data.")
@@ -755,42 +928,40 @@ class RunStore:
         work = self.base_dir / f"{_TMP_PREFIX}{run_id}-{secrets.token_hex(4)}"
         try:
             work.mkdir()
-            manifest = self._write_tables(work, prepared, result)
-            _write_json(work / "risk_meta.json", self._risk_meta(result.risk, manifest))
-            _write_json(work / "quality.json", self._quality_dict(prepared.quality))
-            parsed = _parsed_payload(prepared.parsed, prepared.parsed_by_candidate)
-            (work / "parsed.json.gz").write_bytes(gzip.compress(_json_bytes(parsed, compact=True), compresslevel=6))
-            _write_json(work / "llm.json", {"state": dict(llm_state or {}), "applied": dict(result.llm_results or {})})
+            manifest = write_prepared(work, prepared)
+            manifest.update(self._write_result_tables(work, result))
+            write_json(work / "risk_meta.json", self._risk_meta(result.risk, manifest))
+            write_json(work / "llm.json", {"format": FORMAT_VERSION, "state": normalize_llm_state(llm_state),
+                                           "applied": _mapping(result.llm_results)})
             cfg = result.config if isinstance(result.config, AppConfig) else AppConfig()
-            _write_json(work / "meta.json", {
+            write_json(work / "meta.json", {
                 "format_version": FORMAT_VERSION, "run_id": run_id, "label": name,
                 "created_at": now.isoformat(timespec="microseconds"), "dataset": str(dataset_label or ""),
                 "mode": str(result.mode), "prepared_mode": str(getattr(prepared, "mode", result.mode)),
                 "app_version": __version__, "counts": run_counts(result), "config": cfg.to_dict(),
-                "timings": {"prepared": dict(getattr(prepared, "timings", None) or {}),
-                            "result": dict(result.timings or {})},
+                "timings": {"prepared": _mapping(getattr(prepared, "timings", None)),
+                            "result": _mapping(result.timings)},
                 "frames": manifest,
             })
             final = self.base_dir / run_id
             if final.exists():
                 raise RunStoreError("A run with the same id already exists; try again.")
-            _retry(os.replace, work, final)
+            move_path(work, final)
         except RunStoreError:
-            _remove_tree(work)
+            remove_tree(work)
             raise
         except OSError as exc:
-            _remove_tree(work)
+            remove_tree(work)
             raise RunStoreError(f"The run could not be saved ({_os_reason(exc)}).") from exc
         except Exception as exc:  # noqa: BLE001 - report without data values (they may hold PII)
-            _remove_tree(work)
+            remove_tree(work)
             log.warning("Saving a run failed (%s)", type(exc).__name__)
             raise RunStoreError(f"The run could not be saved ({type(exc).__name__}).") from exc
         return run_id
 
     @staticmethod
-    def _write_tables(folder: Path, prepared: PreparedData, result: PipelineResult) -> dict[str, bool]:
-        tables = {"candidates": result.candidates, "base": prepared.base, "matches": prepared.matches,
-                  "ta": prepared.ta_df}
+    def _write_result_tables(folder: Path, result: PipelineResult) -> dict[str, bool]:
+        tables: dict[str, Any] = {"candidates": result.candidates}
         risk = result.risk if result.risk is not None else RiskResult()
         tables.update({f"risk_{name}": getattr(risk, name, None) for name in RISK_FRAMES})
         manifest: dict[str, bool] = {}
@@ -806,12 +977,6 @@ class RunStore:
         return {"focus_ids": list(risk.focus_ids or []), "params": dict(risk.params or {}),
                 "warnings": list(risk.warnings or []),
                 "frames": {name: manifest.get(f"risk_{name}", False) for name in RISK_FRAMES}}
-
-    @staticmethod
-    def _quality_dict(quality: DataQualityReport | None) -> dict[str, Any]:
-        if quality is None or not is_dataclass(quality):
-            return {}
-        return {f.name: getattr(quality, f.name) for f in fields(quality)}
 
     # ---- read -----------------------------------------------------------
     def list_runs(self) -> pd.DataFrame:
@@ -837,7 +1002,7 @@ class RunStore:
                 "created_at": _created_at(meta, entry.name),
                 "dataset": str((meta or {}).get("dataset") or ""),
                 "mode": str((meta or {}).get("mode") or ""),
-                "size_mb": _folder_mb(folder),
+                "size_mb": folder_size_mb(folder),
             }
             row.update({key: _count(counts.get(key)) for key in COUNT_KEYS})
             rows.append(row)
@@ -854,19 +1019,11 @@ class RunStore:
         """meta.json of a saved run."""
         return self._read_meta(self._existing(run_id))
 
-    @staticmethod
-    def _optional_frame(path: Path, stored: Any) -> pd.DataFrame | None:
-        if stored is False:
-            return None
-        if stored is None and not path.exists():  # manifest silent and no file: treat as absent
-            return None
-        return read_frame(path)
-
     def load(self, run_id: str) -> tuple[PreparedData, PipelineResult, dict[str, Any], dict[str, Any]]:
         """(PreparedData, PipelineResult, llm_state, meta) exactly as saved.
 
         pipeline.evaluate(prepared, result.config) works on the loaded data, so a saved run can be
-        re-tuned without the original files.
+        re-tuned without the original files. llm_state always has the LLM_STATE_KEYS.
         """
         folder = self._existing(run_id)
         meta = self._read_meta(folder)
@@ -877,32 +1034,28 @@ class RunStore:
         if version > FORMAT_VERSION:
             raise RunStoreError(f"Saved run {run_id} was written by a newer version of the app and cannot be "
                                 "opened here.")
+        mode = str(meta.get("mode") or "ta+resumes")
+        timings = _mapping(meta.get("timings"))
         try:
             missing = [name for name in _REQUIRED_FILES if not (folder / name).is_file()]
             if missing:
                 raise RunStoreError(f"Saved run {run_id} is incomplete ({', '.join(missing)} missing).")
-            frames = meta.get("frames") if isinstance(meta.get("frames"), dict) else {}
+            frames = _mapping(meta.get("frames"))
             cfg = config_from_saved(meta.get("config"))
             candidates = read_frame(folder / "candidates.parquet")
-            base = read_frame(folder / "base.parquet")
-            matches = self._optional_frame(folder / "matches.parquet", frames.get("matches"))
-            ta_df = self._optional_frame(folder / "ta.parquet", frames.get("ta"))
-            risk_meta = _read_json(folder / "risk_meta.json")
-            risk_meta = risk_meta if isinstance(risk_meta, dict) else {}
-            stored = risk_meta.get("frames") if isinstance(risk_meta.get("frames"), dict) else {}
+            prepared = read_prepared(folder, frames, mode=str(meta.get("prepared_mode") or mode),
+                                     timings=_mapping(timings.get("prepared")))
+            risk_meta = _mapping(read_json(folder / "risk_meta.json"))
+            stored = _mapping(risk_meta.get("frames"))
             risk = RiskResult(
                 focus_ids=list(risk_meta.get("focus_ids") or []),
                 params=dict(risk_meta.get("params") or {}),
                 warnings=list(risk_meta.get("warnings") or []),
-                **{name: self._optional_frame(folder / f"risk_{name}.parquet", stored.get(name))
+                **{name: _optional_frame(folder / f"risk_{name}.parquet", stored.get(name))
                    for name in RISK_FRAMES},
             )
-            quality = _quality_from(_read_json(folder / "quality.json"))
-            parsed, by_candidate = _read_parsed(folder / "parsed.json.gz", base)
             llm_path = folder / "llm.json"
-            llm_doc = _read_json(llm_path) if llm_path.exists() else {}
-            llm_doc = llm_doc if isinstance(llm_doc, dict) else {}
-            timings = meta.get("timings") if isinstance(meta.get("timings"), dict) else {}
+            llm_doc = _mapping(read_json(llm_path) if llm_path.exists() else {})
         except RunStoreError:
             raise
         except FileNotFoundError as exc:
@@ -910,16 +1063,12 @@ class RunStore:
         except Exception as exc:  # noqa: BLE001 - damaged files: report without data values
             log.warning("Reading a saved run failed (%s)", type(exc).__name__)
             raise RunStoreError(f"Saved run {run_id} could not be read ({type(exc).__name__}).") from exc
-        mode = str(meta.get("mode") or "ta+resumes")
-        prepared = PreparedData(ta_df=ta_df, quality=quality, parsed=parsed, matches=matches, base=base,
-                                parsed_by_candidate=by_candidate, mode=str(meta.get("prepared_mode") or mode),
-                                timings=dict(timings.get("prepared") or {}))
-        result = PipelineResult(candidates=candidates, parsed_resumes=parsed, parsed_by_candidate=by_candidate,
-                                matches=matches, risk=risk, quality=quality, config=cfg,
-                                llm_results=dict(llm_doc.get("applied") or {}),
-                                timings=dict(timings.get("result") or {}), mode=mode)
-        llm_state = llm_doc.get("state") if isinstance(llm_doc.get("state"), dict) else {}
-        return prepared, result, dict(llm_state), meta
+        result = PipelineResult(candidates=candidates, parsed_resumes=prepared.parsed,
+                                parsed_by_candidate=prepared.parsed_by_candidate, matches=prepared.matches,
+                                risk=risk, quality=prepared.quality, config=cfg,
+                                llm_results=_mapping(llm_doc.get("applied")),
+                                timings=_mapping(timings.get("result")), mode=mode)
+        return prepared, result, normalize_llm_state(llm_doc.get("state")), meta
 
     # ---- edit -----------------------------------------------------------
     def rename(self, run_id: str, label: str) -> str:
@@ -930,8 +1079,8 @@ class RunStore:
         meta["renamed_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         work = folder / f"meta.json.{secrets.token_hex(4)}.tmp"
         try:
-            _write_json(work, meta)
-            _retry(os.replace, work, folder / "meta.json")
+            write_json(work, meta)
+            move_path(work, folder / "meta.json")
         except OSError as exc:
             work.unlink(missing_ok=True)
             raise RunStoreError(f"Saved run {run_id} could not be renamed ({_os_reason(exc)}).") from exc
@@ -942,10 +1091,10 @@ class RunStore:
         folder = self._existing(run_id)
         trash = self.base_dir / f"{_TRASH_PREFIX}{run_id}-{secrets.token_hex(4)}"
         try:
-            _retry(os.replace, folder, trash)
+            move_path(folder, trash)
         except OSError as exc:
             raise RunStoreError(f"Saved run {run_id} could not be deleted ({_os_reason(exc)}).") from exc
-        _remove_tree(trash)
+        remove_tree(trash)
         self._housekeeping()
 
     # ---- compare --------------------------------------------------------
@@ -965,3 +1114,23 @@ class RunStore:
         cfg_b = meta_b.get("config") if isinstance(meta_b.get("config"), dict) else {}
         return {"diff": shortlist_diff(before, after), "config_changes": config_changes(cfg_a, cfg_b),
                 "meta": (meta_a, meta_b)}
+
+
+def sweep_work_folders(base_dir: str | Path, stale_seconds: float = _STALE_TMP_SECONDS) -> None:
+    """Remove leftovers of interrupted writes in ``base_dir``: ``.trash-*`` folders and ``.tmp-*``
+    folders older than ``stale_seconds`` (best effort; symlinks are never followed)."""
+    try:
+        entries = list(os.scandir(base_dir))
+    except OSError:
+        return
+    now = time.time()
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            stale_tmp = (entry.name.startswith(_TMP_PREFIX)
+                         and now - entry.stat(follow_symlinks=False).st_mtime > stale_seconds)
+            if stale_tmp or entry.name.startswith(_TRASH_PREFIX):
+                remove_tree(Path(entry.path))
+        except OSError:
+            continue

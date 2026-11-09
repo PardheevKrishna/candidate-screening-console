@@ -11,6 +11,13 @@ Row-level problems never raise: they become ``data_flags`` entries plus report i
 Only a file that cannot be read as a table at all (empty, corrupt, legacy binary .xls)
 raises ``ValueError``; its message is safe to show to users (no cell values / PII).
 
+Workday assessment exports are read as delivered: a workbook's data sheet is the one whose
+header maps the most canonical fields (summary sheets, whose rows have < 3 cells, are
+skipped); the composite "Assessment Comment" ("Hackerrank Completed - Qualified" /
+"Integrity Issues: ..." / "Integrity Summary: ...") fills test_status, integrity_status and
+proctoring_flags when those are not mapped separately; "Job Application" ("First Last (first
+last)") supplies the name when no name column is usable; "#N/A" is a missing value.
+
 Data flags written to ``S.DATA_FLAGS`` ("; "-joined): generated_id, invalid_email,
 invalid_phone, score_missing, score_from_pct, score_exceeds_max, score_negative,
 max_score_assumed, cgpa_out_of_range, invalid_graduation_year, invalid_test_start,
@@ -21,6 +28,7 @@ from __future__ import annotations
 
 import csv
 import datetime as _dt
+import html
 import io
 import ipaddress
 import math
@@ -72,16 +80,17 @@ FLAG_SHARED_EMAIL = "shared_email"
 
 # Canonical column order of the normalised frame (only present columns are emitted).
 _OUTPUT_ORDER = [
-    S.CANDIDATE_ID, S.NAME, S.EMAIL, S.PHONE, S.COLLEGE, S.COLLEGE_TIER, S.DEGREE, S.BRANCH,
-    S.GRAD_YEAR, S.CGPA, S.CITY, S.HR_SCORE, S.MAX_SCORE, S.HR_PCT, S.TEST_NAME, S.TEST_STATUS,
-    S.TEST_START, S.SUBMISSION_TIME, S.COMPLETION_MIN, S.IP_ADDRESS, IP_ADDRESSES, S.IP_SUBNET,
-    S.TEST_MODE, S.TAB_SWITCHES, S.COPY_PASTE, S.OUT_OF_WINDOW_SEC, S.SECURE_MODE_EXITS,
-    S.PLAGIARISM_FLAG, S.MAX_CODE_SIMILARITY, S.PLAGIARISM_MATCH, PLAGIARISM_MATCH_ID,
-    S.INTEGRITY_STATUS, S.PROCTORING_FLAGS, S.SOURCE, S.EMAIL_DOMAIN, S.TEST_SLOT,
+    S.CANDIDATE_ID, S.NAME, S.JOB_APPLICATION, S.EMAIL, S.PHONE, S.COLLEGE, S.COLLEGE_TIER, S.DEGREE,
+    S.BRANCH, S.GRAD_YEAR, S.CGPA, S.CITY, S.HR_SCORE, S.MAX_SCORE, S.HR_PCT, S.CUTOFF_SCORE, S.CUTOFF_PCT,
+    S.TEST_NAME, S.CANDIDATE_OPTION, S.TEST_STATUS, S.TEST_START, S.SUBMISSION_TIME, S.COMPLETION_MIN,
+    S.IP_ADDRESS, IP_ADDRESSES, S.IP_SUBNET, S.TEST_MODE, S.TAB_SWITCHES, S.COPY_PASTE, S.OUT_OF_WINDOW_SEC,
+    S.SECURE_MODE_EXITS, S.PLAGIARISM_FLAG, S.MAX_CODE_SIMILARITY, S.PLAGIARISM_MATCH, PLAGIARISM_MATCH_ID,
+    S.INTEGRITY_STATUS, S.PROCTORING_FLAGS, S.ASSESSMENT_COMMENT, S.SOURCE, S.EMAIL_DOMAIN, S.TEST_SLOT,
     S.RESUME_FILE, S.REPORT_URL,
 ]
 # Free-text categories whose spellings are unified (case / whitespace / punctuation only).
-_CANONICAL_SPELLING_COLUMNS = [S.COLLEGE, S.CITY, S.DEGREE, S.BRANCH, S.SOURCE, S.TEST_NAME, S.TEST_MODE]
+_CANONICAL_SPELLING_COLUMNS = [S.COLLEGE, S.CITY, S.DEGREE, S.BRANCH, S.SOURCE, S.TEST_NAME, S.TEST_MODE,
+                               S.CANDIDATE_OPTION]
 
 _NULL_TOKENS = frozenset({
     "", "na", "n/a", "n.a.", "nan", "null", "none", "nil", "-", "--", "---", "#n/a",
@@ -180,12 +189,16 @@ def _excel_cell(value: Any) -> str:
 
 
 def _excel_rows(content: bytes) -> list[list[str]]:
-    """Rows of the first sheet that has a header-like row (else the first non-empty sheet)."""
+    """Rows of the data sheet: the sheet whose header row maps the most canonical fields.
+
+    Summary sheets (no row with >= 3 non-empty cells, e.g. a Workday recruiter summary) are
+    skipped; ties go to the earlier sheet; with no header-like row anywhere the first
+    non-empty sheet is read.
+    """
     if content.startswith(_OLE2_MAGIC):
         raise ValueError("Legacy binary .xls files are not supported - re-save the file as .xlsx or CSV.")
     from openpyxl import load_workbook  # local import keeps CSV-only use light
 
-    sheets: list[list[list[str]]] = []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
@@ -193,19 +206,33 @@ def _excel_rows(content: bytes) -> list[list[str]]:
         except Exception:  # noqa: BLE001 - any openpyxl failure means "not a readable workbook"
             raise ValueError("Could not open the Excel workbook (corrupt or unsupported format).") from None
         try:
+            best, best_score, fallback = None, -1, None
             for ws in wb.worksheets:
-                rows = [[_excel_cell(v) for v in row]
-                        for _, row in zip(range(MAX_TABLE_ROWS), ws.iter_rows(values_only=True))]
-                widths = [sum(1 for c in r if c.strip()) for r in rows]
-                if widths and max(widths) >= HEADER_MIN_CELLS:
-                    return rows
-                if any(widths):
-                    sheets.append(rows)
+                head = [[_excel_cell(v) for v in row]
+                        for _, row in zip(range(HEADER_SCAN_ROWS), ws.iter_rows(values_only=True))]
+                score = _header_score(head)
+                if score is None:
+                    if fallback is None and any(c.strip() for r in head for c in r):
+                        fallback = ws
+                elif score > best_score:
+                    best, best_score = ws, score
+            chosen = best if best is not None else fallback
+            if chosen is None:
+                raise ValueError("The Excel workbook has no data.")
+            return [[_excel_cell(v) for v in row]
+                    for _, row in zip(range(MAX_TABLE_ROWS), chosen.iter_rows(values_only=True))]
         finally:
             wb.close()
-    if not sheets:
-        raise ValueError("The Excel workbook has no data.")
-    return sheets[0]
+
+
+def _header_score(rows: list[list[str]]) -> int | None:
+    """Canonical fields mapped by a sheet's header row; None for a summary sheet (every row < 3 cells)."""
+    rows = [[" ".join(c.split()) for c in r] for r in rows]
+    rows = [r for r in rows if any(r)]
+    if not rows or max(sum(1 for c in r if c) for r in rows) < HEADER_MIN_CELLS:
+        return None
+    header = [c for c in rows[_find_header_row(rows)] if c]
+    return len(suggest_column_mapping(header))
 
 
 def _label_share(row: list[str]) -> float:
@@ -596,6 +623,135 @@ def _test_status(value: str) -> str:
     return _STATUS_MAP.get(re.sub(r"[^a-z0-9]", "", value.lower())) or _smart_title(value)
 
 
+# ---------------------------------------------------------------------------
+# Workday composite "Assessment Comment" and "Job Application"
+#   "Hackerrank Completed – Qualified&#xa;Integrity Issues: No Issues Detected\nIntegrity Summary: N/A"
+# ---------------------------------------------------------------------------
+_COMMENT_LABEL_RE = re.compile(r"\b(integrity\s*issues?|integrity\s*summary)\s*[:–—-]\s*", re.IGNORECASE)
+_HACKERRANK_PREFIX_RE = re.compile(r"^\s*hacker\s*rank\b[\s:]*", re.IGNORECASE)
+_STATUS_DASH_RE = re.compile(r"\s*[–—―−]\s*|\s+[-‐‑‒]\s+")
+_NO_ISSUES_RE = re.compile(r"^(?:no(?:\s+issues?)?(?:\s+(?:detected|found|observed|identified))?|none|nil"
+                           r"|n\s*/?\s*a|clear|clean|ok|-+)$", re.IGNORECASE)
+_SEVERITY_RE = re.compile(r"^(low|medium|moderate|high|critical|review|suspicious|flagged)\b", re.IGNORECASE)
+_SUMMARY_PLACEHOLDER_RE = re.compile(r"^(?:n\s*/?\s*a|none|nil|null|-+|\.+|no\s+issues?(?:\s+detected)?)$",
+                                     re.IGNORECASE)
+_COMMENT_SCAN_ROWS = 2000
+
+
+def _unescape(value: str) -> str:
+    """HTML entities ("&#xa;", "&#10;", "&amp;", twice-escaped "&amp;#xa;") -> text; CR/LF unified."""
+    text = value
+    for _ in range(2):
+        if "&" not in text:
+            break
+        text = html.unescape(text)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _looks_like_composite_comment(series: pd.Series) -> bool:
+    """True when a comment column carries labelled parts ("Integrity Issues: ...", "Hackerrank Completed ...")."""
+    values = [v for v in series.tolist()[:_COMMENT_SCAN_ROWS] if isinstance(v, str)]
+    hits = 0
+    for v in values:
+        text = _unescape(v)
+        hits += bool(_COMMENT_LABEL_RE.search(text) or _HACKERRANK_PREFIX_RE.match(text))
+    return hits > 0 and hits >= 0.3 * len(values)
+
+
+def _integrity_value(value: str | None) -> str | None:
+    """"No Issues Detected" / "None" / "N/A" -> "Clear"; severities -> Title Case ("Medium")."""
+    if value is None:
+        return None
+    text = " ".join(value.split()).strip(" .;,|")
+    if not text:
+        return None
+    if _NO_ISSUES_RE.match(text):
+        return "Clear"
+    m = _SEVERITY_RE.match(text)
+    return m.group(1).title() if m else _smart_title(text)
+
+
+def _summary_value(value: str | None) -> str | None:
+    text = " ".join((value or "").split()).strip(" .;,|")
+    return None if not text or _SUMMARY_PLACEHOLDER_RE.match(text) else text
+
+
+@dataclass
+class _Comment:
+    status: str | None          # "Completed" (feeds test_status)
+    integrity: str | None       # "Clear" / "Medium" / ...
+    summary: str | None         # "Detected Code Similarity With Other Submissions"
+    text: str                   # cleaned comment, one part per line (qualification kept)
+    has_issues: bool = False    # an "Integrity Issues:" part was present
+    has_summary: bool = False   # an "Integrity Summary:" part was present
+
+
+def _parse_comment(value: Any) -> _Comment | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = _unescape(value)
+    parts = _COMMENT_LABEL_RE.split(text)     # [head, label, value, label, value, ...]
+    head = " ".join(parts[0].split()).strip(" ;,|")
+    labelled: dict[str, str] = {}
+    for label, part in zip(parts[1::2], parts[2::2]):
+        key = "summary" if "summary" in label.lower() else "issues"
+        labelled.setdefault(key, " ".join(part.split()).strip(" ;,|"))
+    status = None
+    if head:
+        prefix = _HACKERRANK_PREFIX_RE.match(head)
+        word = _STATUS_DASH_RE.split(head[prefix.end():] if prefix else head, maxsplit=1)[0].strip(" :;,")
+        known = re.sub(r"[^a-z0-9]", "", word.lower()) in _STATUS_MAP
+        if not known:                                    # "Completed-Qualified" (no spaces round the dash)
+            first = re.split(r"[-‐-―−]", word, maxsplit=1)[0].strip()
+            if re.sub(r"[^a-z0-9]", "", first.lower()) in _STATUS_MAP:
+                word, known = first, True
+        if word and len(word) <= 40 and (prefix or known):
+            status = word
+    lines = [head] if head else []
+    if "issues" in labelled:
+        lines.append(f"Integrity Issues: {labelled['issues']}")
+    if "summary" in labelled:
+        lines.append(f"Integrity Summary: {labelled['summary']}")
+    return _Comment(status, _integrity_value(labelled.get("issues")), _summary_value(labelled.get("summary")),
+                    "\n".join(lines) or " ".join(text.split()), "issues" in labelled, "summary" in labelled)
+
+
+def _parse_assessment_comments(comment: pd.Series, header: str = "") -> dict[str, pd.Series]:
+    """Comment column -> {"text": cleaned comment, <field>: values} for every field it carries
+    (TEST_STATUS, INTEGRITY_STATUS, PROCTORING_FLAGS; a field is present when its label is).
+
+    A column that is itself "Integrity Issues" / "Integrity Summary" (header name) carries plain
+    values; any other comment column is parsed only when it looks composite.
+    """
+    out = {"text": comment.map(lambda v: " ".join(_unescape(v).split()), na_action="ignore").astype("str")}
+    if header.startswith("integrityissue"):
+        out[S.INTEGRITY_STATUS] = comment.map(lambda v: _integrity_value(_unescape(v)),
+                                              na_action="ignore").astype("str")
+    elif header == "integritysummary":
+        out[S.PROCTORING_FLAGS] = comment.map(lambda v: _summary_value(_unescape(v)), na_action="ignore").astype("str")
+    elif _looks_like_composite_comment(comment):
+        parsed = [_parse_comment(v) for v in comment.tolist()]
+        out["text"] = pd.Series([p.text if p else None for p in parsed], dtype="str")
+        if any(p and p.status for p in parsed):
+            out[S.TEST_STATUS] = pd.Series([p.status if p else None for p in parsed], dtype="str")
+        if any(p and p.has_issues for p in parsed):
+            out[S.INTEGRITY_STATUS] = pd.Series([p.integrity if p else None for p in parsed], dtype="str")
+        if any(p and p.has_summary for p in parsed):
+            out[S.PROCTORING_FLAGS] = pd.Series([p.summary if p else None for p in parsed], dtype="str")
+    return out
+
+
+def _name_from_job_application(value: Any) -> str | None:
+    """"Asha Menon (asha menon)" -> "Asha Menon" (the text before " (")."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    cut = text.find(" (")
+    name = text[:cut] if cut > 0 else text.strip("()")
+    name = name.strip(" -,;:")
+    return name if re.search(r"[^\W\d_]", name) else None
+
+
 _CAMPUS_WORDS = frozenset({"campus", "oncampus", "incampus", "onsite", "offline", "lab", "labs", "centre",
                            "center", "venue", "college", "physical", "inperson"})
 _REMOTE_WORDS = frozenset({"remote", "remotely", "online", "home", "wfh", "virtual"})
@@ -774,6 +930,46 @@ def _names_from_parts(raw: pd.DataFrame) -> pd.Series | None:
     parts = [_text(raw.iloc[:, j]).tolist() for j in cols]
     joined = [" ".join(p for p in row if isinstance(p, str)) or None for row in zip(*parts)]
     return pd.Series(joined, dtype="str")
+
+
+def _derive_from_comment(col: dict[str, pd.Series], eff: dict[int, str], columns: list[Any],
+                         report: DataQualityReport) -> pd.Series | None:
+    """Parse the (Workday) assessment comment; fill test_status / integrity_status / proctoring_flags
+    from it when those fields are not mapped separately. Returns the cleaned comment text."""
+    comment = col.get(S.ASSESSMENT_COMMENT)
+    if comment is None:
+        return None
+    source = next((columns[j] for j, canon in eff.items() if canon == S.ASSESSMENT_COMMENT), "")
+    parsed = _parse_assessment_comments(comment, S.normalize_header(source))
+    derived = []
+    for canon in (S.TEST_STATUS, S.INTEGRITY_STATUS, S.PROCTORING_FLAGS):
+        if canon not in col and canon in parsed:
+            col[canon] = parsed[canon]
+            derived.append(S.TA_FIELD_LABELS.get(canon, canon))
+    if derived:
+        report.missing_fields = [c for c in report.missing_fields if c not in col]
+        report.add("info", STAGE, f"{', '.join(derived)} read from the '{source}' column.")
+    return parsed["text"]
+
+
+def _names_from_job_application(names: pd.Series | None, job: pd.Series | None,
+                                report: DataQualityReport) -> pd.Series | None:
+    """Fill missing names from "Job Application" ("First Last (first last)" -> "First Last")."""
+    if job is None:
+        return names
+    from_job = job.map(_name_from_job_application, na_action="ignore").astype("str")
+    if names is None:
+        if from_job.notna().any():
+            report.missing_fields = [c for c in report.missing_fields if c != S.NAME]
+            report.add("info", STAGE, "Candidate names taken from the 'Job Application' column.")
+            return from_job
+        return names
+    fill = names.isna() & from_job.notna()
+    if fill.any():
+        report.add("info", STAGE, f"{int(fill.sum())} missing candidate name(s) taken from the 'Job Application' "
+                                  f"column.")
+        return names.where(~fill, from_job)
+    return names
 
 
 def _candidate_ids(text: pd.Series | None, n: int, ctx: _Ctx) -> pd.Series:
@@ -1028,11 +1224,13 @@ def normalize_ta_feed(raw: pd.DataFrame, mapping: dict[str, str], cfg: AppConfig
     mapped = set(eff.values())
     report.missing_fields = [c for c in S.TA_FIELD_ALIASES if c not in mapped]
     col: dict[str, pd.Series] = {canon: _text(raw.iloc[:, j]) for j, canon in eff.items()}
+    comment_text = _derive_from_comment(col, eff, columns, report)
     names = col.get(S.NAME)
     if names is None:
         names = _names_from_parts(raw)
         if names is not None:
             report.add("info", STAGE, "Candidate names built from first/last name columns.")
+    names = _names_from_job_application(names, col.get(S.JOB_APPLICATION), report)
     if S.HR_SCORE not in mapped and S.HR_PCT not in mapped:
         report.add("error", STAGE, "No HackerRank score column found; assessment scores will be blank.")
     if not mapped & set(S.IDENTITY_FIELDS) and names is None:
@@ -1055,9 +1253,11 @@ def normalize_ta_feed(raw: pd.DataFrame, mapping: dict[str, str], cfg: AppConfig
 
     # education / profile / free text ------------------------------------------------
     for canon in (S.COLLEGE, S.DEGREE, S.BRANCH, S.CITY, S.SOURCE, S.TEST_NAME, S.REPORT_URL,
-                  S.PROCTORING_FLAGS, S.PLAGIARISM_MATCH):
+                  S.PROCTORING_FLAGS, S.PLAGIARISM_MATCH, S.JOB_APPLICATION, S.CANDIDATE_OPTION):
         if canon in col:
             out[canon] = col[canon]
+    if comment_text is not None:
+        out[S.ASSESSMENT_COMMENT] = comment_text
     if S.COLLEGE_TIER in col:
         out[S.COLLEGE_TIER] = col[S.COLLEGE_TIER].map(_college_tier, na_action="ignore").astype("str")
     if S.GRAD_YEAR in col:
@@ -1073,6 +1273,12 @@ def normalize_ta_feed(raw: pd.DataFrame, mapping: dict[str, str], cfg: AppConfig
 
     # assessment --------------------------------------------------------------------
     out.update(_scores(col, n, ctx))
+    if S.CUTOFF_SCORE in col:
+        cutoff = _floats(col[S.CUTOFF_SCORE])
+        out[S.CUTOFF_SCORE] = cutoff.mask(cutoff < 0)
+    if S.CUTOFF_PCT in col:
+        cutoff = _fraction_aware(col[S.CUTOFF_PCT])
+        out[S.CUTOFF_PCT] = cutoff.where((cutoff >= 0) & (cutoff <= 100))
     for canon, func in ((S.TEST_STATUS, _test_status), (S.INTEGRITY_STATUS, _smart_title), (S.TEST_MODE, _test_mode)):
         if canon in col:
             out[canon] = col[canon].map(func, na_action="ignore").astype("str")

@@ -10,19 +10,24 @@ i.e. perfect scorers by default) and returns review evidence - never verdicts:
                     shared phone / email, HackerRank plagiarism match), generated with groupby
                     self-joins, sorted time windows and sparse TF-IDF products - never a Python
                     double loop over candidates;
-3. individual     - per-candidate flags (speed anomaly + HackerRank plagiarism/proctoring fields);
+3. individual     - per-candidate flags (speed anomaly, HackerRank / Workday plagiarism and
+                    integrity fields, hidden or adversarial resume text - prompt injection);
 4. clusters       - connected components of pairs with pair_score >= edge_threshold;
 5. candidate_risk - min(100, max_pair_score + individual_score) for every candidate, with
-                    reasons that name the evidence and the linked candidate IDs.
+                    reasons that name the evidence and the linked candidate IDs, plus
+                    ``injection_flags`` (summaries of hidden / adversarial resume text).
 
 Precision guards for legitimate look-alikes (all reported in ``RiskResult.params``): answer
 hashes held by a large share of the focus group are answer keys; bullets / repos held by many
 resumes are boilerplate; a shared lab/NAT/hostel IP of one college (or of an On-campus venue)
 is not evidence; timing matches inside scheduled or crowded sessions are down-weighted, and
-timing alone links candidates only inside a synchronised group of >= 3. Identity signals
-(phone/email) and HackerRank's plagiarism match also link a perfect scorer to a non-focus
-candidate. Missing columns skip a signal with a warning, and a failure inside one signal never
-aborts the analysis.
+timing alone links candidates only inside a synchronised group of >= 3. Teammates who list
+the same 1-2 GitHub repos on otherwise different resumes are a team project
+(``team_max_*`` settings), scored with ``team_repo_weight`` and worded as collaboration to
+verify. Duplicate applications of one person (``duplicate_of`` / ``duplicate_ids`` in the
+input) are never paired - eligibility handles them. Identity signals (phone/email) and
+HackerRank's plagiarism match also link a perfect scorer to a non-focus candidate. Missing
+columns skip a signal with a warning, and a failure inside one signal never aborts the analysis.
 """
 from __future__ import annotations
 
@@ -41,6 +46,7 @@ from scipy import sparse
 from scipy.stats import false_discovery_control, hypergeom
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from . import injection
 from . import schema as S
 from .config import AppConfig, RiskConfig
 from .models import ParsedResume, RiskResult
@@ -75,8 +81,9 @@ COMMONALITY_COLUMNS = [
 INDIVIDUAL_COLUMNS = [S.CANDIDATE_ID, "flag_key", "flag", "detail", "weight"]
 CANDIDATE_RISK_COLUMNS = [
     S.CANDIDATE_ID, S.IS_FOCUS, S.RISK_SCORE, S.RISK_LEVEL, S.RISK_REASONS, S.CLUSTER_ID,
-    S.N_LINKS, S.MAX_PAIR_SCORE, S.INDIVIDUAL_SCORE,
+    S.N_LINKS, S.MAX_PAIR_SCORE, S.INDIVIDUAL_SCORE, S.INJECTION_FLAGS,
 ]
+INJECTION_REASON = "Adversarial text detected in resume (Prompt Injection / Hidden Text)"
 
 # ---------------------------------------------------------------------------
 # Small-sample / precision guards (reported in RiskResult.params)
@@ -109,6 +116,7 @@ SIGNALS: dict[str, _SignalDef] = {
     "same_phone": _SignalDef("Same phone", "phone"),
     "same_email": _SignalDef("Same email", "email"),
     "shared_github_repo": _SignalDef("Shared GitHub repo", "repo"),
+    "team_github_repo": _SignalDef("Shared team project GitHub repo", "team_repo"),
     "resume_text_high": _SignalDef("Near-identical resume text", "text"),
     "resume_text_medium": _SignalDef("Similar resume text", "text"),
     "shared_bullets": _SignalDef("Shared rare resume bullets", "bullets"),
@@ -124,6 +132,7 @@ TIMING_SIGNALS = frozenset(k for k, s in SIGNALS.items() if s.timing)
 _SIGNAL_RANK = {k: i for i, k in enumerate(SIGNALS)}
 
 FLAG_LABELS: dict[str, str] = {
+    "prompt_injection": "Prompt injection / hidden text",
     "plagiarism_flag": "HackerRank plagiarism flag",
     "speed_anomaly": "Speed anomaly",
     "high_code_similarity": "High code similarity",
@@ -154,7 +163,8 @@ _ON_CAMPUS = frozenset({"oncampus", "campus", "incampus", "offline", "onsite", "
                         "venue", "testcentre", "testcenter", "centre", "center", "poolcampus",
                         "campusdrive", "poolcampusdrive"})
 _FAKE_PHONES = frozenset({"1234567890", "0123456789", "9876543210", "0987654321"})
-_INTEGRITY_RE = re.compile(r"\b(review|suspicious|flagged)\b")
+_WORD_RE = re.compile(r"[a-z]+")
+_ID_SPLIT_RE = re.compile(r"[,;|\s]+")      # ", "-joined candidate IDs (duplicate_ids)
 _NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
 _KEY_RE = re.compile(r"[^\w]+")
 _IP_SPLIT_RE = re.compile(r"[,;|\s]+")
@@ -257,6 +267,7 @@ class _Ctx:
     text_matrix: Any = None                                   # csr, L2-normalised rows
     bullet_counts: dict[str, int] = field(default_factory=dict)  # bullet -> resumes holding it
     timing: _Timing | None = None
+    dup_group: np.ndarray | None = None   # same number = one person's applications (never paired)
 
     @property
     def n(self) -> int:
@@ -360,6 +371,7 @@ def _build_context(candidates: Any, parsed_by_candidate: Any, parsed_all: Any, r
         pw=_weights(rc.pair_weights, _DEFAULT_RC.pair_weights),
         iw=_weights(rc.individual_weights, _DEFAULT_RC.individual_weights),
         warnings=warnings, params=dict(derived),
+        dup_group=_duplicate_groups(df, ids),
     )
 
 
@@ -589,7 +601,15 @@ def _individual_flags(ctx: _Ctx) -> pd.DataFrame:
     else:
         for i, t in enumerate(status):
             if t and _is_integrity_concern(t):
-                rows.append((i, "integrity_status", f"HackerRank AI-proctoring status: {_clip(t, 60)}"))
+                severity = _WORD_RE.findall(t.casefold())[:1] in (["medium"], ["high"])
+                label = "Assessment integrity issues" if severity else "HackerRank AI-proctoring status"
+                rows.append((i, "integrity_status", f"{label}: {_clip(t, 60)}"))
+
+    # Hidden / adversarial resume text (prompt injection), found while the resume was parsed.
+    for i, p in sorted(ctx.resumes.items()):
+        findings = _injection_findings(p)
+        if findings:
+            rows.append((i, "prompt_injection", f"{INJECTION_REASON}: '{injection.reason_snippet(findings)}'"))
 
     notes = _str_col(df, S.PROCTORING_FLAGS)
     if notes is None:
@@ -983,9 +1003,27 @@ def _gen_text(ctx: _Ctx, scope: list[int]) -> _Gen:
     return _unique_gen(np.minimum(pa, pb)[keep], np.maximum(pa, pb)[keep], ctx.n)
 
 
+def _without_duplicate_applications(ctx: _Ctx, gens: list[_Gen]) -> list[_Gen]:
+    """Drop pairs between applications of the same person (eligibility handles duplicates)."""
+    if ctx.dup_group is None:
+        return gens
+    out: list[_Gen] = []
+    dropped: set[tuple[int, int]] = set()
+    for g in gens:
+        keep = ctx.dup_group[g.a] != ctx.dup_group[g.b]
+        dropped.update(zip(g.a[~keep].tolist(), g.b[~keep].tolist()))
+        if keep.any():
+            out.append(_Gen(g.a[keep], g.b[keep], {k: v[keep] for k, v in g.ev.items()}))
+    ctx.params["duplicate_application_pairs_ignored"] = len(dropped)
+    return out
+
+
 def _score_pairs(ctx: _Ctx, gens: list[_Gen]) -> _Pairs:
     """Union all candidate pairs, evaluate every signal vectorised, keep the meaningful ones."""
     rc, pw, n = ctx.rc, ctx.pw, ctx.n
+    gens = _without_duplicate_applications(ctx, gens)
+    if not gens:
+        return _Pairs.empty()
     gen_keys = [g.a * n + g.b for g in gens]
     union = np.unique(np.concatenate(gen_keys))
     A, B = union // n, union % n
@@ -1041,12 +1079,19 @@ def _score_pairs(ctx: _Ctx, gens: list[_Gen]) -> _Pairs:
     sequential = same_ip & _within(seq_gap, rc.proxy_gap_max_min)
     seq_factor = ip_factor * np.where(co_sched, SCHEDULED_TIMING_FACTOR, 1.0)
     sim0 = np.nan_to_num(sim, nan=0.0)
+    # Team project: 1-2 shared repos on otherwise different resumes (low text similarity, at most
+    # one shared rare bullet) - teammates list the same repo; weighted down and worded as such.
+    has_repo = E["repos"] != ""
+    n_repos = np.array([len([r for r in str(v).split(S.SEP_LIST) if r]) for v in E["repos"]], dtype=np.int64)
+    team = (has_repo & (n_repos <= int(rc.team_max_shared_repos))
+            & (sim0 < float(rc.team_max_text_similarity)) & (E["n_bullets"] <= int(rc.team_max_shared_bullets)))
     W: dict[str, np.ndarray] = {
         "shared_answer_hash": pw["shared_answer_hash"] * np.minimum(E["n_hash"], 2),
         "plagiarism_match": np.where(E["plag"], pw["plagiarism_match"], 0.0),
         "same_phone": np.where(same_phone, pw["same_phone"], 0.0),
         "same_email": np.where(same_email, pw["same_email"], 0.0),
-        "shared_github_repo": np.where(E["repos"] != "", pw["shared_github_repo"], 0.0),
+        "shared_github_repo": np.where(has_repo & ~team, pw["shared_github_repo"], 0.0),
+        "team_github_repo": np.where(team, max(0.0, float(rc.team_repo_weight)), 0.0),
         "resume_text_high": np.where(sim0 >= rc.text_similarity_high, pw["resume_text_high"], 0.0),
         "resume_text_medium": np.where((sim0 >= rc.text_similarity_medium) & (sim0 < rc.text_similarity_high),
                                        pw["resume_text_medium"], 0.0),
@@ -1143,6 +1188,8 @@ def _signal_text(key: str, r: int, E: dict[str, np.ndarray]) -> str:
         return "Same email address"
     if key == "shared_github_repo":
         return f"Same GitHub repo {E['repos'][r]}"
+    if key == "team_github_repo":
+        return f"Same GitHub repo {E['repos'][r]} on otherwise different resumes (team project)"
     if key in ("resume_text_high", "resume_text_medium"):
         return f"Resume project/experience text {E['sim'][r] * 100:.0f}% similar (TF-IDF cosine)"
     if key == "shared_bullets":
@@ -1201,10 +1248,13 @@ def _aggregate(ctx: _Ctx, pairs: _Pairs, individual: pd.DataFrame) -> tuple[pd.D
         S.SEP_REASONS.join(t for _, _, t in sorted(reasons.get(i, []), key=lambda x: (-x[0], x[1], x[2])))
         for i in range(n)
     ]
+    injected = [injection.summarize(_injection_findings(ctx.resumes[i])) if i in ctx.resumes else ""
+                for i in range(n)]
     cr = pd.DataFrame({
         S.CANDIDATE_ID: ctx.ids.astype(str), S.IS_FOCUS: ctx.focus.astype(bool), S.RISK_SCORE: risk,
         S.RISK_LEVEL: level.astype(str), S.RISK_REASONS: reason_text, S.CLUSTER_ID: cluster_ids.astype(str),
         S.N_LINKS: n_links, S.MAX_PAIR_SCORE: np.round(max_pair, 2), S.INDIVIDUAL_SCORE: indiv,
+        S.INJECTION_FLAGS: injected,
     })
     order = np.lexsort((np.arange(n), -risk))   # risk desc, then candidate_id asc
     cr = cr.iloc[order].reset_index(drop=True)[CANDIDATE_RISK_COLUMNS]
@@ -1239,7 +1289,7 @@ def _pair_reasons(ctx: _Ctx, pairs: _Pairs) -> dict[int, list[tuple[float, int, 
     """Aggregate pair signals per candidate and reason group, naming partner IDs."""
     E, W = pairs.ev, pairs.weights
     groups: dict[tuple[int, str, str], dict[int, dict[str, Any]]] = defaultdict(dict)
-    sub_of = {"hash": "hash_qs", "repo": "repos", "ip": "ip", "subnet": "subnet"}
+    sub_of = {"hash": "hash_qs", "repo": "repos", "team_repo": "repos", "ip": "ip", "subnet": "subnet"}
     for r in range(len(pairs.a)):
         a, b = int(pairs.a[r]), int(pairs.b[r])
         for key, wv in W.items():
@@ -1268,6 +1318,9 @@ def _format_reason(ctx: _Ctx, group: str, sub: str, ranked: list[tuple[int, dict
         return f"Identical answers to {sub} with {plist} - pattern consistent with shared solutions"
     if group == "repo":
         return f"Same GitHub repo {sub} as {plist} - pattern consistent with a shared or purchased project"
+    if group == "team_repo":
+        return (f"Shared team project GitHub repo {sub} with {plist} - pattern consistent with legitimate team "
+                f"collaboration (verify candidate's individual role)")
     if group == "text":
         parts = [f"{ids[k]} ({E['sim'][info['r']] * 100:.0f}%)"
                  for k, (_, info) in enumerate(ranked[:MAX_IDS_IN_REASON])]
@@ -1444,6 +1497,8 @@ def _cluster_pattern(keys: Counter[str], n_speed: int, size: int, sync_frac: flo
     if any(keys.get(k) for k in ("shared_github_repo", "shared_bullets", "resume_text_high",
                                  "resume_text_medium")):
         return "shared or templated resumes"
+    if keys.get("team_github_repo") and sync_frac == 0:
+        return "a shared team project (verify individual roles)"
     if sync_frac > 0:
         return "coordinated test-taking (synchronised sessions)"
     if keys.get("same_ip") or keys.get("same_subnet"):
@@ -1490,7 +1545,7 @@ def _all_clear(candidates: Any, focus: np.ndarray | None = None) -> pd.DataFrame
     return pd.DataFrame({
         S.CANDIDATE_ID: pd.Series(ids, dtype=object).astype(str), S.IS_FOCUS: is_focus,
         S.RISK_SCORE: 0.0, S.RISK_LEVEL: S.RISK_CLEAR, S.RISK_REASONS: "", S.CLUSTER_ID: "",
-        S.N_LINKS: 0, S.MAX_PAIR_SCORE: 0.0, S.INDIVIDUAL_SCORE: 0.0,
+        S.N_LINKS: 0, S.MAX_PAIR_SCORE: 0.0, S.INDIVIDUAL_SCORE: 0.0, S.INJECTION_FLAGS: "",
     })[CANDIDATE_RISK_COLUMNS]
 
 
@@ -1689,10 +1744,48 @@ def _is_on_campus(t: str | None) -> bool:
 
 
 def _is_integrity_concern(t: str) -> bool:
+    """Review / Suspicious / Flagged (HackerRank AI proctoring) or Medium / High (Workday integrity
+    issues) - schema.INTEGRITY_CONCERN_VALUES; negated values ("Not Suspicious") are not."""
     low = t.casefold().strip()
     if low.startswith(("not ", "no ", "non-", "non ")):
         return False
-    return bool(_INTEGRITY_RE.search(low))
+    return any(word in S.INTEGRITY_CONCERN_VALUES for word in _WORD_RE.findall(low))
+
+
+def _injection_findings(p: Any) -> list[dict[str, Any]]:
+    """Hidden-text / prompt-injection findings of a parsed resume (absent on older cached objects)."""
+    found = getattr(p, "injection_findings", None) or []
+    return [f for f in found if isinstance(f, dict)]
+
+
+def _duplicate_groups(df: pd.DataFrame, ids: np.ndarray) -> np.ndarray | None:
+    """Group number per row joining duplicate applications with their primary
+    (``duplicate_of`` / ``duplicate_ids``); None when the input marks no duplicates."""
+    of = _str_col(df, S.DUPLICATE_OF)
+    listed = _str_col(df, S.DUPLICATE_IDS)
+    if of is None and listed is None:
+        return None
+    n = len(ids)
+    pos = {str(c).upper(): i for i, c in enumerate(ids)}
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    linked = False
+    for i in range(n):
+        others = [of[i]] if of is not None and of[i] else []
+        if listed is not None and listed[i]:
+            others += [t for t in _ID_SPLIT_RE.split(listed[i]) if t]
+        for other in others:
+            j = pos.get(other.strip().upper())
+            if j is not None and j != i:
+                parent[find(i)] = find(j)
+                linked = True
+    return np.array([find(i) for i in range(n)], dtype=np.int64) if linked else None
 
 
 def _resume_repos(p: ParsedResume) -> frozenset[str]:

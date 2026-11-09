@@ -1,0 +1,120 @@
+{
+  "name": "screening-copilot-proxy",
+  "displayName": "Screening Copilot Proxy",
+  "description": "Serves your GitHub Copilot chat models to the candidate screening console through a token-protected, localhost-only OpenAI-style endpoint.",
+  "version": "0.1.0",
+  "publisher": "screening-console",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "language model",
+    "proxy",
+    "openai"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": true
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "screeningProxy.start",
+        "title": "Start",
+        "category": "Screening Proxy"
+      },
+      {
+        "command": "screeningProxy.stop",
+        "title": "Stop",
+        "category": "Screening Proxy"
+      },
+      {
+        "command": "screeningProxy.showStatus",
+        "title": "Show Status",
+        "category": "Screening Proxy"
+      },
+      {
+        "command": "screeningProxy.copyToken",
+        "title": "Copy Token",
+        "category": "Screening Proxy"
+      },
+      {
+        "command": "screeningProxy.rotateToken",
+        "title": "Rotate Token",
+        "category": "Screening Proxy"
+      }
+    ],
+    "configuration": {
+      "title": "Screening Copilot Proxy",
+      "properties": {
+        "screeningProxy.port": {
+          "type": "integer",
+          "default": 5757,
+          "minimum": 1,
+          "maximum": 65535,
+          "scope": "machine",
+          "order": 1,
+          "markdownDescription": "TCP port of the proxy. The screening console finds a changed port automatically through the connection file in your home folder."
+        },
+        "screeningProxy.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "scope": "machine",
+          "order": 2,
+          "markdownDescription": "Address the proxy listens on. Keep `127.0.0.1` (this computer only). **Warning:** any other value (for example `0.0.0.0` or a network address) exposes the proxy, and with it your GitHub Copilot access, to other machines on the network; only the bearer token would protect it."
+        },
+        "screeningProxy.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "order": 3,
+          "description": "Start the proxy automatically when VS Code starts."
+        },
+        "screeningProxy.modelFamily": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "order": 4,
+          "markdownDescription": "Copilot model id or family used when a request does not name an available model, for example `gpt-4.1`. Empty = the first model GitHub Copilot offers. `Screening Proxy: Show Status` lists the available models."
+        },
+        "screeningProxy.maxConcurrency": {
+          "type": "integer",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 32,
+          "scope": "machine",
+          "order": 5,
+          "description": "Maximum number of Copilot requests running at the same time. Further requests wait in a small queue; when the queue is full the proxy answers 429 (retry later)."
+        },
+        "screeningProxy.requestTimeoutSec": {
+          "type": "integer",
+          "default": 120,
+          "minimum": 5,
+          "maximum": 1800,
+          "scope": "machine",
+          "order": 6,
+          "description": "Seconds a request may take (including time waiting in the queue) before the proxy cancels it and answers 504."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}

@@ -196,12 +196,26 @@ def test_cap_zero_matches_non_binding_cap_on_random_frames():
         assert not off[S.COLLEGE_CAPPED].any()
 
 
-def test_cutoff_band_follows_the_cap_backfill():
+def test_borderline_band_follows_the_cap_backfill():
     cfg = make_cfg(top_n=10, college_cap_pct=20.0)       # 2 places per college
-    cfg.llm.cutoff_band = 2
+    cfg.llm.borderline_band = 2
     ranked = scoring.apply_shortlist(make_scored(["A"] * 4 + [f"U{i}" for i in range(16)]), cfg)
     assert capped(ranked) == ["C02", "C03"] and len(shortlisted(ranked)) == 10
-    assert scoring.cutoff_band_ids(ranked, cfg) == ["C10", "C11", "C12", "C13"]   # cutoff moved to rank 12
+    # cutoff moved to rank 12; capped candidates above it are not "just below the cutoff"
+    assert scoring.cutoff_band_ids(ranked, cfg) == ["C12", "C13"]
+
+
+def test_cap_and_tie_notes_coexist():
+    df = make_scored(["A", "A", "B", "C"]).assign(**{S.FINAL_SCORE: [99.0, 98.0, 91.2, 91.2],
+                                                    S.HR_PCT: [90.0, 90.0, 100.0, 95.0]})
+    out = by_id(scoring.apply_shortlist(df, make_cfg(top_n=2, college_cap_pct=50.0)))
+    # A holds 1 place; C01 is capped and C02 backfills; C02 / C03 tie across the cutoff
+    assert out.loc["C01", S.COLLEGE_CAPPED]
+    assert out.loc["C02", S.STATUS_REASON] == (
+        "Rank 3 of 4 (top 2; backfill for 1 college-capped candidate; tied at 91.20 pts; "
+        "won tie-break on HackerRank percentage 100% vs 95%)")
+    assert out.loc["C03", S.STATUS_REASON] == (
+        "Rank 4 of 4 (cutoff: top 2; tied at 91.20 pts; lost tie-break on HackerRank percentage 95% vs 100%)")
 
 
 def test_college_key():
@@ -229,13 +243,13 @@ def test_pipeline_evaluate_applies_the_cap(monkeypatch):
     prepared = pipeline.PreparedData(ta_df=base, quality=DataQualityReport(), parsed={}, matches=pd.DataFrame(),
                                      base=base, parsed_by_candidate=parsed)
     cfg = make_cfg(top_n=5, college_cap_pct=40.0)        # 2 places per college
-    cfg.llm.cutoff_band = 2
-    rules_only = pipeline.evaluate(prepared, cfg, None).candidates
-    assert capped(rules_only) == ["C02", "C03", "C04"]
-    # LLM re-scoring near the cutoff runs apply_shortlist a second time; the cap still holds
-    blended = pipeline.evaluate(prepared, cfg, {cid: {"ok": True, "score": 0.5} for cid in ids})
-    assert blended.llm_results
-    for c in (rules_only, blended.candidates):
-        assert int(c[S.STATUS].isin(scoring.IN_SHORTLIST).sum()) == 5
-        assert int((c[S.STATUS].isin(scoring.IN_SHORTLIST) & (c[S.COLLEGE] == "A")).sum()) == 2
-        assert c[S.COLLEGE_CAPPED].any() and set(c.loc[c[S.COLLEGE_CAPPED], S.COLLEGE]) == {"A"}
+    first = pipeline.evaluate(prepared, cfg)
+    c = first.candidates
+    assert capped(c) == ["C02", "C03", "C04"]
+    assert first.llm_results == {}
+    assert int(c[S.STATUS].isin(scoring.IN_SHORTLIST).sum()) == 5
+    assert int((c[S.STATUS].isin(scoring.IN_SHORTLIST) & (c[S.COLLEGE] == "A")).sum()) == 2
+    assert c[S.COLLEGE_CAPPED].any() and set(c.loc[c[S.COLLEGE_CAPPED], S.COLLEGE]) == {"A"}
+    # re-evaluating with the same config (e.g. reusing the risk result) is deterministic
+    again = pipeline.evaluate(prepared, cfg, risk_result=first.risk).candidates
+    pd.testing.assert_frame_equal(again, c)

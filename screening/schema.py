@@ -47,6 +47,16 @@ PROCTORING_FLAGS = "proctoring_flags"        # webcam / AI proctor notes ("Multi
 REPORT_URL = "report_url"
 PLAGIARISM_MATCH_ID = "plagiarism_match_id"  # derived: plagiarism_match resolved to a candidate_id
 IP_ADDRESSES = "ip_addresses"                # derived: full IP list when the export lists several
+# Workday assessment export fields
+JOB_APPLICATION = "job_application"          # "First Last (first last)" - name fallback when no Name column
+ASSESSMENT_COMMENT = "assessment_comment"    # composite: status + "Integrity Issues:" + "Integrity Summary:"
+CANDIDATE_OPTION = "candidate_option"        # language track, e.g. "Django (Python)"
+CUTOFF_SCORE = "cutoff_score"                # pass mark in points (campaign constant)
+CUTOFF_PCT = "cutoff_pct"                    # pass mark in percent
+
+# Integrity statuses that count as a concern (lower-case). Workday severities Medium/High
+# and HackerRank AI-proctoring Review/Suspicious all qualify; "Clear" does not.
+INTEGRITY_CONCERN_VALUES = frozenset({"review", "suspicious", "flagged", "medium", "high"})
 
 # Per-question columns are dynamic: q1_hash, q1_score, q1_similarity, ...
 ANSWER_HASH_TEMPLATE = "q{n}_hash"
@@ -125,9 +135,6 @@ LLM_RATIONALE = "llm_rationale"        # str ("" when not used)
 SCORE_NOTES = "score_notes"            # "; "-joined notes (e.g. "no resume")
 
 EXP_HEURISTIC = "heuristic"
-EXP_LLM = "llm"
-EXP_HYBRID = "hybrid"
-EXP_LLM_FALLBACK = "heuristic (llm failed)"
 EXP_NO_RESUME = "no resume"
 
 # ---------------------------------------------------------------------------
@@ -138,6 +145,22 @@ RANK = "rank"                  # 1..N among eligible candidates (NaN if ineligib
 STATUS = "status"
 STATUS_REASON = "status_reason"
 COLLEGE_CAPPED = "college_capped"  # bool: would have been shortlisted but the college cap was reached
+INELIGIBILITY = "ineligibility"    # JSON list of {"rule_violated","candidate_value","threshold_value","explanation"}
+TIE_BREAK_NOTE = "tie_break_note"  # "tied at 91.20 pts; won tie-break on HackerRank percentage 100% vs 95%"
+CGPA_SOURCE = "cgpa_source"        # "feed" | "resume" | ""
+TIER_SOURCE = "tier_source"        # "feed" | "tier list" | "" (tier used for scoring)
+DUPLICATE_OF = "duplicate_of"      # primary candidate_id when this row is a duplicate application
+DUPLICATE_IDS = "duplicate_ids"    # on the primary: ", "-joined duplicate candidate_ids
+DUPLICATE_EVIDENCE = "duplicate_evidence"  # why the rows were judged the same person
+INJECTION_FLAGS = "injection_flags"  # " | "-joined summaries of hidden / adversarial resume text
+
+# Ineligibility rule keys (INELIGIBILITY "rule_violated")
+RULE_NO_SCORE = "Assessment"
+RULE_MIN_SCORE = "Score Threshold"
+RULE_MIN_CGPA = "Academic CGPA"
+RULE_GRAD_YEAR = "Graduation Year"
+RULE_EXCLUDED = "Administrative Exclusion"
+RULE_DUPLICATE = "Duplicate Application"
 
 STATUS_SHORTLISTED = "Shortlisted"
 STATUS_REVIEW = "Shortlisted (Integrity Review)"
@@ -287,6 +310,12 @@ TA_FIELD_ALIASES: dict[str, list[str]] = {
         "proctoringviolations", "aiproctoringflags", "suspiciousactivity",
     ],
     REPORT_URL: ["detailedreporturl", "reporturl", "reportlink", "candidatereport", "pdfurl", "report"],
+    JOB_APPLICATION: ["jobapplication", "application", "jobapplicationname", "applicant"],
+    ASSESSMENT_COMMENT: ["assessmentcomment", "assessmentcomments", "comment", "comments", "feedbackcomments",
+                         "integrityissues", "integritysummary"],
+    CANDIDATE_OPTION: ["candidateoption", "languagetrack", "track", "techstack", "codinglanguage", "language"],
+    CUTOFF_SCORE: ["cutoffscore", "cutoff", "passmark", "passingscore", "qualifyingscore"],
+    CUTOFF_PCT: ["cutoffscorepercentage", "cutoffpercentage", "cutoffpct", "passpercentage"],
 }
 
 # Human-friendly labels for the UI (canonical -> label)
@@ -324,6 +353,36 @@ TA_FIELD_LABELS: dict[str, str] = {
     INTEGRITY_STATUS: "Integrity Status",
     PROCTORING_FLAGS: "Proctoring Flags",
     REPORT_URL: "Report URL",
+    JOB_APPLICATION: "Job Application",
+    ASSESSMENT_COMMENT: "Assessment Comment",
+    CANDIDATE_OPTION: "Candidate Option",
+    CUTOFF_SCORE: "Cutoff Score",
+    CUTOFF_PCT: "Cutoff Score %",
+}
+
+# Where each value comes from (shown as grouped/prefixed columns in the UI and exports).
+SRC_ASSESSMENT = "Assessment"   # HackerRank / assessment export (verified test telemetry)
+SRC_RESUME = "Resume"           # parsed from the candidate's CV (self-reported)
+SRC_ACADEMIC = "Academic"       # academic profile (feed, reconciled with the resume)
+SRC_INTEGRITY = "Integrity"     # integrity engine output
+COLUMN_SOURCE: dict[str, str] = {
+    **{c: SRC_ASSESSMENT for c in (
+        HR_SCORE, MAX_SCORE, HR_PCT, PTS_HR, SUB_HR, TEST_NAME, TEST_STATUS, TEST_START, SUBMISSION_TIME,
+        COMPLETION_MIN, CUTOFF_SCORE, CUTOFF_PCT, CANDIDATE_OPTION, INTEGRITY_STATUS, PROCTORING_FLAGS,
+        PLAGIARISM_FLAG, MAX_CODE_SIMILARITY, TAB_SWITCHES, COPY_PASTE, OUT_OF_WINDOW_SEC,
+        SECURE_MODE_EXITS, IP_ADDRESS, TEST_MODE, ASSESSMENT_COMMENT, IP_SUBNET, IP_ADDRESSES,
+        PLAGIARISM_MATCH, PLAGIARISM_MATCH_ID, REPORT_URL)},
+    **{c: SRC_RESUME for c in (
+        SKILLS_FOUND, MATCHED_SKILLS, MISSING_SKILLS, N_MATCHED_SKILLS, PTS_SKILLS, SUB_SKILLS,
+        PTS_EXPERIENCE, SUB_EXPERIENCE, INTERNSHIP_COUNT, EXPERIENCE_MONTHS, PROJECT_COUNT,
+        CERTIFICATIONS, CERT_COUNT, RELEVANCE, RESUME_DEGREE, RESUME_CGPA, HAS_RESUME, RESUME_FILE,
+        RESUME_HASH, MATCH_METHOD, MATCH_CONFIDENCE, EXPERIENCE_SOURCE)},
+    **{c: SRC_ACADEMIC for c in (
+        COLLEGE, COLLEGE_TIER, TIER_SOURCE, DEGREE, BRANCH, GRAD_YEAR, CGPA, CGPA_SOURCE, PTS_EDUCATION,
+        SUB_EDUCATION)},
+    **{c: SRC_INTEGRITY for c in (
+        RISK_LEVEL, RISK_SCORE, RISK_REASONS, CLUSTER_ID, IS_FOCUS, N_LINKS, MAX_PAIR_SCORE,
+        INDIVIDUAL_SCORE, INJECTION_FLAGS, DUPLICATE_OF, DUPLICATE_IDS, DUPLICATE_EVIDENCE)},
 }
 
 # Fields that must be mappable for scoring to work. Identity: at least one of
@@ -358,6 +417,7 @@ COMMONALITY_ATTRIBUTES: dict[str, str] = {
 }
 
 TEST_SLOT = "test_slot"  # derived at ingest: test_start_time floored to the hour
+COLUMN_SOURCE[TEST_SLOT] = SRC_ASSESSMENT
 
 
 def normalize_header(header: object) -> str:

@@ -1,9 +1,10 @@
 """Run History tab: save the current screening, reopen, rename, delete and compare saved runs.
 
 Saved runs live on the server (screening/runs.py, JSON + Parquet only). Opening one restores the
-prepared data, results, configuration and LLM outputs, so it can be reviewed or re-tuned without
-the original files. The tab also renders before the first screening, so a saved run can be opened
-directly.
+prepared data, results, configuration and LLM outputs (executive brief, candidate explanations,
+borderline explanations, cluster summaries), so it can be reviewed or re-tuned without the
+original files. LLM outputs are text only: they never changed scores, ranks or the shortlist. The
+tab also renders before the first screening, so a saved run can be opened directly.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import streamlit as st
 
 from screening import runs
 from screening import schema as S
+from screening.config import AppConfig
 from screening.models import PipelineResult
 from screening.pipeline import PreparedData
 from ui import state, theme
@@ -36,13 +38,18 @@ K_CMP_A = "hist_cmp_a"
 K_CMP_B = "hist_cmp_b"
 K_CMP_CACHE = "_hist_cmp_cache"      # (key, comparison) of the last comparison shown
 K_ACTIVE = "_hist_active"            # saved run on screen: {"run_id", "label", "fp", "sig", "dataset"}
+K_LLM_INFO = "_hist_llm_info"        # run_id -> ((mtime_ns, size) of llm.json, summary text)
 SAVED_PREFIX = "Saved run: "
+LLM_FILE = "llm.json"                # written by RunStore.save next to meta.json
+LLM_COLUMN = "llm"                   # saved-runs table: what LLM text was saved with the run
+NO_LLM = "None"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RETENTION_NOTE = ("Saved runs contain candidate personal data (names, contact details, resume text and integrity "
                   "evidence); your data-retention policy applies. Delete runs you no longer need.")
 SECTION_LABELS = {"weights": "Rubric weights", "skills": "Skills", "experience": "Experience",
                   "education": "Education", "shortlist": "Shortlist", "risk": "Integrity risk", "llm": "LLM",
-                  "processing": "Processing"}
+                  "processing": "Processing", "snapshots": "Fast reload"}
+TIER_LIST_SETTING = "education.tier_mapping"   # one setting per college name once flattened
 DIFF_ORDER = {
     "entering": [S.CANDIDATE_ID, S.NAME, S.COLLEGE, "score_after", "rank_after", "status_after", "status_before",
                  "rank_before"],
@@ -88,12 +95,58 @@ def run_labels(saved: pd.DataFrame) -> dict[str, str]:
     return out
 
 
-def runs_view(saved: pd.DataFrame, active_id: str = "") -> pd.DataFrame:
-    """Saved-runs table for display (friendly mode names, 'open' marker)."""
+def runs_view(saved: pd.DataFrame, active_id: str = "", llm_info: dict[str, str] | None = None) -> pd.DataFrame:
+    """Saved-runs table for display (friendly mode names, 'open' marker and, with ``llm_info``
+    (run_id -> llm_summary text), which LLM outputs each run kept)."""
     view = saved.assign(mode=saved["mode"].map(lambda m: state.MODE_LABELS.get(m, m)),
                         open=saved["run_id"] == active_id)
-    order = ["open", "label", "created_at", "dataset", "mode", *runs.COUNT_KEYS, "size_mb", "run_id"]
+    if llm_info is not None:
+        view[LLM_COLUMN] = [llm_info.get(str(r)) or NO_LLM for r in view["run_id"]]
+    order = ["open", "label", "created_at", "dataset", "mode", *runs.COUNT_KEYS, LLM_COLUMN, "size_mb", "run_id"]
     return view[[c for c in order if c in view.columns]].reset_index(drop=True)
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n:,} {one if n == 1 else many}"
+
+
+def _useful(value: Any) -> bool:
+    """An LLM output worth counting: a dict that is not a recorded failure."""
+    return isinstance(value, dict) and bool(value) and value.get("ok", True) is not False
+
+
+def llm_summary(llm: Any) -> str:
+    """What a saved LLM state holds, e.g. 'brief · 12 explanations · 5 borderline · 2 cluster summaries'
+    ('' when nothing was saved). Failed items are not counted; keys from older app versions are ignored."""
+    data = _normalized_llm(llm)
+    parts = []
+    if _useful(data.get("executive")):
+        parts.append("brief")
+    explain = sum(_useful(v) for v in _as_dict(data.get("explain")).values())
+    borderline = sum(_useful(v) for v in _as_dict(data.get("borderline")).values())
+    clusters = sum(_useful(v) for v in _as_dict(data.get("clusters")).values())
+    if explain:
+        parts.append(_plural(explain, "explanation", "explanations"))
+    if borderline:
+        parts.append(f"{borderline:,} borderline")
+    if clusters:
+        parts.append(_plural(clusters, "cluster summary", "cluster summaries"))
+    return " · ".join(parts)
+
+
+def _normalized_llm(llm: Any) -> dict[str, Any]:
+    """runs.normalize_llm_state: executive, explain, borderline and clusters (legacy keys dropped)."""
+    normalize = state.engine_fn(runs, "normalize_llm_state")
+    if normalize is not None:
+        try:
+            return dict(normalize(llm))
+        except Exception:  # noqa: BLE001 - fall back to the plain shape below
+            pass
+    source = llm if isinstance(llm, dict) else {}
+    out = {key: _as_dict(source.get(key)) for key in ("explain", "borderline", "clusters")}
+    executive = source.get("executive")
+    out["executive"] = dict(executive) if isinstance(executive, dict) and executive else None
+    return out
 
 
 def format_value(value: Any, limit: int = 140) -> str:
@@ -119,6 +172,35 @@ def setting_label(key: str) -> str:
     parts = key.split(".")
     head = SECTION_LABELS.get(parts[0], parts[0].replace("_", " ").capitalize())
     return " › ".join([head, *(p.replace("_", " ") for p in parts[1:])])
+
+
+def _tier_list_size(meta: Any) -> int:
+    education = _as_dict(_as_dict(_as_dict(meta).get("config")).get("education"))
+    return len(_as_dict(education.get("tier_mapping")))
+
+
+def _names(count: int) -> str:
+    return "(none)" if not count else f"{count:,} college name{'s' if count != 1 else ''}"
+
+
+def fold_tier_list_changes(changes: list[tuple[str, Any, Any]], meta_a: Any = None,
+                           meta_b: Any = None) -> list[tuple[str, Any, Any]]:
+    """One summary row instead of a row per college when the runs' tier lists differ
+    (runs.config_changes flattens education.tier_mapping into one setting per name)."""
+    kept: list[tuple[str, Any, Any]] = []
+    differ, found = 0, False
+    for key, before, after in changes:
+        name = str(key)
+        if name == TIER_LIST_SETTING or name.startswith(f"{TIER_LIST_SETTING}."):
+            found = True
+            differ += name != TIER_LIST_SETTING
+            continue
+        kept.append((key, before, after))
+    if found:
+        size_a, size_b = _tier_list_size(meta_a), _tier_list_size(meta_b)
+        detail = f" ({differ:,} differ)" if differ and size_a and size_b else ""
+        kept.append((TIER_LIST_SETTING, _names(size_a), f"{_names(size_b)}{detail}"))
+    return kept
 
 
 def config_changes_frame(changes: list[tuple[str, Any, Any]]) -> pd.DataFrame:
@@ -160,16 +242,16 @@ def _reason(exc: BaseException) -> str:
 # Session helpers
 # ---------------------------------------------------------------------------
 def llm_state() -> dict[str, Any]:
-    """The session's LLM outputs, in the shape RunStore.save expects."""
+    """The session's LLM outputs, in the shape RunStore.save expects and RunStore.load returns:
+    {"executive": dict | None, "explain": {...}, "borderline": {...}, "clusters": {...}}."""
     ss = st.session_state
-    executive = ss.get(state.K_LLM_EXEC)
-    return {"rescore": _as_dict(ss.get(state.K_LLM_RESCORE)), "explain": _as_dict(ss.get(state.K_LLM_EXPLAIN)),
-            "clusters": _as_dict(ss.get(state.K_LLM_CLUSTERS)),
-            "executive": dict(executive) if isinstance(executive, dict) else None}
+    return _normalized_llm({"executive": ss.get(state.K_LLM_EXEC), "explain": ss.get(state.K_LLM_EXPLAIN),
+                            "borderline": ss.get(state.K_LLM_BORDERLINE), "clusters": ss.get(state.K_LLM_CLUSTERS)})
 
 
 def _signature(llm: dict[str, Any]) -> str:
-    """Fingerprint of what a save would capture: evaluated result (config + re-scores) and LLM outputs."""
+    """Fingerprint of what a save would capture: the evaluated result (data + config) and the four
+    LLM output stores (executive brief, explanations, borderline explanations, cluster summaries)."""
     try:
         payload = json.dumps([st.session_state.get(state.K_RESULT_KEY), llm], sort_keys=True, default=str)
     except TypeError:  # non-string keys cannot be sorted
@@ -201,20 +283,21 @@ def _dataset_label(active: dict[str, Any] | None) -> str:
 
 def apply_loaded_run(run_id: str, prepared: PreparedData, result: PipelineResult, llm: dict[str, Any],
                      meta: dict[str, Any]) -> None:
-    """Make a loaded run the session's current screening (no re-evaluation needed)."""
+    """Make a loaded run the session's current screening (no re-evaluation needed) and restore its
+    LLM outputs: executive brief, explanations, borderline explanations and cluster summaries."""
     ss = st.session_state
-    cfg = result.config
+    cfg = result.config if isinstance(result.config, AppConfig) else AppConfig()
     fp = f"run:{run_id}"
-    rescore = _as_dict(llm.get("rescore"))
+    restored = _normalized_llm(llm)
     state.set_config(cfg)
     ss[state.K_PREPARED] = prepared
     ss[state.K_PREPARED_FP] = fp
     ss[state.K_RESULT] = result
-    ss[state.K_RESULT_KEY] = state.eval_key(fp, cfg, rescore or None)
-    ss[state.K_LLM_RESCORE] = rescore
-    ss[state.K_LLM_EXPLAIN] = _as_dict(llm.get("explain"))
-    ss[state.K_LLM_CLUSTERS] = _as_dict(llm.get("clusters"))
-    executive = llm.get("executive")
+    ss[state.K_RESULT_KEY] = state.eval_key(fp, cfg)
+    ss[state.K_LLM_EXPLAIN] = _as_dict(restored.get("explain"))
+    ss[state.K_LLM_BORDERLINE] = _as_dict(restored.get("borderline"))
+    ss[state.K_LLM_CLUSTERS] = _as_dict(restored.get("clusters"))
+    executive = restored.get("executive")
     if isinstance(executive, dict) and executive:
         ss[state.K_LLM_EXEC] = dict(executive)
     else:
@@ -292,6 +375,10 @@ def _save_section(store: runs.RunStore, result: PipelineResult | None, active: d
                         disabled=blocker is not None)
     if blocker and not unchanged:
         st.caption(blocker)
+    if result is not None and prepared is not None:
+        kept = llm_summary(llm)
+        st.caption(f"Saving keeps this session's LLM outputs: {kept}." if kept else
+                   "No LLM outputs in this session yet; the run is saved without them.")
     st.caption(f"{storage_note(store.base_dir)} {RETENTION_NOTE}")
     if clicked and blocker is None and prepared is not None and result is not None:
         _save(store, prepared, result, label, llm, active)
@@ -341,9 +428,45 @@ def _runs_config() -> dict[str, Any]:
         "dataset": cc.TextColumn("Dataset"),
         "mode": cc.TextColumn("Inputs"),
         **{k: cc.NumberColumn(v, format="%d") for k, v in counts.items()},
+        LLM_COLUMN: cc.TextColumn("LLM outputs", width="medium",
+                                  help="LLM text saved with the run (executive brief, candidate and borderline "
+                                       "explanations, cluster summaries); restored when the run is loaded. The LLM "
+                                       "never changed scores, ranks or the shortlist."),
         "size_mb": cc.NumberColumn("Size (MB)", format="%.2f"),
         "run_id": cc.TextColumn("Run ID"),
     }
+
+
+def saved_llm_summaries(store: runs.RunStore, run_ids: list[str]) -> dict[str, str]:
+    """run_id -> llm_summary of the run's saved LLM outputs ('' = none, 'unreadable' = damaged file).
+
+    Reads each run's llm.json once per change of the file (cached in the session)."""
+    ss = st.session_state
+    cache = ss.get(K_LLM_INFO) if isinstance(ss.get(K_LLM_INFO), dict) else {}
+    out: dict[str, str] = {}
+    for run_id in run_ids:
+        if not runs.RUN_ID_RE.match(str(run_id)):
+            continue
+        path = Path(store.base_dir) / str(run_id) / LLM_FILE
+        try:
+            info = path.stat()
+        except OSError:
+            out[run_id] = ""  # no llm.json: nothing was saved
+            continue
+        stamp = (info.st_mtime_ns, info.st_size)
+        hit = cache.get(run_id)
+        if isinstance(hit, tuple) and len(hit) == 2 and hit[0] == stamp:
+            out[run_id] = str(hit[1])
+            continue
+        try:
+            doc = runs.read_json(path)
+            summary = llm_summary(doc.get("state") if isinstance(doc, dict) else None)
+        except Exception:  # noqa: BLE001 - a damaged file only hides this summary
+            summary = "unreadable"
+        cache[run_id] = (stamp, summary)
+        out[run_id] = summary
+    ss[K_LLM_INFO] = {k: v for k, v in cache.items() if k in out}
+    return out
 
 
 def _saved_runs_section(store: runs.RunStore, saved: pd.DataFrame, active: dict[str, Any] | None) -> None:
@@ -357,8 +480,13 @@ def _saved_runs_section(store: runs.RunStore, saved: pd.DataFrame, active: dict[
     labels = run_labels(saved)
     active_id = str((active or {}).get("run_id", ""))
     ss[K_TABLE_IDS] = ids
-    st.dataframe(runs_view(saved, active_id), key=K_TABLE, on_select=_on_table_pick, selection_mode="single-row",
-                 hide_index=True, width="stretch", column_config=_runs_config(),
+    try:
+        llm_info: dict[str, str] | None = saved_llm_summaries(store, ids)
+    except Exception as exc:  # noqa: BLE001 - the column is informative only
+        log.warning("Reading saved LLM outputs failed (%s)", type(exc).__name__)
+        llm_info = None
+    st.dataframe(runs_view(saved, active_id, llm_info), key=K_TABLE, on_select=_on_table_pick,
+                 selection_mode="single-row", hide_index=True, width="stretch", column_config=_runs_config(),
                  height=min(420, 42 + 35 * len(saved)))
     if ss.get(K_PICK) not in ids:
         ss[K_PICK] = active_id if active_id in ids else ids[0]
@@ -383,8 +511,9 @@ def _load(store: runs.RunStore, run_id: str) -> None:
     apply_loaded_run(run_id, prepared, result, llm, meta)
     st.session_state.pop(K_CMP_CACHE, None)
     name = theme.md_escape(runs.clean_label(meta.get("label"), run_id))
-    state.queue_message(f"Opened saved run '{name}' ({len(result.candidates):,} candidates).",
-                        icon=":material/history:")
+    kept = llm_summary(llm)
+    state.queue_message(f"Opened saved run '{name}' ({len(result.candidates):,} candidates"
+                        + (f"; LLM outputs restored: {kept})." if kept else ")."), icon=":material/history:")
     st.rerun()
 
 
@@ -561,7 +690,7 @@ def render_comparison(comparison: dict[str, Any]) -> None:
                 _diff_table(frame, kind, key=f"hist_cmp_{kind}")
 
     st.markdown("##### Configuration changes")
-    changes = comparison.get("config_changes") or []
+    changes = fold_tier_list_changes(list(comparison.get("config_changes") or []), meta_a, meta_b)
     if not changes:
         st.caption("Both runs used the same configuration.")
         return

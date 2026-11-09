@@ -126,6 +126,28 @@ def md_escape(value: object) -> str:
     return _MD_SPECIAL.sub(r"\\\1", "" if value is None else str(value))
 
 
+_URL_TEXT = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"'`]+")
+_URL_TRAILING = ".,;:!?)]}'\""
+
+
+def md_text(value: object) -> str:
+    """Plain text (e.g. an error message) for ``st.markdown`` / ``st.caption``.
+
+    Markdown control characters are escaped and URLs are shown as code, so nothing in the text
+    becomes a link, an image or formatting.
+    """
+    text = "" if value is None else str(value)
+    parts: list[str] = []
+    pos = 0
+    for match in _URL_TEXT.finditer(text):
+        url = match.group(0).rstrip(_URL_TRAILING)
+        parts.append(md_escape(text[pos:match.start()]))
+        parts.append(f"`{url}`")
+        pos = match.start() + len(url)
+    parts.append(md_escape(text[pos:]))
+    return "".join(parts)
+
+
 # Link text / image alt: escapes, soft line breaks and one level of nested brackets.
 _MD_TEXT = r"(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n)|\[[^\[\]\n]*\])*"
 _MD_DEST = r"(?:\\[\s\S]|[^()\\\n]|\([^()\n]*\))*"   # destination and title: one level of nested parentheses
@@ -248,18 +270,24 @@ def render_empty_state(sample_available: bool) -> bool:
     """Getting-started panel. Returns True when the sample run button is clicked."""
     st.html(
         '<div class="wf-card"><h3 style="margin:0 0 6px">Welcome — let\'s screen a hiring drive</h3>'
-        '<div class="wf-muted">Fuse the TA / HackerRank export with bulk resumes, score every '
-        "candidate on the weighted rubric, shortlist the top N and surface integrity patterns "
+        '<div class="wf-muted">Fuse the Workday / HackerRank assessment export with bulk resumes, score '
+        "every candidate on the weighted rubric, shortlist the top N and surface integrity patterns "
         "among perfect scorers.</div><ol style='margin:12px 0 0 18px;color:#333'>"
         "<li><b>Set up the rubric</b> in the <i>Config &amp; Rubric Tuning</i> tab next to this one: "
-        "job description, required skills, weights, shortlist size and integrity policy. Defaults: "
-        "HackerRank 40 / Skills 30 / Experience 20 / Education 10, top 300). You can also "
-        "change them after the run; scores update in under a second.</li>"
-        "<li><b>Choose a data source</b> in the sidebar: the synthetic sample, or upload a TA feed "
-        "(CSV/XLSX) plus resumes (PDF/DOCX/TXT or a ZIP).</li>"
-        "<li><b>Run screening</b> to parse, match, score and analyse.</li>"
+        "job description, required skills, weights, shortlist size and integrity policy (defaults: "
+        "HackerRank 40 / Skills 30 / Experience 20 / Education 10, top 300; without resumes use the "
+        "80 / 0 / 0 / 20 preset). You can also change them after the run; scores update in under a "
+        "second.</li>"
+        "<li><b>Choose a data source</b> in the sidebar: the synthetic sample, or upload the Workday "
+        "assessment export (.xlsx - the data sheet is found automatically) or a HackerRank CSV/XLSX, "
+        "plus Resume.zip (multi-candidate PDF packets are split per candidate) or individual "
+        "PDF/DOCX/TXT resumes.</li>"
+        "<li><b>Run screening</b> to parse, match, score and analyse. Parsed data is cached, so "
+        "<i>Recent datasets</i> in the sidebar reloads a drive in about a second.</li>"
         "<li><b>Review</b> the shortlist, integrity evidence and individual profiles, then export.</li>"
-        "</ol></div>"
+        "</ol><div class='wf-muted' style='margin-top:10px'>Optional: with VS Code running the "
+        "Screening Copilot Proxy extension, GitHub Copilot drafts candidate explanations and summaries. "
+        "The LLM only writes text - it never changes scores, ranks, cutoffs or the shortlist.</div></div>"
     )
     st.space("small")
     clicked = st.button("Load synthetic sample & run", type="primary", icon=":material/rocket_launch:",

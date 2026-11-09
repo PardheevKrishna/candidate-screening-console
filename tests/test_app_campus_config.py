@@ -1,7 +1,8 @@
 """UI tests (AppTest): Campus Distribution tab, college cap setting and the Config what-if preview.
 
 The engine is faked with tests/ui_fixtures.py; previews re-run the real scoring.apply_shortlist on
-the fake candidates so the shortlist differences are genuine. No network or API key is used.
+the fake candidates so the shortlist differences are genuine. No network or proxy token is used;
+the dataset cache and saved runs live under a pytest tmp folder.
 """
 from __future__ import annotations
 
@@ -14,7 +15,8 @@ import plotly.graph_objects as go
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from screening import analytics, export, pipeline, scoring
+from screening import analytics, export, pipeline, runs, scoring, snapshots
+from screening import llm_backends as backends
 from screening import schema as S
 from screening.config import AppConfig
 from screening.models import DataQualityReport, PipelineResult, RiskResult
@@ -40,8 +42,11 @@ def _patch(monkeypatch: pytest.MonkeyPatch, module: Any, name: str, value: Any) 
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv(KEY_ENV, raising=False)
+    monkeypatch.setenv(runs.ENV_RUNS_DIR, str(tmp_path / "runs"))
     _patch(monkeypatch, pipeline, "DEFAULT_SAMPLE_DIR", tmp_path / "no-sample")
-    _patch(monkeypatch, export, "to_csv_bytes", lambda df: df.to_csv(index=False).encode("utf-8-sig"))
+    _patch(monkeypatch, export, "to_csv_bytes", lambda df, **kwargs: df.to_csv(index=False).encode("utf-8-sig"))
+    _patch(monkeypatch, backends, "discover_proxy", lambda *args, **kwargs: None)  # no real connection file
+    _patch(monkeypatch, snapshots, "PROJECT_ROOT", tmp_path)                        # dataset cache under tmp_path
 
 
 def _scored(cap_pct: float = 0.0) -> tuple[Any, PipelineResult]:
@@ -58,8 +63,8 @@ def engine(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     prepared, result = _scored()
     calls: list[dict[str, Any]] = []
 
-    def evaluate(prep, cfg, llm_results=None, *, risk_result=None):
-        calls.append({"cfg": cfg, "llm": llm_results, "risk_reused": risk_result is not None})
+    def evaluate(prep, cfg, *, risk_result=None):
+        calls.append({"cfg": cfg, "risk_reused": risk_result is not None})
         return replace(result, candidates=scoring.apply_shortlist(result.candidates, cfg), config=cfg)
 
     _patch(monkeypatch, pipeline, "evaluate", evaluate)
@@ -77,7 +82,7 @@ def _inject(at: AppTest, prepared: Any, result: PipelineResult, tab: str | None 
     at.session_state[state.K_PREPARED] = prepared
     at.session_state[state.K_PREPARED_FP] = FP
     at.session_state[state.K_RESULT] = result
-    at.session_state[state.K_RESULT_KEY] = state.eval_key(FP, result.config, None)
+    at.session_state[state.K_RESULT_KEY] = state.eval_key(FP, result.config)
     at.session_state[state.K_DATASET] = "Fake dataset"
     if tab:
         at.session_state[state.K_TABS] = tab
@@ -232,6 +237,9 @@ def test_preview_shows_the_diff_and_apply_uses_it(engine: dict[str, Any]) -> Non
     metrics = _metrics(at)
     assert (metrics["Shortlisted"], metrics["Entering"], metrics["Leaving"]) == ("10", "0", "5")
     assert next(m for m in at.metric if m.label == "Shortlisted").delta == "-5"
+    ineligible = int((engine["result"].candidates[S.STATUS] == S.STATUS_INELIGIBLE).sum())
+    assert ineligible and metrics["Ineligible"] == str(ineligible)          # a top-N change keeps eligibility
+    assert not any(c.value.startswith("Ineligible by rule") for c in at.caption)
     assert {"Entering (0)", "Leaving (5)", "Status changes (5)", "Biggest rank moves"} <= {t.label for t in at.tabs}
     expected = analytics.shortlist_diff(engine["result"].candidates, scoring.apply_shortlist(
         engine["result"].candidates, engine["calls"][0]["cfg"]))["leaving"][S.CANDIDATE_ID].tolist()
@@ -285,7 +293,7 @@ def test_preview_is_dropped_when_the_config_changes_elsewhere(engine: dict[str, 
 
 
 def test_preview_failure_is_reported_not_raised(engine: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
-    def broken(prep, cfg, llm_results=None, *, risk_result=None):
+    def broken(prep, cfg, *, risk_result=None):
         raise RuntimeError("scoring backend unavailable")
 
     _patch(monkeypatch, pipeline, "evaluate", broken)

@@ -6,6 +6,7 @@ they are listed in ENABLED_FEATURE_TABS, so these tests run app.py with the Run 
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,8 @@ import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from screening import pipeline, runs
+from screening import pipeline, runs, snapshots
+from screening import llm_backends as backends
 from screening import schema as S
 from screening.config import AppConfig
 from screening.models import PipelineResult
@@ -44,6 +46,8 @@ def runs_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv(runs.ENV_RUNS_DIR, str(folder))
     monkeypatch.delenv(KEY_ENV, raising=False)
     monkeypatch.setitem(vars(pipeline), "DEFAULT_SAMPLE_DIR", tmp_path / "no-sample")
+    monkeypatch.setitem(vars(backends), "discover_proxy", lambda *args, **kwargs: None)  # no real connection file
+    monkeypatch.setitem(vars(snapshots), "PROJECT_ROOT", tmp_path)                        # dataset cache under tmp
     return folder
 
 
@@ -52,9 +56,9 @@ def evaluate_calls(monkeypatch: pytest.MonkeyPatch) -> list[AppConfig]:
     """Real pipeline.evaluate, recording each call."""
     real, calls = pipeline.evaluate, []
 
-    def recording(prepared: Any, cfg: AppConfig, llm_results: Any = None, *, risk_result: Any = None) -> Any:
+    def recording(prepared: Any, cfg: AppConfig, *, risk_result: Any = None) -> Any:
         calls.append(cfg)
-        return real(prepared, cfg, llm_results, risk_result=risk_result)
+        return real(prepared, cfg, risk_result=risk_result)
 
     monkeypatch.setitem(vars(pipeline), "evaluate", recording)
     return calls
@@ -71,7 +75,7 @@ def _inject(at: AppTest, prepared: Any, result: PipelineResult, tab: str | None 
     at.session_state[state.K_PREPARED] = prepared
     at.session_state[state.K_PREPARED_FP] = FP
     at.session_state[state.K_RESULT] = result
-    at.session_state[state.K_RESULT_KEY] = state.eval_key(FP, result.config, None)
+    at.session_state[state.K_RESULT_KEY] = state.eval_key(FP, result.config)
     at.session_state[state.K_DATASET] = "Fake dataset"
     if tab:
         at.session_state[state.K_TABS] = tab
@@ -98,15 +102,31 @@ def test_history_tab_before_first_run_with_no_saved_runs(runs_dir: Path) -> None
     assert not runs_dir.exists()  # rendering never creates the runs folder
 
 
+EXPLANATION = {"ok": True, "focus": "qualified", "summary": "Strong problem solver.", "strengths": ["DSA"],
+               "gaps": [], "interview_questions": [], "integrity_questions": [], "source": "llm", "error": ""}
+GAPS = {"ok": True, "focus": "gaps", "summary": "Just below the cutoff.", "strengths": [], "gaps": ["No internship"],
+        "interview_questions": [], "integrity_questions": [], "source": "llm", "error": ""}
+CLUSTER = {"ok": True, "summary": "Shared answers and one IP - verify with the candidates.", "error": ""}
+EXECUTIVE = {"ok": True, "markdown": "## Drive summary\nSixty candidates screened.", "error": ""}
+
+
+def _llm_outputs(at: AppTest) -> None:
+    """Fill the four LLM stores of a session (text only: nothing here changes a score)."""
+    at.session_state[state.K_LLM_EXPLAIN] = {"CAND-00003": EXPLANATION}
+    at.session_state[state.K_LLM_BORDERLINE] = {"CAND-00021": GAPS, "CAND-00022": {"ok": False, "error": "timeout"}}
+    at.session_state[state.K_LLM_CLUSTERS] = {"C01": CLUSTER}
+    at.session_state[state.K_LLM_EXEC] = EXECUTIVE
+
+
 def test_save_then_load_in_a_new_session(runs_dir: Path, evaluate_calls: list[AppConfig]) -> None:
     prepared, result = make_fake_prepared_and_result()
-    explanation = {"ok": True, "summary": "Strong problem solver.", "strengths": ["DSA"], "gaps": [],
-                   "interview_questions": [], "integrity_questions": [], "error": ""}
     at = _inject(_app(), prepared, result, state.TAB_HISTORY)
-    at.session_state[state.K_LLM_EXPLAIN] = {"CAND-00003": explanation}
+    _llm_outputs(at)
     at.run()
     _clean(at)
     assert not at.button(key="hist_save").disabled
+    assert any("Saving keeps this session's LLM outputs: brief · 1 explanation · 1 borderline · 1 cluster summary"
+               in c.value for c in at.caption)
     at.text_input(key=tab_history.K_LABEL).set_value("North campus drive")
     at.button(key="hist_save").click().run()
     _clean(at)
@@ -116,6 +136,10 @@ def test_save_then_load_in_a_new_session(runs_dir: Path, evaluate_calls: list[Ap
     assert at.session_state[state.K_LOADED_RUN] == run_id
     assert at.button(key="hist_save").disabled  # nothing changed since saving
     assert any("Saved run" in t.value for t in at.toast)
+    saved_llm = runs.read_json(runs_dir / run_id / tab_history.LLM_FILE)["state"]
+    assert set(saved_llm) == {"executive", "explain", "borderline", "clusters"}
+    table = next(d.value for d in at.dataframe if tab_history.LLM_COLUMN in d.value.columns)
+    assert table[tab_history.LLM_COLUMN].tolist() == ["brief · 1 explanation · 1 borderline · 1 cluster summary"]
 
     fresh = _app().run()  # a new session, before any screening
     _clean(fresh)
@@ -127,13 +151,56 @@ def test_save_then_load_in_a_new_session(runs_dir: Path, evaluate_calls: list[Ap
     pd.testing.assert_frame_equal(loaded.candidates, result.candidates, check_dtype=False)
     assert ss[state.K_LOADED_RUN] == run_id and ss[state.K_PREPARED_FP] == f"run:{run_id}"
     assert ss[state.K_DATASET] == "Saved run: North campus drive"
-    assert ss[state.K_RESULT_KEY] == state.eval_key(f"run:{run_id}", loaded.config, None)
+    assert ss[state.K_RESULT_KEY] == state.eval_key(f"run:{run_id}", loaded.config)
     assert ss[state.K_CONFIG] == result.config
-    assert ss[state.K_LLM_EXPLAIN] == {"CAND-00003": explanation}
+    assert ss[state.K_LLM_EXPLAIN] == {"CAND-00003": EXPLANATION}
+    assert ss[state.K_LLM_BORDERLINE] == {"CAND-00021": GAPS, "CAND-00022": {"ok": False, "error": "timeout"}}
+    assert ss[state.K_LLM_CLUSTERS] == {"C01": CLUSTER} and ss[state.K_LLM_EXEC] == EXECUTIVE
     assert isinstance(ss[state.K_PREPARED], pipeline.PreparedData)
     assert evaluate_calls == []  # restored exactly as saved: nothing re-evaluated
     assert "Total Processed" in "\n".join(h.value for h in fresh.html)
-    assert any("Opened saved run" in t.value for t in fresh.toast)
+    assert any("Opened saved run" in t.value and "LLM outputs restored" in t.value for t in fresh.toast)
+
+
+def test_save_fingerprint_covers_every_llm_store(runs_dir: Path) -> None:
+    prepared, result = make_fake_prepared_and_result()
+    at = _inject(_app(), prepared, result, state.TAB_HISTORY).run()
+    at.button(key="hist_save").click().run()
+    _clean(at)
+    assert at.button(key="hist_save").disabled  # just saved
+    for key, value in ((state.K_LLM_EXPLAIN, {"CAND-00003": EXPLANATION}),
+                       (state.K_LLM_BORDERLINE, {"CAND-00021": GAPS}),
+                       (state.K_LLM_CLUSTERS, {"C01": CLUSTER}), (state.K_LLM_EXEC, EXECUTIVE)):
+        at.session_state[key] = value
+        at.run()
+        _clean(at)
+        assert not at.button(key="hist_save").disabled, key  # new LLM text -> a new version can be saved
+        at.button(key="hist_save").click().run()
+        _clean(at)
+        assert at.button(key="hist_save").disabled
+    assert len(runs.RunStore(runs_dir).list_runs()) == 5
+
+
+def test_runs_saved_by_older_versions_load_without_legacy_llm_keys(runs_dir: Path) -> None:
+    store = runs.RunStore(runs_dir)
+    prepared, result = make_fake_prepared_and_result()
+    plain = store.save(prepared, result, "Without LLM text")
+    legacy = store.save(prepared, result, "Older version", llm_state={"explain": {"CAND-00003": EXPLANATION}})
+    doc = runs.read_json(runs_dir / legacy / tab_history.LLM_FILE)
+    doc["state"]["rescore"] = {"CAND-00003": {"ok": True, "score": 0.9}}   # written by an older version
+    (runs_dir / legacy / tab_history.LLM_FILE).write_text(json.dumps(doc), encoding="utf-8")
+    at = _app().run()
+    _clean(at)
+    table = next(d.value for d in at.dataframe if tab_history.LLM_COLUMN in d.value.columns)
+    by_label = dict(zip(table["label"], table[tab_history.LLM_COLUMN]))
+    assert by_label == {"Without LLM text": "None", "Older version": "1 explanation"}
+    at.selectbox(key=tab_history.K_PICK).set_value(legacy).run()
+    at.button(key="hist_load").click().run()
+    _clean(at)
+    assert at.session_state[state.K_LLM_EXPLAIN] == {"CAND-00003": EXPLANATION}
+    assert at.session_state[state.K_LLM_BORDERLINE] == {} and state.K_LLM_EXEC not in at.session_state
+    assert not any("rescore" in str(key) for key in at.session_state.keys())
+    assert set(runs.RunStore(runs_dir).list_runs()["run_id"]) == {plain, legacy}
 
 
 def test_loaded_run_can_be_retuned_and_saved_as_new_run(runs_dir: Path, evaluate_calls: list[AppConfig]) -> None:
@@ -260,4 +327,39 @@ def test_pure_helpers(tmp_path: Path) -> None:
     assert tab_history.run_labels(saved) == {"20261105-101010-abcdef": "Drive · 05 Nov 2026 10:10"}
     view = tab_history.runs_view(saved, "20261105-101010-abcdef")
     assert view.loc[0, "open"] and view.loc[0, "mode"] == state.MODE_LABELS["ta+resumes"]
+    assert tab_history.LLM_COLUMN not in view.columns
+    with_llm = tab_history.runs_view(saved, "", {"20261105-101010-abcdef": ""})
+    assert with_llm.loc[0, tab_history.LLM_COLUMN] == tab_history.NO_LLM and not with_llm.loc[0, "open"]
     assert S.CANDIDATE_ID in tab_history.DIFF_ORDER["entering"]
+
+
+def test_tier_list_differences_fold_into_one_setting(runs_dir: Path) -> None:
+    store = runs.RunStore(runs_dir)
+    prepared, result = make_fake_prepared_and_result()
+    tiered = AppConfig.from_dict(result.config.to_dict())
+    tiered.education.tier_mapping = {f"example college {i}": str(1 + i % 3) for i in range(40)}
+    run_a = store.save(prepared, result, "No tier list")
+    run_b = store.save(prepared, pipeline.evaluate(prepared, tiered), "With tier list")
+    assert len(store.compare_runs(run_a, run_b)["config_changes"]) > 40      # one per college once flattened
+    at = _app().run()
+    _clean(at)
+    at.selectbox(key=tab_history.K_CMP_A).set_value(run_a)
+    at.selectbox(key=tab_history.K_CMP_B).set_value(run_b).run()
+    _clean(at)
+    changes = next(d.value for d in at.dataframe if "setting" in d.value.columns)
+    assert changes.to_dict("records") == [{"setting": "Education › tier mapping", "run_a": "(none)",
+                                           "run_b": "40 college names"}]
+    folded = tab_history.fold_tier_list_changes(
+        [("education.tier_mapping.a", "1", "2"), ("shortlist.top_n", 15, 10)],
+        {"config": {"education": {"tier_mapping": {"a": "1", "b": "2"}}}},
+        {"config": {"education": {"tier_mapping": {"a": "2", "b": "2"}}}})
+    assert folded == [("shortlist.top_n", 15, 10),
+                      ("education.tier_mapping", "2 college names", "2 college names (1 differ)")]
+
+
+def test_llm_summary_counts_saved_text_only() -> None:
+    assert tab_history.llm_summary(None) == "" and tab_history.llm_summary({"rescore": {"A-1": {}}}) == ""
+    state_ = {"executive": {"ok": False, "error": "timeout"}, "explain": {"A-1": EXPLANATION, "A-2": EXPLANATION},
+              "borderline": {"A-3": {"ok": False}}, "clusters": {"C01": CLUSTER, "C02": CLUSTER}}
+    assert tab_history.llm_summary(state_) == "2 explanations · 2 cluster summaries"
+    assert tab_history.llm_summary({"executive": EXECUTIVE}) == "brief"

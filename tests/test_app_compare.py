@@ -2,7 +2,7 @@
 
 The Compare tab is rendered through a small page that mirrors how app.py renders a tab, so these
 tests do not depend on which optional tabs app.py has switched on; the Deep-Dive button is tested
-through app.py itself. The engine is faked (tests/ui_fixtures.py); no network or API key is used.
+through app.py itself. The engine is faked (tests/ui_fixtures.py); no network, proxy or token is used.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import plotly.graph_objects as go
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from screening import export, pipeline
+from screening import export, llm_backends, pipeline
 from screening import schema as S
 from screening.config import AppConfig
 from screening.models import DataQualityReport, PipelineResult, RiskResult
@@ -32,12 +32,25 @@ except ImportError:  # pragma: no cover - tests/ imported as rootdir-relative mo
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
 FP = "fake-fingerprint"
-KEY_ENV = AppConfig().llm.api_key_env  # env var / secret name of the LLM API key, from the config
+KEY_ENV = AppConfig().llm.api_key_env  # env var / secret name of the proxy token, from the config
 PAGE = "_compare_test_page"
-SPEC_ROWS = ["Rank", "Status", "Final score", "HackerRank %", "HackerRank pts", "Skills pts", "Experience pts",
-             "Education pts", "Required skills matched", "Internships", "Experience months", "Projects",
-             "Certifications", "Degree", "Branch", "CGPA", "College tier", "Risk level", "Risk score", "Cluster",
-             "Resume match method"]
+# Outcome rows first, then one group per data source with the source as a label prefix.
+SPEC_ROWS = ["Rank", "Status", "Final score", "Ineligibility", "Tie-break note",
+             "HackerRank: Percentage", "HackerRank: Rubric pts",
+             "Resume: Skills pts", "Resume: Experience pts", "Resume: Required skills matched", "Resume: Internships",
+             "Resume: Experience months", "Resume: Projects", "Resume: Certifications", "Resume: Match method",
+             "Academic: Education pts", "Academic: Degree", "Academic: Branch", "Academic: CGPA",
+             "Academic: College tier",
+             "Integrity: Risk level", "Integrity: Risk score", "Integrity: Cluster", "Integrity: Duplicate of",
+             "Integrity: Merged duplicates", "Integrity: Hidden-text flags"]
+# Rows that only exist for results carrying the screening-rule columns (runs saved earlier lack them).
+RULE_ROW_COLUMNS = {"Ineligibility": S.INELIGIBILITY, "Tie-break note": S.TIE_BREAK_NOTE,
+                    "Integrity: Duplicate of": S.DUPLICATE_OF, "Integrity: Merged duplicates": S.DUPLICATE_IDS,
+                    "Integrity: Hidden-text flags": S.INJECTION_FLAGS}
+
+
+def _spec_rows(df: pd.DataFrame) -> list[str]:
+    return [r for r in SPEC_ROWS if RULE_ROW_COLUMNS.get(r, S.CANDIDATE_ID) in df.columns]
 
 
 def _page() -> None:
@@ -63,6 +76,7 @@ def _page() -> None:
 def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv(KEY_ENV, raising=False)
     monkeypatch.setitem(vars(pipeline), "DEFAULT_SAMPLE_DIR", tmp_path / "no-sample")
+    monkeypatch.setitem(vars(llm_backends), "discover_proxy", lambda path=None: None)  # ignore a running proxy
 
 
 @pytest.fixture(scope="module")
@@ -76,7 +90,7 @@ def engine(monkeypatch: pytest.MonkeyPatch, fake: tuple[pipeline.PreparedData, P
     prepared, result = fake
     calls: list[Any] = []
 
-    def evaluate(prep, cfg, llm_results=None, *, risk_result=None):
+    def evaluate(prep, cfg, *, risk_result=None):
         calls.append(cfg)
         return replace(result, config=cfg)
 
@@ -92,7 +106,7 @@ def _inject(at: AppTest, prepared: Any, result: PipelineResult, **values: Any) -
     if prepared is not None:
         at.session_state[state.K_PREPARED] = prepared
         at.session_state[state.K_PREPARED_FP] = FP
-        at.session_state[state.K_RESULT_KEY] = state.eval_key(FP, result.config, None)
+        at.session_state[state.K_RESULT_KEY] = state.eval_key(FP, result.config)
     at.session_state[state.K_DATASET] = "Fake dataset"
     for key, value in values.items():
         at.session_state[key] = value
@@ -146,7 +160,7 @@ def test_compare_defaults_to_top_three_shortlisted(engine: dict[str, Any]) -> No
     assert at.session_state[state.K_COMPARE_IDS] == expected
 
     table = _frame(at, tab_compare.METRIC)
-    assert table[tab_compare.METRIC].tolist() == SPEC_ROWS
+    assert table[tab_compare.METRIC].tolist() == _spec_rows(result.candidates)
     assert _ids(table) == expected
     assert _row(table, "Rank") == ["#1", "#2", "#3"]
     assert "FFF4C2" in str(_element(at, tab_compare.METRIC).proto)  # best-value highlight reaches the grid
@@ -178,9 +192,11 @@ def test_compare_with_explicit_ids(engine: dict[str, Any]) -> None:
     assert at.session_state[state.K_COMPARE_IDS] == ["CAND-00020", "CAND-00060"]
     table = _frame(at, tab_compare.METRIC)
     assert _ids(table) == ["CAND-00020", "CAND-00060"]
-    assert _row(table, "Rank")[1] == "-" and _row(table, "HackerRank %")[1] == "-"
-    assert _row(table, "Resume match method")[1] == "no resume"
-    assert _row(table, "Cluster")[0] == "C02"
+    assert _row(table, "Rank")[1] == "-" and _row(table, "HackerRank: Percentage")[1] == "-"
+    assert _row(table, "Resume: Match method")[1] == "no resume"
+    assert _row(table, "Integrity: Cluster")[0] == "C02"
+    if S.INELIGIBILITY in engine["result"].candidates.columns:   # no assessment score -> Ineligible
+        assert _row(table, "Ineligibility") == ["-", S.RULE_NO_SCORE]
     assert any("No resume is linked" in c.value for c in at.caption)
     assert len(json.loads(at.get("plotly_chart")[0].proto.spec)["data"]) == 2
 
@@ -337,24 +353,67 @@ def test_build_comparison_highlights_best_values() -> None:
     comparison = tab_compare.build_comparison(_small_frame(), ["C-1", "C-2", "C-3"], required_total=3)
     shown = comparison.display.set_index(tab_compare.METRIC)
     best = comparison.best.drop(columns=[tab_compare.METRIC]).set_index(comparison.display[tab_compare.METRIC])
-    assert list(shown.index) == ["Rank", "Status", "Final score", "HackerRank %", "Skills pts",
-                                 "Required skills matched", "CGPA", "College tier", "Risk level", "Risk score"]
+    assert list(shown.index) == ["Rank", "Status", "Final score", "HackerRank: Percentage", "Resume: Skills pts",
+                                 "Resume: Required skills matched", "Academic: CGPA", "Academic: College tier",
+                                 "Integrity: Risk level", "Integrity: Risk score"]
     assert shown.loc["Rank"].tolist() == ["#2", "#1", "-"]
     assert best.loc["Rank"].tolist() == [False, True, False]                 # lower is better
     assert best.loc["Final score"].tolist() == [True, True, False]           # compared as shown: 80.0 == 80.0
-    assert shown.loc["HackerRank %"].tolist() == ["99.6%", "100%", "-"]
-    assert best.loc["HackerRank %"].tolist() == [False, True, False]
-    assert not best.loc["Skills pts"].any()                                  # all equal -> nothing marked
-    assert shown.loc["Required skills matched"].tolist() == ["2 / 3", "1 / 3", "0 / 3"]
-    assert best.loc["Required skills matched"].tolist() == [True, False, False]
-    assert best.loc["CGPA"].tolist() == [False, False, True]                 # missing values are skipped
-    assert best.loc["Risk score"].tolist() == [True, False, True]            # lower is better, ties all marked
-    assert shown.loc["College tier"].tolist() == ["Tier 1", "Tier 3", "-"]
-    assert not best.loc[["Status", "College tier", "Risk level"]].to_numpy().any()  # text rows are not ranked
-    assert shown.loc["Risk level"].tolist() == [theme.risk_label(S.RISK_CLEAR), theme.risk_label(S.RISK_HIGH),
-                                                theme.risk_label(S.RISK_CLEAR)]
+    assert shown.loc["HackerRank: Percentage"].tolist() == ["99.6%", "100%", "-"]
+    assert best.loc["HackerRank: Percentage"].tolist() == [False, True, False]
+    assert not best.loc["Resume: Skills pts"].any()                          # all equal -> nothing marked
+    assert shown.loc["Resume: Required skills matched"].tolist() == ["2 / 3", "1 / 3", "0 / 3"]
+    assert best.loc["Resume: Required skills matched"].tolist() == [True, False, False]
+    assert best.loc["Academic: CGPA"].tolist() == [False, False, True]       # missing values are skipped
+    assert best.loc["Integrity: Risk score"].tolist() == [True, False, True]  # lower is better, ties all marked
+    assert shown.loc["Academic: College tier"].tolist() == ["Tier 1", "Tier 3", "-"]
+    text_rows = ["Status", "Academic: College tier", "Integrity: Risk level"]
+    assert not best.loc[text_rows].to_numpy().any()                          # text rows are not ranked
+    assert shown.loc["Integrity: Risk level"].tolist() == [theme.risk_label(S.RISK_CLEAR),
+                                                           theme.risk_label(S.RISK_HIGH),
+                                                           theme.risk_label(S.RISK_CLEAR)]
     raw = comparison.raw.set_index(tab_compare.METRIC)
-    assert raw.loc["Rank"].tolist()[:2] == [2, 1] and raw.loc["Risk level"].tolist()[0] == S.RISK_CLEAR
+    assert raw.loc["Rank"].tolist()[:2] == [2, 1] and raw.loc["Integrity: Risk level"].tolist()[0] == S.RISK_CLEAR
+
+
+def test_metric_rows_are_grouped_by_source_with_prefixed_labels() -> None:
+    rows = tab_compare.metric_rows(5)
+    assert [m.label for m in rows] == SPEC_ROWS
+    groups = [m.group for m in rows]
+    assert groups == sorted(groups, key=tab_compare.SOURCE_ORDER.index)
+    assert set(groups) == set(tab_compare.SOURCE_ORDER)
+    for metric in rows:
+        prefix = tab_compare.SOURCE_PREFIX.get(metric.group, "")
+        assert metric.label.startswith(f"{prefix}: ") if prefix else ": " not in metric.label
+    assert tab_compare.SOURCE_PREFIX[S.SRC_ASSESSMENT] == "HackerRank"
+
+
+def test_rule_rows_show_ineligibility_tie_breaks_duplicates_and_hidden_text() -> None:
+    rules = [{"rule_violated": S.RULE_NO_SCORE, "candidate_value": None, "threshold_value": None,
+              "explanation": "No assessment score recorded."},
+             {"rule_violated": S.RULE_MIN_CGPA, "candidate_value": 6.4, "threshold_value": 7.0,
+              "explanation": "CGPA 6.40 is below the minimum 7.00."}]
+    df = _small_frame().assign(**{
+        S.INELIGIBILITY: ["[]", "[]", json.dumps(rules)],
+        S.TIE_BREAK_NOTE: ["tied at 80.00 pts; lost tie-break on HackerRank percentage 99.6% vs 100%",
+                           "tied at 80.00 pts; won tie-break on HackerRank percentage 100% vs 99.6%", ""],
+        S.DUPLICATE_OF: ["", "", "C-1"], S.DUPLICATE_IDS: ["C-3", "", ""],
+        S.INJECTION_FLAGS: ["", "Hidden text (page 1: white text): 'x' | Invisible characters (6) | +2 more", None],
+        S.RESUME_CGPA: [7.9, 8.3, 9.0], S.CGPA_SOURCE: ["feed", "resume", "feed"],
+    })
+    comparison = tab_compare.build_comparison(df, ["C-1", "C-2", "C-3"], required_total=3)
+    shown = comparison.display.set_index(tab_compare.METRIC)
+    assert shown.loc["Ineligibility"].tolist() == ["-", "-", f"{S.RULE_NO_SCORE}, {S.RULE_MIN_CGPA}"]
+    assert shown.loc["Tie-break note"].tolist()[1].startswith("tied at 80.00 pts; won")
+    assert shown.loc["Integrity: Duplicate of"].tolist() == ["-", "-", "C-1"]
+    assert shown.loc["Integrity: Merged duplicates"].tolist() == ["C-3", "-", "-"]
+    assert shown.loc["Integrity: Hidden-text flags"].tolist() == ["None", "4 findings", "None"]
+    assert shown.loc["Academic: CGPA"].tolist() == ["8.10", "8.30 (from resume)", "9.20"]
+    raw = comparison.raw.set_index(tab_compare.METRIC)
+    assert raw.loc["Ineligibility"].tolist()[2] == ("Assessment: No assessment score recorded.; "
+                                                    "Academic CGPA: CGPA 6.40 is below the minimum 7.00.")
+    assert not comparison.best.set_index(comparison.display[tab_compare.METRIC]).loc[
+        ["Ineligibility", "Integrity: Hidden-text flags"]].drop(columns=[tab_compare.METRIC]).to_numpy().any()
 
 
 def test_best_flags_edge_cases() -> None:

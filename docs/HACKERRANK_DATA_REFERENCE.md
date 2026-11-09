@@ -1,7 +1,254 @@
-<!-- Reference (2026-11-05): what HackerRank for Work exposes to employers after an OA.
-     Compiled from public documentation; see Sources at the end. -->
+<!-- Reference: Part 1 describes the Workday assessment export and the Resume.zip packets as the
+     console reads them; Part 2 describes what HackerRank for Work exposes to employers after an
+     online assessment (compiled from public documentation; see Sources at the end).
+     Every example value is fictional. -->
 
-# HackerRank online assessment (OA) data available to employers
+# Assessment export reference (Workday and HackerRank)
+
+This reference describes, column by column, the assessment data the Candidate Screening & Integrity Console reads. It is written for the TA team that downloads the files and for the IT person who supports the app.
+
+- **Part 1 - Workday assessment export.** The primary input: the Workday assessment export (`.xlsx`) and the `Resume.zip` of multi-candidate PDF packets that goes with it. What every column and every part of a packet contains, and what the console does with it.
+- **Part 2 - HackerRank for Work exports.** HackerRank CSV/XLSX files are still accepted. How the console maps their headers, followed by a research reference of what HackerRank exposes to employers: field catalog, an example export layout, integrity signals, caveats and sources.
+
+Every example value in this document is fictional: names, candidate IDs, colleges, and e-mail addresses on reserved `.example` domains.
+
+Related documents: [USER_GUIDE.md](USER_GUIDE.md) (the screens and fields), [ARCHITECTURE.md](ARCHITECTURE.md#screeningingestpy) (the ingest and packet-splitting contracts), [DEPLOYMENT.md](DEPLOYMENT.md) (installation) and [data/README.md](../data/README.md) (the synthetic sample, which uses the Part 1 format).
+
+## Contents
+
+- [Part 1 - Workday assessment export](#part-1---workday-assessment-export)
+  - [1.1 What TA uploads](#11-what-ta-uploads)
+  - [1.2 Workbook layout](#12-workbook-layout)
+  - [1.3 The 14 columns](#13-the-14-columns)
+  - [1.4 The Assessment Comment](#14-the-assessment-comment)
+  - [1.5 Missing values and "#N/A"](#15-missing-values-and-na)
+  - [1.6 Repeat applications and fields the export lacks](#16-repeat-applications-and-fields-the-export-lacks)
+  - [1.7 Resume.zip packet layout](#17-resumezip-packet-layout)
+  - [1.8 How the console splits a packet](#18-how-the-console-splits-a-packet)
+  - [1.9 Checking a new export](#19-checking-a-new-export)
+- [Part 2 - HackerRank for Work exports](#part-2---hackerrank-for-work-exports)
+  - [2.1 How the console reads a HackerRank export](#21-how-the-console-reads-a-hackerrank-export)
+  - [2.2 Sources, confidence and where-exposed codes](#22-sources-confidence-and-where-exposed-codes)
+  - [2.3 Field catalog](#23-field-catalog)
+  - [2.4 Example HackerRank export layout](#24-example-hackerrank-export-layout)
+  - [2.5 Integrity signals](#25-integrity-signals)
+  - [2.6 Unverified / caveats](#26-unverified--caveats)
+- [Sources](#sources)
+- [Questions to settle before onboarding a new export](#questions-to-settle-before-onboarding-a-new-export)
+
+## Part 1 - Workday assessment export
+
+### 1.1 What TA uploads
+
+| File | What it is | Where it goes in the app |
+|---|---|---|
+| Assessment export (`.xlsx`; the synthetic sample calls it `test_scores_export.xlsx`) | Workday report of one requisition's applications with their HackerRank results | Sidebar > **Upload TA feed + resumes** > "TA export: Workday or HackerRank (CSV or Excel)" |
+| `Resume.zip` | A `Resume/` folder of multi-candidate PDF packets downloaded from Workday | Same panel > "Resumes: Resume.zip, PDF, DOCX or TXT" |
+
+Upload both files as delivered: do not rename columns, re-save the workbook as CSV or unzip the archive. Either file also works alone. An export without resumes is scored on HackerRank + Education (the default "auto" missing-resume policy rescales those to 100 points). Resumes without an export are screened in resume-only mode. The synthetic sample (`python generate_mock_data.py`, see [data/README.md](../data/README.md)) has exactly this shape.
+
+### 1.2 Workbook layout
+
+The workbook has two sheets.
+
+- **`Sheet1` - recruiter summary.** Two columns. Example (fictional counts):
+
+  | A | B |
+  |---|---|
+  | Review Candidates: R-100200 2027 Technology Program Intern | |
+  | Active Candidates | 14673 of 32326 |
+  | Applied Prefilters | |
+  | Numeric Return Attribute | Recruiting Stage (Workday Owner) |
+  | 10696 | Review |
+  | 0 | Screen |
+  | 3977 | Assessment |
+  | ... | one row per further stage: Interview, Reference Check, Offer, Employment Agreement, Background Check, Ready for Hire |
+  | Total | 14673 |
+
+  The console skips this sheet: no row has three or more filled cells, so it cannot hold the data.
+- **`Sheet2` - one row per application.** A header row with exactly the 14 columns of [1.3](#13-the-14-columns), then one row per application (2,133 in the sample). The Assessment Comment cells are multi-line.
+
+How the console picks the sheet:
+
+- The first 50 rows of every sheet are inspected. The sheet whose header row maps the most known fields is read; ties go to the earlier sheet. When no sheet has a header-like row, the first non-empty sheet is read.
+- In the sidebar, **Review column mapping** confirms the choice with the caption "Sheet used: **Sheet2** - detected automatically as the best header match among the workbook's 2 sheets."
+- Title rows above the header are skipped. The header is the first row with at least 3 filled cells and at least half as many cells as the widest row; among the first few such rows, one that reads like column labels wins.
+- Legacy binary `.xls` workbooks are refused with "Legacy binary .xls files are not supported - re-save the file as .xlsx or CSV."
+
+### 1.3 The 14 columns
+
+All 14 headers map automatically. The **Maps to** column of **Review column mapping** shows the result. Examples are fictional.
+
+| # | Column | Type | Example | Console field | How the console uses it |
+|---|---|---|---|---|---|
+| 1 | Job Application | text: "First Last (first last)" | `Asha Menon (asha menon)` | `job_application`, gives `name` | The export's only name field: there is no Name or Phone column. The name is the text before " (", here `Asha Menon`; names typed all lower-case or all capitals are Title-cased. Used for display, for the duplicate-application check, and to redact the name before anything is sent to the LLM. |
+| 2 | Candidate ID | text: `C-` + 7 digits | `C-1204417` | `candidate_id` | The candidate's key, upper-cased. A blank ID gets a generated `ROW-00001`-style ID and the data flag `generated_id`. Resumes split from packets are linked by this ID in their file names. A repeat applicant has a second, later ID ([1.6](#16-repeat-applications-and-fields-the-export-lacks)). If one ID appears on two rows, the last row is kept (data flag `duplicate_id`). |
+| 3 | Assessment Comment | multi-line text | see [1.4](#14-the-assessment-comment) | `assessment_comment`, gives `test_status`, `integrity_status`, `proctoring_flags` | Split into the test status, the integrity status and the integrity summary. The cleaned comment is shown in Deep-Dive section **A. Assessment (HackerRank)** and exported as "HackerRank: Comment". |
+| 4 | Email | text | `asha.menon24@mail.example.com` (webmail) or `24cs0117@northfield.example` (institutional) | `email` | The first address in the cell, lower-cased; an invalid value is left blank (data flag `invalid_email`). The domain tells personal webmail from an institutional address: the duplicate-application check keeps the institutional application. The same address under two IDs adds the data flag `shared_email` and the "Same email" risk signal. |
+| 5 | CGPA | number, 10-point scale | `9.12` | `cgpa` | Education sub-score (6.0 or less scores 0, 9.5 or more full marks), the **Min CGPA** eligibility rule and the "CGPA (feed, then resume)" tie-break. Also accepts "8.5/10", "3.6/4" (converted x2.5) and percentages ("78.5%" becomes 7.85). Out-of-range values are left blank (data flag `cgpa_out_of_range`). The export's CGPA wins over the resume's ("CGPA Source" = feed). |
+| 6 | Branch | text | `Computer Science & Engineering` | `branch` | Degree relevance in the education score (computer science, IT, data or AI score full marks; electronics, electrical, maths or statistics 0.7; other engineering 0.4). Also used by the no-resume duplicate check, the commonality analysis and Campus Distribution. |
+| 7 | School | text | `Northfield Institute of Technology`, or an acronym such as `QZ-IICT` | `college` | Spellings that differ only by case, spaces or punctuation are unified to the most common one. Used by the college cap, the college tier (only when tier scoring is switched on; acronyms are matched against the tier list), Campus Distribution, the commonality analysis and the duplicate check (same college). |
+| 8 | Location | text | `Rivertown` | `city` | The college city or the candidate's hometown. Display, commonality analysis and Campus Distribution. |
+| 9 | Max Score | number | `175` | `max_score` | Denominator of the percentage. |
+| 10 | Score | number, decimals allowed | `168.5` | `hackerrank_score` | Percentage = Score / Max Score x 100, clipped to 0-100. It drives the HackerRank part of the rubric (40 of 100 points by default) and the integrity focus group (100% scorers). `#N/A` means no score ([1.5](#15-missing-values-and-na)). |
+| 11 | Cutoff Score | number | `96` | `cutoff_score` | The campaign's pass mark in points. Shown for reference in Deep-Dive section A: the "Cutoff score" card, and the Score card's difference such as "+72.5 vs cutoff". It does **not** set eligibility; use **Min HackerRank %** in Config & Rubric Tuning for that. |
+| 12 | Cutoff Score Percentage | number | `55` | `cutoff_pct` | The pass mark in percent, shown next to the cutoff score ("96 (55%)"). A column of fractions (0.55) is read as percent. |
+| 13 | Percentage Score | number | `96.29` | `hackerrank_pct` | Used only when Score is blank: the score becomes percentage x max / 100 (data flag `score_from_pct`). When both are present, Score / Max Score wins and differences above 1 point are listed as an info item in **Data quality details**. |
+| 14 | Candidate Option | text | `Django (Python)` | `candidate_option` | The assessment track the candidate chose (the sample uses Spring Boot (Java), Django (Python) and Node.JS (JavaScript)). Shown in Deep-Dive section A and on the Excel "Shortlist" sheet. |
+
+### 1.4 The Assessment Comment
+
+Each cell holds up to three parts. Workday stores the first line break as the literal text `&#xa;` and the second as a real line break. A clean application:
+
+```
+Hackerrank Completed – Qualified&#xa;Integrity Issues: No Issues Detected
+Integrity Summary: N/A
+```
+
+An application with an integrity finding:
+
+```
+Hackerrank Completed – Qualified&#xa;Integrity Issues: Medium
+Integrity Summary: Detected Code Similarity With Other Submissions
+```
+
+The console decodes the entity (a twice-escaped `&amp;#xa;` too), unifies the line breaks and splits the cell at the labels "Integrity Issues:" and "Integrity Summary:".
+
+| Part | Example | Console field | Rule | Effect |
+|---|---|---|---|---|
+| Status line | `Hackerrank Completed – Qualified` | `test_status` = `Completed` | The word after the optional "HackerRank" prefix, cut at the dash (en dash, em dash or a spaced hyphen; "Completed-Qualified" works too). Known words are normalised: Completed (also complete, submitted, done, finished, attempted), Invited, In Progress, Expired, Did Not Attempt. The qualification after the dash ("Qualified") is not a field of its own; it stays in the comment text. | Deep-Dive section A "Test status"; "HackerRank: Test Status" in exports. |
+| Integrity Issues | `No Issues Detected`, `Medium`, `High` | `integrity_status` | "No Issues Detected", "No issues", "None", "Nil", "N/A", "Clear", "Clean", "OK" and "-" become **Clear**. A value that starts with a severity word (Low, Medium, Moderate, High, Critical, Review, Suspicious, Flagged) becomes that word, for example "Medium". Anything else is kept as written. | **Medium** and **High** count as integrity concerns: the risk engine adds the individual flag "Proctoring integrity status" (weight 20, detail "Assessment integrity issues: Medium"), Deep-Dive section A shows a warning and section **D. Integrity** repeats the status. Clear and Low raise nothing. |
+| Integrity Summary | `N/A`, `Detected Code Similarity With Other Submissions` | `proctoring_flags` | Placeholders (N/A, None, Nil, Null, "-", "...", "No issues detected") become blank; other text is kept. | A non-empty summary adds the individual flag "Proctoring flags" (weight 15, detail "Proctoring notes: ..."). Deep-Dive section A "Proctoring flags". |
+
+With the default thresholds, a row with "Integrity Issues: Medium" and a summary collects 35 risk points (20 + 15). That is **Medium** risk, so the candidate, if shortlisted, becomes **Shortlisted (Integrity Review)**.
+
+More rules:
+
+- The cleaned comment, one part per line, is kept in `assessment_comment`.
+- The three parts fill their fields only when the file has no separate column mapped to them. **Data quality details** then shows the info item "Test Status, Integrity Status, Proctoring Flags read from the 'Assessment Comment' column."
+- A comment column is split only when at least 30% of its first 2,000 filled cells carry one of the two labels or start with "HackerRank". Otherwise it is kept as plain text.
+- A separate column headed "Integrity Issues" (or "Integrity Summary") that is mapped to **Assessment Comment** is read as plain integrity-status (or proctoring-flag) values.
+
+### 1.5 Missing values and "#N/A"
+
+- Workday writes `#N/A` (an Excel error value, like a failed lookup) for an application without an assessment result. In every column the console treats `#N/A`, `N/A`, `NA`, `n.a.`, `nan`, `null`, `none`, `nil`, `-`, `--`, `---`, "not available", "not applicable" (any case) and empty cells as missing.
+- An unscored application (in the sample: one row with `#N/A` in Score, Percentage Score, Cutoff Score Percentage and Candidate Option, and Max Score 100):
+  - has no score: data flag `score_missing`, and the warning "1 candidate(s) have no assessment score (data flag 'score_missing')." in **Data quality details**;
+  - fails the eligibility rule **Assessment** ("No assessment score recorded on HackerRank.") and is **Ineligible**: red banner in the Deep-Dive, listed under "Ineligible candidates" on the Shortlist tab and on the Excel "Ineligible Candidates" sheet;
+  - keeps its other fields blank.
+- `#N/A` in any other column only leaves that field blank. A blank CGPA never fails the Min CGPA rule.
+
+### 1.6 Repeat applications and fields the export lacks
+
+- **One person, two applications.** Workday exports one row per application. A student who applied twice, typically once with a personal webmail address and once with the university address, appears under two candidate IDs with the same name, the same school and the same resume. The console marks such rows: same name, same college, and an identical or near-identical resume (or, when neither has a resume, the same CGPA and branch). One application is kept: the one with an assessment score, then the one with the institutional e-mail, then the lowest ID. While **Auto-disqualify duplicate applications** is on (the default), the others become **Ineligible** with the rule **Duplicate Application**, for example "Disqualified: Duplicate application of C-1204417 (merged into official profile ...)". Namesakes (the same name at another college, or with a different resume) are never merged, and duplicate applications are never treated as collusion pairs.
+- **Fields the Workday export does not have**: phone, degree, graduation year, test start and submission times, completion time, IP address, test mode, tab switches, paste counts, per-question scores and answer hashes. **Data quality details** lists them under "Optional fields absent". The integrity checks that need them (timing, shared IP, speed, per-question similarity, same phone) are skipped and named in the Risk tab's "Signals skipped (missing data)" expander. Without a graduation year, the "Allowed graduation years" rule excludes nobody.
+
+### 1.7 Resume.zip packet layout
+
+`Resume.zip` contains one folder, `Resume/`, with one or more PDF **packets**. A packet bundles the attachments of many candidates of one requisition.
+
+- **Packet file name**: `<requisition> - <job title>_set <N>.pdf`, for example `R-100200 - 2027 Technology Program Intern_set 1.pdf`. The sample has 33 packets (`_set 1` to `_set 33`) of 5 to 100 candidates each; the last set is a small remainder batch. The console does not depend on the file name.
+- **Table of contents** on the first 1-3 pages:
+
+  ```
+  Table of Contents
+  R-100200 - 2027 Technology Program Intern (1 of 33)
+
+  Candidate Name                  Candidate ID      Attachments
+  1. Asha Menon                   C-1204417
+                                                    Asha_Menon_Resume.pdf
+  2. Rohan Iyer                   C-1204452
+                                                    Rohan_Iyer_CV.pdf
+                                                    Cover_Letter.pdf
+  3. ...
+  ```
+
+  One row per candidate: number, name, and the candidate ID in its own column, with the candidate's attachment file names on the lines below. Only candidates with at least one attachment are listed; in the sample, about 12% of the applications have no resume and appear in no packet.
+- **Attachments** follow in table-of-contents order. First the resume: in the sample about 83% are one page, 16% two pages and 1% three to six pages (a resume followed by certificate pages). About 5% of candidates have a second attachment: a cover letter, a grade card or transcript, or a certificate. Attachment file names vary, for example `Asha_Menon_Resume.pdf`, `AshaMenon_CV.pdf`, `Resume_Asha_Menon.pdf`, `Resume.pdf`, `CV.pdf`, `Cover_Letter.pdf`, `Grade_Card.pdf`, `Internship_Certificate.pdf`.
+- **Bookmarks**: the PDF outline has one bookmark per attachment, pointing at the attachment's first page. Bookmarks that carry the candidate's name ("Asha Menon" or "Asha Menon (asha menon)") are matched directly. The synthetic sample titles them `<Name> - <attachment file name>` ("Asha Menon - Asha_Menon_Resume.pdf").
+- **Page ranges**: the first bookmark's page is where the table of contents ends. A candidate's pages run from their first bookmark to the next candidate's first bookmark; the last candidate's run to the end of the packet. Example: a one-page table of contents, then Asha Menon on pages 2-3 (a two-page resume) and Rohan Iyer on pages 4-5 (a one-page CV and a one-page cover letter).
+
+### 1.8 How the console splits a packet
+
+1. **Reading the archive.** The ZIP is read member by member, so only one packet is in memory at a time; the progress bar shows "Reading resume files - n/33". A packet may be up to **250 MB** with any number of pages. Folders, `__MACOSX` and hidden files are ignored, nested ZIPs are not opened, and encrypted or unusually compressed members are skipped with a warning.
+2. **Recognising a packet.** A PDF is treated as a packet when it has at least 2 pages (3 without bookmarks) and table-of-contents rows on its first 1-3 pages: lines such as "1. Asha Menon C-1204417" with a Workday ID (`C-` + 6 to 8 digits), or, below a "Table of Contents" or "Candidate Name Candidate ID" heading, any ID that matches the candidate ID pattern. Without such a heading, at least two rows are needed. A name wrapped onto the next line is joined. Any other PDF is an ordinary resume.
+3. **Finding each attachment.** The bookmarks give every attachment's first page. They are matched to the listed candidates in order, by name (exact or a close fuzzy match) or by candidate ID, and a candidate may have several attachments. When fewer than half of the bookmark titles name a listed candidate (as in the synthetic sample), the console looks for each listed name or ID near the top of the pages instead; if that fails as well, it assigns the bookmarks to the candidates in order. A packet without bookmarks is always split by the names on the pages.
+4. **Writing the split files.** One PDF per attachment:
+
+   | Attachment | Split file name |
+   |---|---|
+   | first | `<Candidate ID>_<First_Last>.pdf`, e.g. `C-1204417_Asha_Menon.pdf` |
+   | second, third, ... | `C-1204417_Asha_Menon_att2.pdf`, `C-1204417_Asha_Menon_att3.pdf` |
+
+   The name part is the listed name with accents removed and every run of other characters replaced by `_` (at most 60 characters). Each split file remembers its packet and 1-based page range, for example "R-100200 - 2027 Technology Program Intern_set 1.pdf p.2-3", which Deep-Dive section **B. Resume (self-reported)** shows as "From packet ..., pages 2-3". The candidate ID is also written into the file's PDF metadata, so two applications with the same resume stay two separate files. When the names had to be located on the pages, a candidate's file covers all of their pages: the resume and any second attachment.
+5. **Caps after the split.** Every split file then passes the normal per-resume limits: at most **10 MB** (a larger file is skipped with a warning) and at most **50 pages** (a longer file is not read as a resume). One archive yields at most 10,000 resumes and 2,048 MB uncompressed.
+6. **Linking.** A split file links to its application through the candidate ID in its file name: match method "ID in file name", confidence 100%. An `_att2` file of a candidate whose resume is already linked is set aside as a further attachment (match method "duplicate") and is not scored.
+7. **Messages** in **Data quality details**:
+   - info: "Split multi-candidate packet into 64 file(s) for 64 candidate(s) (86 pages)", plus "K listed candidate(s) have no attachment pages" when a listed candidate has none;
+   - warning, when a fallback was used, ending in "verify the split": "... bookmark titles do not name the listed candidates, so the names were located on the pages - verify the split", "... bookmark titles do not name the listed candidates; attachments were assigned in order - verify the split" or "... the packet has no bookmarks, so the names were located on the pages - verify the split". The synthetic sample produces the first of these for every packet, because its bookmark titles also contain the attachment file name; the split itself is correct, and all 1,877 resumes link by ID;
+   - warning: "Multi-candidate packet listing N candidate(s) could not be split (no usable bookmarks and the listed names were not found on the pages); kept as one file".
+
+The packet size limit (`max_bundle_mb`), the per-resume limit (`max_file_mb`), the archive limits and the switch `split_bundles` live in the `processing` section of the configuration. They are not on screen, but a configuration JSON loaded with **Upload a config JSON** in Config & Rubric Tuning can change them.
+
+### 1.9 Checking a new export
+
+1. Before running, open **Review column mapping**: 14 of 14 columns mapped, "Sheet used: Sheet2". If Workday renamed a column, pick the field in **Maps to**, then **Download mapping (JSON)** and load that profile with **Load mapping profile** next time.
+2. After the run, open **Data quality details** in the sidebar. Expect: "Read N row(s); 14 column(s) mapped (auto-detected), 0 kept as extra columns."; "Test Status, Integrity Status, Proctoring Flags read from the 'Assessment Comment' column."; "Candidate names taken from the 'Job Application' column."; one "Split multi-candidate packet ..." item per packet; a warning for every unscored row.
+3. Compare the KPI card **Total Processed** ("N with a linked resume") with the number of candidates listed in the packets' tables of contents.
+4. Open a few candidates in the Deep-Dive. Section B shows the packet and page range a resume came from: check one against the packet itself.
+5. Look at the Shortlist tab's "Ineligible candidates" section: duplicate applications and unscored rows should be the only surprises.
+
+## Part 2 - HackerRank for Work exports
+
+### 2.1 How the console reads a HackerRank export
+
+A HackerRank CSV or Excel file is read the same way as any other assessment export: headers are mapped to the console's fields by exact aliases, per-question patterns and close fuzzy matches; unmapped columns are kept as `extra_*` columns (in the candidate table and the exports, never scored). The table shows how the full example header row of [2.4](#24-example-hackerrank-export-layout) is mapped automatically ("Maps to" labels as in **Review column mapping**).
+
+| Export header | Maps to | Notes |
+|---|---|---|
+| `ID` | Candidate ID | |
+| `Name` | Name | `Full Name` stays an extra column. |
+| `Email` | Email | `Personal Email Address` stays an extra column while `Email` is present. |
+| `Contact Number` | Phone | |
+| `Univ/College Name`, `Degree`, `Stream/Branch`, `Graduation Year`, `CGPA`, `City` | College, Degree, Branch, Graduation Year, CGPA, City | |
+| `IP Address` | IP Address | |
+| `Score`, `Max Score`, `Percentage Score` | HackerRank Score, Max Score, HackerRank % | |
+| `Cutoff Score` | Cutoff Score | Reference only, as in Part 1. |
+| `Status` | Test Status | |
+| `Test Name` | Test Name | |
+| `Attempt Start time`, `Attempt Endtime` | Test Start Time, Submission Time | |
+| `Test Duration` | Completion (min) | The test's configured length, not the time taken: see the note below. |
+| `Attempt Time Taken` | (not mapped) | Not mapped while `Test Duration` holds Completion (min). |
+| `Detailed Report Url` | Report URL | |
+| `Attempt Plagiarism` | Plagiarism Flag | |
+| `Number Of Window Exits` | Tab Switches | |
+| `Out Of Window Duration (seconds)` | Out-of-Window (sec) | |
+| `Copy Paste Frequency` | Copy-Paste Events | |
+| `Fullscreen Exit Count` | Secure-Mode Exits | |
+| `Proctor Flag` | Integrity Status | |
+| `Proctor Flag Reasons` | Proctoring Flags | |
+| `Feedback Comments` | Assessment Comment | The candidate's feedback, kept as text (it carries no integrity labels). |
+| `Q{n} - Plagiarism Percent` | Q{n} code similarity % | Feeds the "High code similarity" flag. |
+| `Gender` | (dropped) | Protected attribute: never read, scored, shown, exported or sent to the LLM. |
+| all other columns (`Tag`, `Full Name`, `Student Roll Number`, `Personal Email Address`, `Work Experience`, company, invite, test-owner and team fields, `Attempt ID`, `Attempt Count`, `Last Attempt Date And Time`, `Network Disconnected Duration`, `Product Rating`, `Fullscreen Exit Duration`, `Proctor Activity *`, `Attempt Activity *`, `Integrity Summary`, the four split-score columns, the other `Q{n} - ...` columns, `Integrity Issues`, `Code Quality`) | extra columns | Kept as `extra_<header>`; not scored. |
+
+Adjustments worth making for a full HackerRank export, in **Review column mapping** (each field takes one column; when two columns claim a field, the earlier one wins):
+
+- **Completion time.** Set `Test Duration` to "— not mapped —" (or Action **Ignore**) and map `Attempt Time Taken` to "Completion (min)". An all-numeric completion column whose median is above 600 is read as seconds and converted to minutes.
+- **HackerRank's overall integrity verdict.** To use `Integrity Issues` (High / Medium / No issues detected) instead of `Proctor Flag`, set `Proctor Flag` to "— not mapped —" and map `Integrity Issues` to "Integrity Status". High and Medium then count as integrity concerns, as in Part 1. Likewise `Integrity Summary` can replace `Proctor Flag Reasons` as "Proctoring Flags".
+- **Per-question scores.** Headers such as `Q11 - Question Score` are not recognised automatically: the per-question patterns expect the score word right after the question number ("Q3 Score", "Question 3 Marks", "Q3 Score (Coding - Graphs)"). Map them with a mapping profile, for example:
+
+  ```json
+  {"version": 1, "mapping": {"Test Duration": "ignore", "Attempt Time Taken": "completion_minutes",
+                             "Q11 - Question Score": "q11_score", "Q12 - Question Score": "q12_score",
+                             "Q13 - Question Score": "q13_score"}}
+  ```
+
+  Load it with **Load mapping profile** (at most 64 KB; headers that are not in the file are listed as skipped, and the other columns keep the auto-detected mapping). Per-question scores feed the "HackerRank coding-question marks" tie-break: questions that also have a code-similarity column count as coding questions.
+
+Headers the console recognises on its own, besides the ones above: "Q3 Score" / "Q3 Marks" / "Q3 Points" (per-question score), "Q2 Code Similarity" / "Q2 Similarity" / "Q2 Plagiarism %" (per-question code similarity), "Q1 Answer Hash" / "Q1 Code Hash" / "Q1 Signature" (per-question answer hash, used by the "Identical answers" pair signal; HackerRank's bulk export has no such column), "Max Code Similarity", "Plagiarism Match" / "Most Similar Candidate", "Integrity Status", "Proctoring Flags", "Test Mode", "Tab Switches" and "College Tier".
+
+### 2.2 Sources, confidence and where-exposed codes
 
 Each underlying field appears once. Each row uses the most exact label available, which is the export header where one is known, and carries the strongest confidence its sources support. All source URLs are kept as keys that resolve in **Sources**. Speculative items that no second source backs up are listed only under **Unverified / caveats**.
 
@@ -18,7 +265,7 @@ Each underlying field appears once. Each row uses the most exact label available
 - **PDF**: the per-candidate PDF report.
 - **ATS**: fields written back to applicant tracking systems.
 
-## Field catalog
+### 2.3 Field catalog
 
 | Label | Category | Where exposed (aliases) | Confidence | Sources |
 |---|---|---|---|---|
@@ -145,9 +392,11 @@ Each underlying field appears once. Each row uses the most exact label available
 | PDF report and ATS writebacks | meta | One PDF per candidate; the new version adds integrity and performance summaries; admins can block PDF downloads (Jan 2026). ATS integrations (Greenhouse, Lever, Workday, Ashby, Eightfold, SmartRecruiters, Unified.to) write 4–10 fields | verified | DL, PDF19, RN2601, GH, LV, WD, ASH, EF, SRC, UNI |
 | Anonymized reports | meta | The Diversity & Inclusion setting can hide personal data in reports and downloads | likely | W-DI, HRU |
 
-## Recommended synthetic CSV columns
+### 2.4 Example HackerRank export layout
 
-**Assumed campus OA (every value is configurable):**
+The bundled generator (`generate_mock_data.py`) writes only the Workday format of [Part 1](#part-1---workday-assessment-export). This section is a reference for what a full HackerRank Candidates-tab export can contain, and a recipe for building HackerRank test files by hand. The console maps such a file as shown in [2.1](#21-how-the-console-reads-a-hackerrank-export).
+
+**Assumed campus OA (illustrative values):**
 - Test "Campus OA 2026 - SDE (Set A)", 90 minutes, taken through a public link.
 - Two slots, each with a 15-minute login window.
 - Section "Aptitude & CS Fundamentals": Q1–Q10, multiple-choice, +4 correct / −1 wrong, 40 points.
@@ -272,7 +521,7 @@ Email,ID,IP Address,Name,Tag,Full Name,Student Roll Number,Univ/College Name,Deg
 
 **Scenarios to plant.** Record the true labels in a separate file, never in the CSV.
 1. **Innocent lab cluster.** 30–80 candidates on one NAT IP, overlapping attempt windows, independent code. This should not be flagged.
-2. **Collusion ring of 3–5 people.** All score 100%. Q12 and Q13 show 85–99% similarity and are flagged. They use the same language, and their line counts are within ±2. Followers finish each question 3–10 minutes after the leader with fewer compile runs, and leave the window more (30–120 s).
+2. **Collusion ring of 3–5 people.** All score 100%. Q12 and Q13 show 85–99% similarity and are flagged. They use the same language, and their line counts are within ±2. Followers finish each question 3–10 minutes after the ring's source candidate, with fewer compile runs, and leave the window more (30–120 s).
 3. **Leaked Q11.** 25–40% of second-slot candidates match one canonical solution at 90% or more, with short solve times and 0–1 compile runs.
 4. **One candidate with outside help.** Attempt Activity reasons are set, paste counts are high in baseline mode, and tool names appear in the proctored Integrity Summary.
 5. **Proxy test-taker.** One roll number, phone or personal email appears under two logins, plus a `Secondary face` flag.
@@ -286,7 +535,9 @@ Email,ID,IP Address,Name,Tag,Full Name,Student Roll Number,Univ/College Name,Deg
   - Code and plagiarism: `Submitted Response (Question)`, `Is Plagiarism Detected (Question)`, `Max Plagiarism Probability (Question)`.
 - If TA has API access, add `attempt_events.jsonl` (event codes 1–10, including `pasted_text`) and `plagiarism_edges.csv` (`test_candidate_id`, `email`, `similarity`, `solve_id`).
 
-### Signals not in the bulk export
+#### Signals not in the bulk export
+
+The Workday assessment export carries HackerRank's overall Integrity Issues and Integrity Summary inside its Assessment Comment ([1.4](#14-the-assessment-comment)), so for Workday exports the first two rows below are already covered.
 
 | Signal | Where it lives | Would TA plausibly add it? |
 |---|---|---|
@@ -302,7 +553,7 @@ Email,ID,IP Address,Name,Tag,Full Name,Student Roll Number,Univ/College Name,Deg
 | Fields only in Custom Reports: Monitors Detected Count (Max), Webcam Count, Suspicion Category, Max Plagiarism Probability, Is Question Leaked, Submitted Response | Custom Reports | Medium, if TA has Insights or admin access. |
 | Taken On (with timezone) | PDF / Summary Report | Low, but useful for settling which timezone the timestamps are in. |
 
-## Integrity signals
+### 2.5 Integrity signals
 
 Among 100% scorers, every outcome field is saturated. Score equals Max Score, every test case passes, and every `Mcq Answer` equals the key. So multiple-choice patterns and test-case pass vectors carry no signal inside this group; they only help with partial scorers (shared wrong answers, identical failure patterns). The evidence has to come from how and when the answers were produced, and from HackerRank's own flags.
 
@@ -330,7 +581,7 @@ Among 100% scorers, every outcome field is saturated. Score equals Max Score, ev
 
 For clean 100% scorers, the tie-breakers are `Attempt Time Taken` and `Code Quality`.
 
-## Unverified / caveats
+### 2.6 Unverified / caveats
 
 **Unverified (speculative, with no second source):**
 - How the Candidates-tab Excel lays out per-question data. It could use question titles or `Q1`, could group by question or by field, and may or may not give test cases their own columns. The `Q{n} - <label>` pattern above is a working convention.
@@ -491,13 +742,16 @@ The KB articles below on support.hackerrank.com have mirrors under the same IDs 
 - UNI: https://docs.unified.to/integrations/hackerrankwork.md
 - SKT: https://docs.scalekit.com/agentkit/connectors/hackerrankwork/
 
-## Questions for you
+## Questions to settle before onboarding a new export
 
-1. Which file will TA actually send: the Candidates-tab Excel, a Custom Report, API/webhook JSON, an ATS export, or PDFs? Can they share the header row plus two redacted rows? That alone settles header text, column order, per-question layout, units and timezone.
-2. Will the file cover all completers, or only rows with Integrity Issues = High or Medium (which is what HackerRank's own walkthrough exports)?
+Use these with the TA team when a new requisition, a new assessment or a new export layout comes in.
+
+1. Which file will TA send: the Workday assessment export with `Resume.zip` (Part 1, the console's primary input), the HackerRank Candidates-tab Excel, a Custom Report, API/webhook JSON, another ATS export, or PDFs? Can they share the header row plus two redacted rows? That alone settles header text, column order, per-question layout, units and timezone.
+2. Will the file cover all completers, or only some of them: only qualified candidates (every Workday row reads "Hackerrank Completed – Qualified"), or only rows with Integrity Issues = High or Medium (which is what HackerRank's own walkthrough exports)?
 3. Does the company have the AI Add-on? Which mode was used (default, Secure, Proctor, Desktop App)? Were AI plagiarism detection, Image Proctoring/Analysis, Photo ID, question shuffling, hidden titles or watermarking on?
 4. What was the test design: how many multiple-choice vs coding questions, the points, negative marking, sections or random question pools, library vs custom questions, duration and cutoff? Was it one slot or several, and how long was the login window?
 5. Which onboarding fields were collected, with their exact titles? For example roll number, CGPA, college, branch, graduation year, and any custom fields such as 10th or 12th marks.
 6. Was the test taken in campus labs (shared IPs, invigilated halls) or remotely? Through a public link or individual invites? Were re-attempts allowed?
 7. Can TA provide the plagiarism match list (partner email and similarity %) for flagged 100% scorers, the submitted code, or API access (event logs, typing times)? Are we cleared to process code, IPs and phone numbers?
-8. Roughly how many candidates and 100% scorers are there per test? Should the synthetic data also include the older plagiarism fields (`plagiarism_status`, `max_code_similarity`) and the companion files (per-question long format and event log)?
+8. Roughly how many candidates and 100% scorers are there per test? Should HackerRank test files also include the older plagiarism fields (`plagiarism_status`, `max_code_similarity`) and the companion files (per-question long format and event log)?
+9. For Workday packets: how are the bookmarks titled (candidate name, name plus file name, or something else), and are all of a candidate's attachments in one packet? Check the "verify the split" warnings in **Data quality details** after the first run ([1.8](#18-how-the-console-splits-a-packet)).
