@@ -187,8 +187,8 @@ def evaluate(prepared: PreparedData, cfg: AppConfig, *, risk_result: RiskResult 
 def run_pipeline(ta_file, resume_docs, cfg=None, *, mapping_override=None, progress_cb=None) -> PipelineResult
     # prepare_data + evaluate, no LLM (tests and scripts)
 def load_sample_dataset(sample_dir=None) -> tuple[tuple[str, bytes] | None, list[ResumeDoc], str | None]
-    # data/sample: test_scores_export.xlsx (older layout: ta_feed.csv), Resume.zip as ONE upload that
-    # expand_uploads expands and splits (older layout: the files of a resumes/ folder), job_description.txt
+    # data/sample: test_scores_export.xlsx, Resume.zip as ONE upload that expand_uploads expands and
+    # splits, job_description.txt
 def sample_dataset_available(sample_dir=None) -> bool
 ```
 

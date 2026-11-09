@@ -696,8 +696,6 @@ def test_load_sample_dataset_reads_the_workday_sample(tmp_path):
     from screening import pipeline
 
     _write_fake_workday_sample(tmp_path)
-    (tmp_path / "resumes").mkdir()                      # an older layout next to it is ignored
-    (tmp_path / "resumes" / "old.txt").write_text("old resume", encoding="utf-8")
     ta_file, docs, jd = pipeline.load_sample_dataset(tmp_path)
     assert ta_file[0] == "test_scores_export.xlsx"
     assert ta_file[1] == (tmp_path / "test_scores_export.xlsx").read_bytes()
@@ -709,15 +707,9 @@ def test_load_sample_dataset_reads_the_workday_sample(tmp_path):
         assert zf.namelist()[0].startswith("Resume/")
 
 
-def test_load_sample_dataset_falls_back_to_the_older_layout(tmp_path):
+def test_load_sample_dataset_without_a_sample(tmp_path):
     from screening import pipeline
 
-    (tmp_path / "ta_feed.csv").write_text("candidate_id,score\nC-1000042,90\n", encoding="utf-8")
-    (tmp_path / "resumes").mkdir()
-    (tmp_path / "resumes" / "C-1000042_Asha_Menon.txt").write_text("Python SQL", encoding="utf-8")
-    ta_file, docs, jd = pipeline.load_sample_dataset(str(tmp_path))
-    assert ta_file[0] == "ta_feed.csv" and [d.file_name for d in docs] == ["C-1000042_Asha_Menon.txt"]
-    assert jd is None
     empty = tmp_path / "empty"
     empty.mkdir()
     assert pipeline.load_sample_dataset(empty) == (None, [], None)

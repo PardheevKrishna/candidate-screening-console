@@ -212,22 +212,16 @@ DEFAULT_SAMPLE_DIR = Path(__file__).resolve().parent.parent / "data" / "sample"
 SAMPLE_TA_FILE = "test_scores_export.xlsx"   # Workday assessment export (2 sheets)
 SAMPLE_RESUME_ZIP = "Resume.zip"             # "Resume/" folder of multi-candidate PDF packets
 SAMPLE_JD_FILE = "job_description.txt"
-LEGACY_TA_FILE = "ta_feed.csv"               # older synthetic layout
-LEGACY_RESUME_DIR = "resumes"
 
 
 def _sample_ta_path(base: Path) -> Path | None:
-    for name in (SAMPLE_TA_FILE, LEGACY_TA_FILE):
-        if (base / name).is_file():
-            return base / name
-    return None
+    return base / SAMPLE_TA_FILE if (base / SAMPLE_TA_FILE).is_file() else None
 
 
 def sample_dataset_available(sample_dir: str | Path | None = None) -> bool:
     """True when the sample folder holds a TA export and/or resumes that load_sample_dataset reads."""
     base = Path(sample_dir) if sample_dir else DEFAULT_SAMPLE_DIR
-    return (_sample_ta_path(base) is not None or (base / SAMPLE_RESUME_ZIP).is_file()
-            or (base / LEGACY_RESUME_DIR).is_dir())
+    return _sample_ta_path(base) is not None or (base / SAMPLE_RESUME_ZIP).is_file()
 
 
 def load_sample_dataset(
@@ -235,9 +229,8 @@ def load_sample_dataset(
 ) -> tuple[tuple[str, bytes] | None, list[ResumeDoc], str | None]:
     """Load the synthetic Workday-style dataset written by generate_mock_data.py.
 
-    * TA file: ``test_scores_export.xlsx`` (falls back to an older ``ta_feed.csv``)
-    * resumes: ``Resume.zip`` as one upload (expanded and split by resume_parser); without it,
-      the files of an older ``resumes/`` folder
+    * TA file: ``test_scores_export.xlsx``
+    * resumes: ``Resume.zip`` as one upload (expanded and split by resume_parser)
     * job description: ``job_description.txt``
 
     Returns (ta_file, resume_docs, job_description_text). Missing pieces are None/[].
@@ -246,12 +239,7 @@ def load_sample_dataset(
     ta_path = _sample_ta_path(base)
     ta_file = (ta_path.name, ta_path.read_bytes()) if ta_path is not None else None
     zip_path = base / SAMPLE_RESUME_ZIP
-    if zip_path.is_file():
-        docs = [ResumeDoc(SAMPLE_RESUME_ZIP, zip_path.read_bytes(), source="folder")]
-    elif (base / LEGACY_RESUME_DIR).is_dir():
-        docs = resume_parser.load_resume_folder(base / LEGACY_RESUME_DIR)
-    else:
-        docs = []
+    docs = [ResumeDoc(SAMPLE_RESUME_ZIP, zip_path.read_bytes(), source="folder")] if zip_path.is_file() else []
     jd_path = base / SAMPLE_JD_FILE
     jd = jd_path.read_text(encoding="utf-8") if jd_path.is_file() else None
     return ta_file, docs, jd

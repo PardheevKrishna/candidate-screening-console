@@ -887,10 +887,6 @@ Caches need no clearing: cached datasets made by a different version of the pars
 discarded automatically and rebuilt on the next upload, and the LLM cache's file names include the
 model and prompt version, so old entries are simply not reused.
 
-If an earlier installation kept an API key for a hosted LLM service in `.streamlit/secrets.toml`,
-`.env` or the service environment, delete it there and have it revoked: this release does not use
-any such key.
-
 ## 14. Smoke test after installation
 
 Run these from the project folder with the virtual environment's Python

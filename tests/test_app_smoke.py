@@ -169,7 +169,8 @@ def test_sample_button_runs_pipeline_with_progress_and_caches_it(engine: dict[st
                                                                  monkeypatch: pytest.MonkeyPatch,
                                                                  tmp_path: Path) -> None:
     sample = tmp_path / "sample"
-    (sample / "resumes").mkdir(parents=True)
+    sample.mkdir()
+    (sample / "Resume.zip").write_bytes(b"PK")          # the sample button needs a sample to exist
     _patch(monkeypatch, pipeline, "DEFAULT_SAMPLE_DIR", sample)
     docs = [ResumeDoc("CAND-00001_Asha_Menon.txt", b"Asha Menon\nPython")]
     _patch(monkeypatch, pipeline, "load_sample_dataset",
