@@ -117,9 +117,9 @@ exits with an error if a check fails:
 | Resume mills (2 groups, 11 candidates) | **11 of 11 High**, each group recovered as its own cluster (C01, C02) |
 | Team projects (13 pairs) | **0 flagged High or Medium**, no pair linked into a cluster (all Low) |
 | Code-similarity rows ("Integrity Issues: Medium") | 2 of 2 Medium |
-| Prompt-injection resumes (hidden text, invisible characters, instructions) | **5 of 5 flagged** (Medium); hidden keywords counted as skills: 0 |
+| Hidden / adversarial resume text (5 resumes: hidden text, invisible characters, instructions) | **5 of 5 flagged at the expected level** (invisible characters only: Low; the other four: Medium); hidden keywords counted as skills: 0 |
 | Boilerplate-bullet resumes (decoy, 145 candidates) | 0 flagged High or Medium |
-| Overall | **13 of 13 ground-truth checks pass**. Risk levels: 11 High, 7 Medium, 38 Low, 2,077 Clear; 1,360 perfect scorers; 44 risk pairs in 2 clusters |
+| Overall | **13 of 13 ground-truth checks pass**. Risk levels: 11 High, 6 Medium, 39 Low, 2,077 Clear; 1,360 perfect scorers; 44 risk pairs in 2 clusters |
 
 ---
 
@@ -250,7 +250,7 @@ The **focus group** is candidates with HackerRank % ≥ 100 (adjustable in Confi
 | Timing | `Attempt Start/End Time`, `Time Taken` | Synchronized starts and submissions, matching durations, implausibly fast perfect scores. Timing is down-weighted for on-campus sessions at the same college, which are scheduled together |
 | Resume | parsed resumes | TF-IDF similarity of project and experience text, rare shared bullet lines (boilerplate filtered out), shared GitHub repos |
 | Team projects | parsed resumes | Two candidates who list the same 1–2 GitHub repos on otherwise different resumes (text similarity below 0.40, at most 1 shared rare bullet), as teammates do, get a small repo weight (15 instead of 35). A pair linked by nothing else has the pair type "Team project (likely legitimate)", is hidden from the risk network by default and is not counted as a collusion pattern; the reason asks the recruiter to verify each candidate's own role |
-| Hidden text / prompt injection | resume files | White, tiny, transparent or off-page PDF text, zero-width, bidirectional and tag characters, and instruction-like text aimed at AI screeners ("ignore previous instructions ..."). Individual flag weight 50; badge "Adversarial text detected in resume (Prompt Injection / Hidden Text)". Hidden text never counts towards skills and is never sent to the LLM |
+| Hidden text / prompt injection | resume files | White, tiny, transparent or off-page PDF text, zero-width, bidirectional and tag characters, and instruction-like text aimed at AI screeners ("ignore previous instructions ..."). One individual flag per resume, for the most serious kind found only: **Prompt injection** (an instruction aimed at AI screeners, visible, hidden or encoded in invisible characters; weight 50), **Hidden text in resume** (text a reader cannot see, such as white keyword stuffing; weight 35) or **Invisible characters in resume** (only dense zero-width, bidirectional or tag characters; weight 15, Low on its own because copy-paste can produce them). Risk tab badge "Hidden or adversarial text in resume: N candidate(s)". Hidden text never counts towards skills and is never sent to the LLM |
 | Identity | phone / email | One phone number or email used across several candidate IDs (duplicate applications of one person are handled by eligibility instead) |
 
 **Outputs:** a *commonality* table (attribute values over-represented among 100% scorers, with

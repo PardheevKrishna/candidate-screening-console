@@ -83,7 +83,6 @@ CANDIDATE_RISK_COLUMNS = [
     S.CANDIDATE_ID, S.IS_FOCUS, S.RISK_SCORE, S.RISK_LEVEL, S.RISK_REASONS, S.CLUSTER_ID,
     S.N_LINKS, S.MAX_PAIR_SCORE, S.INDIVIDUAL_SCORE, S.INJECTION_FLAGS,
 ]
-INJECTION_REASON = "Adversarial text detected in resume (Prompt Injection / Hidden Text)"
 
 # ---------------------------------------------------------------------------
 # Small-sample / precision guards (reported in RiskResult.params)
@@ -132,7 +131,9 @@ TIMING_SIGNALS = frozenset(k for k, s in SIGNALS.items() if s.timing)
 _SIGNAL_RANK = {k: i for i, k in enumerate(SIGNALS)}
 
 FLAG_LABELS: dict[str, str] = {
-    "prompt_injection": "Prompt injection / hidden text",
+    "prompt_injection": "Prompt injection",
+    "hidden_text": "Hidden text in resume",
+    "invisible_chars": "Invisible characters in resume",
     "plagiarism_flag": "HackerRank plagiarism flag",
     "speed_anomaly": "Speed anomaly",
     "high_code_similarity": "High code similarity",
@@ -605,11 +606,13 @@ def _individual_flags(ctx: _Ctx) -> pd.DataFrame:
                 label = "Assessment integrity issues" if severity else "HackerRank AI-proctoring status"
                 rows.append((i, "integrity_status", f"{label}: {_clip(t, 60)}"))
 
-    # Hidden / adversarial resume text (prompt injection), found while the resume was parsed.
+    # Hidden or adversarial resume text found while the resume was parsed: one flag per resume, for
+    # its most serious kind (prompt injection > hidden text > invisible characters).
     for i, p in sorted(ctx.resumes.items()):
         findings = _injection_findings(p)
-        if findings:
-            rows.append((i, "prompt_injection", f"{INJECTION_REASON}: '{injection.reason_snippet(findings)}'"))
+        flag = injection.flag_kind(findings)
+        if flag:
+            rows.append((i, flag, f"{injection.FLAG_REASONS[flag]}: '{injection.reason_snippet(findings)}'"))
 
     notes = _str_col(df, S.PROCTORING_FLAGS)
     if notes is None:

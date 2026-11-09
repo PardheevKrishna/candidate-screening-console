@@ -208,7 +208,9 @@ class RiskConfig:
         "out_of_window_time": 10.0,
         "copy_paste": 10.0,
         "secure_mode_exits": 10.0,
-        "prompt_injection": 50.0,     # hidden / adversarial text aimed at screeners or AI in the resume
+        "prompt_injection": 50.0,     # instruction aimed at AI screeners in the resume (visible or hidden)
+        "hidden_text": 35.0,          # resume text a reader cannot see (e.g. white keyword stuffing)
+        "invisible_chars": 15.0,      # only zero-width / bidi characters (obfuscation or copy-paste)
     })
 
 

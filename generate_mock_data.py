@@ -2847,7 +2847,9 @@ def build_dataset(n: int = DEFAULT_N, seed: int = DEFAULT_SEED, packets: int | N
         groups.append(_group(
             f"inject_{g:02d}", INJECTION, [app_of[p.pid][0].cid],
             "Resume with text aimed at automated screeners (" + ", ".join(kinds) + "). Must be flagged; hidden "
-            "keywords must not count as skills.", expected_min_level="Medium", signals=["prompt_injection"],
+            "keywords must not count as skills.",
+            expected_min_level="Low" if tuple(kinds) == ("invisible_chars",) else "Medium",
+            signals=["invisible_chars" if tuple(kinds) == ("invisible_chars",) else "prompt_injection"],
             details=details))
     boiler_bullets: dict[int, list[str]] = {}
     for p in boiler:

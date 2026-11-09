@@ -120,7 +120,7 @@ def _augment(result: PipelineResult) -> PipelineResult:
     team = {"cand_a": TEAM[0], "cand_b": TEAM[1], "pair_score": 15.0, "signal_keys": charts.TEAM_SIGNAL,
             "signals": f"Same GitHub repo {TEAM_REPO} on otherwise different resumes (team project)",
             "shared_github": TEAM_REPO, "shared_hashes": "", "shared_bullets": 0}
-    flags = [{S.CANDIDATE_ID: INJECTED, "flag_key": "prompt_injection", "flag": "Prompt injection / hidden text",
+    flags = [{S.CANDIDATE_ID: INJECTED, "flag_key": "prompt_injection", "flag": "Prompt injection",
               "detail": f"{charts.INJECTION_LABEL}: '{SNIPPET[:40]}...'", "weight": 50.0},
              {S.CANDIDATE_ID: MEDIUM_INTEGRITY, "flag_key": "integrity_status", "flag": "Proctoring integrity status",
               "detail": "Assessment integrity issues: Medium", "weight": 20.0}]
@@ -437,7 +437,7 @@ def test_deep_dive_duplicate_applications_link_both_ways(data: tuple[Any, Pipeli
 def test_deep_dive_shows_hidden_text_findings_and_packet_pages(data: tuple[Any, PipelineResult]) -> None:
     at = _app(data, "deepdive", **{state.K_DD_CANDIDATE: INJECTED}).run()
     _assert_clean(at)
-    assert charts.INJECTION_LABEL in _texts(at.warning)
+    assert "Hidden text in resume (invisible to readers)" in _texts(at.warning)   # the most serious kind found
     findings = _frame(at, "kind", "snippet", "detail")
     assert findings["kind"].tolist() == ["Hidden text", "Invisible characters"]   # most serious first
     assert findings["snippet"].iloc[0] == SNIPPET
@@ -523,11 +523,11 @@ def test_risk_anomalies_filter_and_assessment_integrity(data: tuple[Any, Pipelin
     anomalies = _frame(at, "flag", "detail", "weight")
     assert _row(anomalies, MEDIUM_INTEGRITY)[S.INTEGRITY_STATUS] == "Medium"
     pills = at.button_group(key=tab_risk.K_FLAG_FILTER)
-    assert "Prompt injection / hidden text" in pills.options
-    pills.set_value(["Prompt injection / hidden text"]).run()
+    assert "Prompt injection" in pills.options
+    pills.set_value(["Prompt injection"]).run()
     _assert_clean(at)
     filtered = _frame(at, "flag", "detail", "weight")
-    assert set(filtered["flag"]) == {"Prompt injection / hidden text"} and INJECTED in filtered[S.CANDIDATE_ID].tolist()
+    assert set(filtered["flag"]) == {"Prompt injection"} and INJECTED in filtered[S.CANDIDATE_ID].tolist()
 
 
 # ---------------------------------------------------------------------------

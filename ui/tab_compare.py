@@ -20,7 +20,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from screening import export
+from screening import export, injection
 from screening import schema as S
 from screening import skills as skill_taxonomy
 from screening.config import AppConfig
@@ -583,7 +583,8 @@ def _candidate_details(row: pd.Series, parsed: ParsedResume | None) -> None:
             st.caption("No internships detected.")
     st.markdown("**Integrity signals**")
     if split_list(_raw(row, S.INJECTION_FLAGS), S.SEP_REASONS):
-        st.warning(charts.INJECTION_LABEL, icon=":material/gpp_bad:")
+        st.warning(injection.flag_headline(_raw(row, S.INJECTION_FLAGS)) or charts.INJECTION_LABEL,
+                   icon=":material/gpp_bad:")
     reasons = split_list(_raw(row, S.RISK_REASONS), S.SEP_REASONS)
     if reasons:
         st.markdown("\n".join(f"- {theme.md_escape(r)}" for r in reasons))

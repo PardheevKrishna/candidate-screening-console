@@ -155,7 +155,7 @@ evaluate(prepared, cfg, *, risk_result=None) -> PipelineResult
   scoring.score_candidates(base, parsed_by_candidate, cfg, mode=mode)
                                                 tiers (only when enabled), "auto" missing-resume policy
   risk.run_risk_analysis(scored, parsed_by_candidate, cfg, parsed)      (skipped when risk_result is given)
-                                                team-project rule, prompt_injection flag,
+                                                team-project rule, resume-text flags,
                                                 duplicate applications never paired
   _merge_risk ──▶ scoring.apply_shortlist(df, cfg)
                                                 eligibility rules -> INELIGIBILITY JSON (incl. exclusions
@@ -513,6 +513,10 @@ def looks_like_instruction(text) -> bool
 def summarize(findings, limit=6) -> str                # " | "-joined, most serious first (injection_flags)
 def finding_summary(f, width=80) -> str
 def reason_snippet(findings, width=60) -> str          # short snippet for the risk reason
+FLAG_KEYS = ("prompt_injection", "hidden_text", "invisible_chars")   # risk flags, most serious first
+FLAG_REASONS: dict[str, str]                           # flag key -> reason headline
+def flag_kind(findings) -> str | None                  # the one risk flag for a resume
+def flag_headline(injection_flags) -> str              # headline for an injection_flags summary ("" if none)
 ```
 
 * **Hidden PDF text** (`kind` "hidden_text"): white or same-colour text on a white / same-colour
@@ -532,9 +536,18 @@ def reason_snippet(findings, width=60) -> str          # short snippet for the r
   chatbot") and sentences that describe security work ("detects prompts such as 'ignore previous
   instructions'") do not match.
 * Limits: snippets are cut to 300 characters; at most 12 findings per document.
-* Where findings go: `ParsedResume.injection_findings` -> risk individual flag `prompt_injection`
-  (weight 50, reason "Adversarial text detected in resume (Prompt Injection / Hidden Text): '{snippet}'")
-  and the `injection_flags` column; hidden text never reaches sections, skills or scores; the LLM
+* Risk flag per resume (`flag_kind(findings)`; only the most serious kind counts, so one resume is
+  never weighted twice): `FLAG_PROMPT_INJECTION` "prompt_injection" when any finding reads like an
+  instruction to AI screeners (kind "instruction", or any finding whose detail mentions an
+  instruction, such as hidden text that reads like one), else `FLAG_HIDDEN_TEXT` "hidden_text" when any finding
+  is hidden PDF text, else `FLAG_INVISIBLE_CHARS` "invisible_chars"; None without findings.
+  `FLAG_REASONS` holds the reason headlines: "Instruction aimed at AI screeners found in resume
+  (prompt injection)", "Hidden text in resume (invisible to readers)" and "Unusual invisible
+  characters in resume (possible obfuscation or copy-paste artefact)"; `flag_headline(injection_flags)`
+  returns the headline for an `injection_flags` summary (Deep-Dive section D and Compare warnings).
+* Where findings go: `ParsedResume.injection_findings` -> one risk individual flag per resume,
+  `prompt_injection` (weight 50), `hidden_text` (35) or `invisible_chars` (15), with the reason
+  "{FLAG_REASONS[flag]}: '{snippet}'", and the `injection_flags` column; hidden text never reaches sections, skills or scores; the LLM
   layer drops instruction-like lines before any prompt. The UI shows the snippets in Deep-Dive section
   "D. Integrity" and in the Risk tab's "Adversarial resume text" section; the Excel report and the
   evidence pack list them too.
@@ -795,8 +808,12 @@ inside one signal never aborts the analysis.
    high_code_similarity, integrity_status (Workday Medium / High: "Assessment integrity issues:
    Medium"; HackerRank Review / Suspicious / Flagged: "HackerRank AI-proctoring status: ..."),
    proctoring_flags (non-empty notes), out_of_window_time, secure_mode_exits, tab_switches, copy_paste
-   and **prompt_injection** (hidden or adversarial resume text: "Adversarial text detected in resume
-   (Prompt Injection / Hidden Text): '{snippet}'"). Columns: candidate_id, flag_key, flag, detail, weight.
+   and one resume-text flag per resume, the most serious kind only (`injection.flag_kind`):
+   **prompt_injection** ("Prompt injection": "Instruction aimed at AI screeners found in resume (prompt
+   injection): '{snippet}'"), **hidden_text** ("Hidden text in resume": "Hidden text in resume
+   (invisible to readers): '{snippet}'") or **invisible_chars** ("Invisible characters in resume":
+   "Unusual invisible characters in resume (possible obfuscation or copy-paste artefact):
+   '{snippet}'"). Columns: candidate_id, flag_key, flag, detail, weight.
 4. **Clusters**: graph of pairs with pair_score >= edge_threshold (networkx connected
    components, size >= 2), ids "C01".. ordered by max pair score desc then size. Columns:
    cluster_id, size, members (", "), member_names (", "), risk_level, max_pair_score,
@@ -816,10 +833,12 @@ Default weights (`RiskConfig`): pair - shared_answer_hash 35 (per answer, cap 2x
 35, team project repo 15, resume_text_high 30, resume_text_medium 15, shared_bullets 8 (per bullet, cap
 3x), same_ip 20, same_subnet 5, sync_submission 15, sync_start 10, duration_match 5, same_phone 40,
 same_email 40, sequential_same_ip 25, plagiarism_match 40; individual - prompt_injection 50,
-plagiarism_flag 30, speed_anomaly 25, high_code_similarity 20, integrity_status 20, proctoring_flags 15,
-tab_switches 10, out_of_window_time 10, copy_paste 10, secure_mode_exits 10. Thresholds: edge 30,
-medium 30, high 60. So a prompt-injection resume alone is Medium, and a Workday row with "Integrity
-Issues: Medium" plus an Integrity Summary is Medium (20 + 15).
+hidden_text 35, invisible_chars 15, plagiarism_flag 30, speed_anomaly 25, high_code_similarity 20,
+integrity_status 20, proctoring_flags 15, tab_switches 10, out_of_window_time 10, copy_paste 10,
+secure_mode_exits 10. Thresholds: edge 30, medium 30, high 60. So a prompt-injection or hidden-text
+resume alone is Medium, invisible characters alone are Low (zero-width characters can come from
+copy-paste), and a Workday row with "Integrity Issues: Medium" plus an Integrity Summary is Medium
+(20 + 15).
 
 Risk flags are **review evidence, not verdicts**: wording must say "pattern consistent with ..."
 not "cheated".
@@ -1348,8 +1367,9 @@ Risk usage (in addition to the signals above):
   `S.INTEGRITY_CONCERN_VALUES` {review, suspicious, flagged, medium, high}, `proctoring_flags`
   non-empty, `out_of_window_time` (>= out_of_window_sec_threshold), `secure_mode_exits`
   (>= secure_mode_exit_threshold), `tab_switches` (out_of_window_events), `copy_paste`
-  (editor_paste_count), `plagiarism_flag`, `speed_anomaly`, `prompt_injection`. Weights in
-  cfg.risk.individual_weights.
+  (editor_paste_count), `plagiarism_flag`, `speed_anomaly`, and one of `prompt_injection`,
+  `hidden_text`, `invisible_chars` per resume. Weights in cfg.risk.individual_weights (12 keys, one
+  Config box each).
 * Pair signal `plagiarism_match`: A.plagiarism_match_id == B.candidate_id (either
   direction) -> weight cfg.risk.pair_weights["plagiarism_match"]; included when at least one
   side is in the focus group (the matched "source" may have scored < 100%).
@@ -1438,14 +1458,16 @@ sample is generated on each machine (data/ is gitignored). Full procedure: [DEPL
   evaluate (rules only, no LLM), prints mode, counts, risk levels, clusters, the shortlist outcome and
   stage timings, and - when `<sample>/_ground_truth/` exists - evaluates 13 checks: duplicate recall,
   duplicate precision, institutional application kept, namesakes kept apart, duplicates marked
-  Ineligible, team projects not flagged, resume mills flagged, code-similarity rows flagged, prompt
-  injection flagged, hidden keywords not counted as skills, boilerplate-bullet resumes not flagged,
+  Ineligible, team projects not flagged, resume mills flagged, code-similarity rows flagged, hidden /
+  adversarial resume text flagged (each planted resume at its expected level), hidden keywords not
+  counted as skills, boilerplate-bullet resumes not flagged,
   missing-resume count, unscored row not shortlisted. Options: `--sample DIR`, `--excel out.xlsx`,
   `--strict` (exit 1 when a check fails). Output contains candidate IDs and counts only.
 * On the default sample (`python generate_mock_data.py`, seed 42) all 13 checks pass: 7 of 7 planted
   duplicate pairs found with no false pair (the institutional application kept each time, 4 namesake
   pairs kept apart), 13 team-project pairs with no member above Low, 11 of 11 resume-mill candidates
-  High in 2 clusters, both code-similarity rows Medium, 5 of 5 prompt-injection resumes Medium with no
-  hidden keyword counted as a skill, 0 of 145 boilerplate-bullet resumes flagged, 256 applications
+  High in 2 clusters, both code-similarity rows Medium, 5 of 5 hidden / adversarial-text resumes at the
+  expected level (the invisible-characters-only resume Low, the other four Medium) with no hidden
+  keyword counted as a skill, 0 of 145 boilerplate-bullet resumes flagged, 256 applications
   (12.0%) without a resume, and the unscored "#N/A" row Ineligible. Shortlist: 299 Shortlisted, 1
   Shortlisted (Integrity Review), 8 Ineligible (Duplicate Application 7, Assessment 1).

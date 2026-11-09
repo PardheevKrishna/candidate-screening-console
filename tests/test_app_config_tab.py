@@ -357,7 +357,7 @@ def test_team_project_settings_and_prompt_injection_weight(engine: dict[str, Any
     at = _open(engine, cfg)
     k = _k(at)
     weight = at.number_input(key=f"{k}_iw_prompt_injection")
-    assert weight.label == "Prompt injection / hidden text" and weight.value == 50.0
+    assert weight.label == "Prompt injection" and weight.value == 50.0
     repos = at.number_input(key=f"{k}_risk_team_max_shared_repos")
     assert repos.value == 2 and tab_config.TEAM_HELP in repos.help
     assert any(tab_config.TEAM_HELP in c.value for c in at.caption)

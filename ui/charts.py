@@ -329,7 +329,7 @@ def points_breakdown(earned: Mapping[str, float], available: Mapping[str, float]
 TEAM_SIGNAL = "team_github_repo"
 TEAM_PAIR_LABEL = "Team project (likely legitimate)"
 SIGNAL_PAIR_LABEL = "Integrity signal"
-INJECTION_LABEL = "Adversarial text detected in resume (Prompt Injection / Hidden Text)"
+INJECTION_LABEL = "Hidden or adversarial text in resume"
 INJECTION_KIND_LABELS: dict[str, str] = {
     "instruction": "Instruction aimed at screeners or AI tools",
     "hidden_text": "Hidden text",

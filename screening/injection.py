@@ -41,6 +41,9 @@ __all__ = [
     "finding_summary",
     "reason_snippet",
     "looks_like_instruction",
+    "flag_kind",
+    "FLAG_KEYS",
+    "FLAG_REASONS",
     "PageScan",
     "ScanBudget",
     "scan_page",
@@ -332,6 +335,44 @@ def reason_snippet(findings: Iterable[dict[str, Any]] | None, width: int = 60) -
     """Short snippet of the most serious finding (instructions first)."""
     items = sorted((f for f in findings or [] if isinstance(f, dict)), key=_rank)
     return _no_pipes(_clip(items[0].get("snippet", ""), width)) if items else ""
+
+
+# Risk flag per resume: only the most serious kind counts, so one resume is never weighted twice.
+FLAG_PROMPT_INJECTION = "prompt_injection"   # instruction aimed at AI screeners (visible or hidden)
+FLAG_HIDDEN_TEXT = "hidden_text"             # text a reader cannot see (white, tiny, off-page, hidden layer)
+FLAG_INVISIBLE_CHARS = "invisible_chars"     # only zero-width / bidi / tag characters
+FLAG_KEYS = (FLAG_PROMPT_INJECTION, FLAG_HIDDEN_TEXT, FLAG_INVISIBLE_CHARS)
+FLAG_REASONS = {
+    FLAG_PROMPT_INJECTION: "Instruction aimed at AI screeners found in resume (prompt injection)",
+    FLAG_HIDDEN_TEXT: "Hidden text in resume (invisible to readers)",
+    FLAG_INVISIBLE_CHARS: "Unusual invisible characters in resume (possible obfuscation or copy-paste artefact)",
+}
+
+
+def flag_kind(findings: Iterable[dict[str, Any]] | None) -> str | None:
+    """The risk flag for one resume: prompt_injection when any finding reads like an instruction to AI
+    screeners (visible, hidden or encoded in invisible characters), else hidden_text, else
+    invisible_chars; None without findings."""
+    items = [f for f in findings or [] if isinstance(f, dict)]
+    if not items:
+        return None
+    if any(f.get("kind") == KIND_INSTRUCTION or "instruction" in str(f.get("detail", "")) for f in items):
+        return FLAG_PROMPT_INJECTION
+    if any(f.get("kind") == KIND_HIDDEN for f in items):
+        return FLAG_HIDDEN_TEXT
+    return FLAG_INVISIBLE_CHARS
+
+
+def flag_headline(injection_flags: Any) -> str:
+    """Reviewer headline for an injection_flags summary (see summarize()); "" when there is none."""
+    text = str(injection_flags or "").strip()
+    if not text:
+        return ""
+    if text.startswith("Instruction aimed at AI screeners") or "instruction" in text.casefold():
+        return FLAG_REASONS[FLAG_PROMPT_INJECTION]
+    if "Hidden text (" in text:
+        return FLAG_REASONS[FLAG_HIDDEN_TEXT]
+    return FLAG_REASONS[FLAG_INVISIBLE_CHARS]
 
 
 # ===========================================================================

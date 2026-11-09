@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from screening import export, llm, scoring
+from screening import export, injection, llm, scoring
 from screening import schema as S
 from screening.config import AppConfig
 from screening.models import ParsedResume, PipelineResult
@@ -547,7 +547,8 @@ def _integrity(result: PipelineResult, row: pd.Series, parsed: ParsedResume | No
         st.caption(f":material/report: Assessment integrity status: **{theme.md_escape(status)}** (see section A).")
     injected = injection_table(row, parsed)
     if not injected.empty:
-        st.warning(charts.INJECTION_LABEL, icon=":material/gpp_bad:")
+        st.warning(injection.flag_headline(_s(row, S.INJECTION_FLAGS)) or charts.INJECTION_LABEL,
+                   icon=":material/gpp_bad:")
         cc = st.column_config
         st.dataframe(injected, hide_index=True, width="stretch",
                      column_config={"kind": cc.TextColumn("Kind"), "snippet": cc.TextColumn("Snippet", width="large"),

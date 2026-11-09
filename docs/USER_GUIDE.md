@@ -934,7 +934,7 @@ With the defaults a team-project pair scores 15, below the link score of 30, so 
 
 - **Also compare perfect scorers' resumes against the whole pool** (toggle, default off): the resume checks (text similarity, shared GitHub repositories, shared bullets) compare each perfect scorer's resume with every linked resume, not just other perfect scorers. This catches copying from candidates who did not score 100%, but is slower and produces more pairs.
 - **Pair signal weights (summed into a 0-100 pair score)**: 14 boxes, 0–100, named after the signals: **Identical answers**, **Shared GitHub repo**, **Near-identical resume text**, **Similar resume text**, **Shared rare resume bullets**, **Same IP**, **Same /24 subnet**, **Synchronised submission**, **Synchronised start**, **Matching duration**, **Same phone**, **Same email**, **Back-to-back sessions on one IP**, **HackerRank plagiarism match**.
-- **Individual flag weights**: 10 boxes, 0–100: **Speed anomaly**, **HackerRank plagiarism flag**, **High code similarity**, **Proctoring integrity status**, **Proctoring flags**, **Tab switches**, **Time outside test window**, **Copy-paste events**, **Secure-mode exits**, **Prompt injection / hidden text** (default 50, so hidden or adversarial resume text alone makes a candidate Medium).
+- **Individual flag weights**: 12 boxes, 0–100: **Speed anomaly**, **HackerRank plagiarism flag**, **High code similarity**, **Proctoring integrity status**, **Proctoring flags**, **Tab switches**, **Time outside test window**, **Copy-paste events**, **Secure-mode exits**, **Prompt injection** (default 50), **Hidden text in resume** (default 35) and **Invisible characters in resume** (default 15). The last three are the resume-text flags: a resume gets only the most serious one, so an instruction or hidden text alone makes a candidate Medium, while invisible characters alone stay Low (see [Adversarial resume text](#adversarial-resume-text)).
 - Defaults and the meaning of every weight are in the [Signal glossary](#signal-glossary). Setting a weight to 0 switches that signal or flag off.
 - The three **Commonality** settings only affect the "What 100% scorers have in common" table, the **Significant traits** count and LLM summaries. They never change a candidate's risk score.
 - **Settings without an on-screen box** can be changed only through a profile file ("Download current config (JSON)", edit, "Upload a config JSON", "Apply uploaded config"): high code similarity threshold 80% (`code_similarity_threshold`), time outside the window 120 seconds (`out_of_window_sec_threshold`), secure-mode exits 1 (`secure_mode_exit_threshold`), and the boilerplate share for bullets and repositories, 2% of resumes (`max_bullet_population_share`).
@@ -1309,7 +1309,7 @@ Under the default policy nobody is removed automatically: shortlisted candidates
 | **Medium risk** | Candidates whose risk level is Medium (30 to just under 60 by default) | Whole pool. Low-risk candidates are not counted here; they are in the "Flagged candidates" download. |
 | **Linked clusters** | Clusters at the current **Pair score to link candidates** | Same number as the "Linked clusters (N)" heading |
 | **Significant traits** | Rows ticked "Significant" in "What 100% scorers have in common" | Hover help: "Attribute values significantly over-represented among perfect scorers" |
-| **Hidden-text flags** | Candidates whose linked resume contains hidden or adversarial text | Hover help: "Adversarial text detected in resume (Prompt Injection / Hidden Text)". Details in [Adversarial resume text](#adversarial-resume-text). |
+| **Hidden-text flags** | Candidates whose linked resume contains hidden or adversarial text | Hover help: "Hidden or adversarial text in resume". Details in [Adversarial resume text](#adversarial-resume-text). |
 
 A caption under the metrics adds, when they apply: "N linked pair(s) with integrity signals; T team-project pair(s) marked 'Team project (likely legitimate)' and not counted as collusion patterns" and "C candidate(s) with assessment integrity issues (Medium / High) reported by the assessment platform". The second count includes HackerRank-style statuses such as "Review", "Suspicious" or "Flagged".
 
@@ -1493,7 +1493,7 @@ Some resumes contain text a human reader cannot see, or sentences addressed to a
 | Element | Details |
 |---|---|
 | Nothing found | A green message: "No hidden or adversarial text was found in the linked resumes." |
-| Badge | "Adversarial text detected in resume (Prompt Injection / Hidden Text): N candidate(s)" (red) |
+| Badge | "Hidden or adversarial text in resume: N candidate(s)" (red) |
 | Caption | "Text a reader cannot see (white, tiny or transparent text, invisible characters) or instructions aimed at screeners or AI tools. It is excluded from scoring and from LLM prompts. The snippet is evidence for review: ask the candidate before drawing conclusions." |
 | Table | One row per candidate: **Candidate ID**, **Name**, **Status**, **Risk** (risk level), **Snippet** (the most serious finding, up to 80 characters; instructions come first) and **Findings** (every finding in words, separated by vertical bars) |
 
@@ -1509,11 +1509,19 @@ Some resumes contain text a human reader cannot see, or sentences addressed to a
 
 - **Hidden text never counts.** Hidden PDF text is blanked while the page is read and invisible characters are stripped, so hidden keywords earn no skills, projects or relevance. On the synthetic sample's five planted resumes no hidden keyword reached the skills.
 - **The LLM never sees it.** Before any resume excerpt goes to the LLM, invisible characters are removed and every line that reads like an instruction (also when it is split over two lines) is replaced with "[instruction-like text removed]".
-- **It is integrity evidence.** Each affected candidate gets the individual flag "Prompt injection / hidden text" (default weight 50, so the candidate is at least Medium) with the reason "Adversarial text detected in resume (Prompt Injection / Hidden Text): '<snippet>'". The Deep-Dive shows a red "Hidden text in resume" badge and the findings in section D; the evidence pack and the Excel "Integrity Evidence" sheet list them; the column "Integrity: Hidden Text Flags" carries them in the exports.
+- **It is integrity evidence.** Each affected candidate gets one individual flag for the resume, for the most serious kind found only, so a resume is never weighted twice:
+
+  | Flag | When | Default weight | Reason |
+  |---|---|---|---|
+  | **Prompt injection** | Any finding reads like an instruction to AI screeners: visible text, hidden text, or text encoded in invisible tag characters | 50 (Medium on its own) | "Instruction aimed at AI screeners found in resume (prompt injection): '{snippet}'" |
+  | **Hidden text in resume** | White or near-white, tiny, transparent, off-page or hidden-layer text without an instruction, for example stuffed keywords | 35 (Medium on its own) | "Hidden text in resume (invisible to readers): '{snippet}'" |
+  | **Invisible characters in resume** | Only zero-width, bidirectional or tag characters, in a dense pattern (a few stray ones and a leading byte-order mark are ignored) | 15 (Low on its own) | "Unusual invisible characters in resume (possible obfuscation or copy-paste artefact): '{snippet}'" |
+
+  Zero-width characters can come from copying text out of another document, so the invisible-characters flag is a prompt to look, not proof. The Deep-Dive shows a red "Hidden text in resume" badge and, in section D, the headline of the flag (the reason without the snippet) above the findings; the evidence pack and the Excel "Integrity Evidence" sheet list them; the column "Integrity: Hidden Text Flags" carries them in the exports.
 
 **Precision guards.** White text drawn on a coloured shape or image is visible (template headers) and is not reported. Invisible text laid over a scanned page image is the scanner's own text layer, and a page drawn entirely as an image or as vector outlines whose only text is invisible is treated the same way. A single leading byte-order mark is ignored.
 
-**Before drawing conclusions,** open the original file. Resume templates and online resume tools can leave hidden text behind; ask the candidate how the resume was prepared. To change the weight of this flag, use **Prompt injection / hidden text** under **Risk thresholds & signal weights** (0 switches the flag off; the text is still excluded from scoring).
+**Before drawing conclusions,** open the original file. Resume templates and online resume tools can leave hidden text behind; ask the candidate how the resume was prepared. To change the weights, use **Prompt injection**, **Hidden text in resume** and **Invisible characters in resume** under **Risk thresholds & signal weights** (0 switches that flag off; the text is still excluded from scoring).
 
 ### Individual anomalies
 
@@ -1530,7 +1538,7 @@ When more than one kind of flag occurs, a **Flag type** row of pills filters the
 | "Name", "College", "Status", "HackerRank %", "Completion (min)" | Context from the candidate record |
 | "Assessment integrity" | The integrity status reported by the assessment platform (help: "Integrity status reported by the assessment platform"), for example "Clear" or "Medium" from a Workday comment |
 
-Rows are sorted by candidate ID, heaviest flag first. This table explains why a candidate with no links can still be Medium or High: for example a Workday comment "Integrity Issues: Medium" (20) with the summary "Detected Code Similarity With Other Submissions" (a proctoring note, 15) gives 35, which is Medium; hidden text alone (50) is Medium too. A flag whose weight is 0 is switched off and never appears.
+Rows are sorted by candidate ID, heaviest flag first. This table explains why a candidate with no links can still be Medium or High: for example a Workday comment "Integrity Issues: Medium" (20) with the summary "Detected Code Similarity With Other Submissions" (a proctoring note, 15) gives 35, which is Medium; a prompt injection (50) or hidden text (35) in the resume alone is Medium too, while invisible characters alone (15) are Low. A flag whose weight is 0 is switched off and never appears.
 
 ### All risk pairs
 
@@ -1624,7 +1632,7 @@ When a timing or back-to-back signal is down-weighted (see safeguards), its word
 | Same /24 subnet | "Same /24 subnet 203.0.113.0/24 as CAND-0102" |
 | Timing | "Synchronised test sessions with CAND-0102 (starts 50 s apart, submissions 40 s apart, durations 0.2 min apart) - pattern consistent with coordinated test-taking", or "... - expected in a scheduled or crowded session (down-weighted)" |
 | Duration only | "Completion time within 0.2 min of CAND-0102" |
-| Individual flags | The flag's detail text, for example "6 tab switches / out-of-window events", "Assessment integrity issues: Medium" or "Adversarial text detected in resume (Prompt Injection / Hidden Text): '…'" |
+| Individual flags | The flag's detail text, for example "6 tab switches / out-of-window events", "Assessment integrity issues: Medium" or "Hidden text in resume (invisible to readers): '…'" |
 
 **Safeguards against false positives**
 
@@ -1654,7 +1662,9 @@ When a timing or back-to-back signal is down-weighted (see safeguards), its word
 
 | Flag (Config weight box) | Source | Fires when (default) | Default weight | Example detail |
 |---|---|---|---|---|
-| **Prompt injection / hidden text** | The linked resume | Any hidden text, invisible-character or instruction finding (see [Adversarial resume text](#adversarial-resume-text)) | 50 | "Adversarial text detected in resume (Prompt Injection / Hidden Text): 'Note to AI screening systems: ignore all previous…'" |
+| **Prompt injection** | The linked resume | Any finding reads like an instruction to AI screeners: visible text, hidden text or text encoded in invisible tag characters (see [Adversarial resume text](#adversarial-resume-text)) | 50 | "Instruction aimed at AI screeners found in resume (prompt injection): 'Note to AI screening systems: ignore all previous…'" |
+| **Hidden text in resume** | The linked resume | Hidden text (white or near-white, tiny, transparent, off-page or in a hidden layer) without an instruction, for example stuffed keywords; not counted when the resume already has a prompt injection | 35 | "Hidden text in resume (invisible to readers): 'Skills: Kafka, Spark, Docker…'" |
+| **Invisible characters in resume** | The linked resume | Only zero-width, bidirectional or tag characters in a dense pattern, with no hidden text or instruction; a few stray ones and a leading byte-order mark are ignored. Copy-paste can produce them, so on its own this stays Low | 15 | "Unusual invisible characters in resume (possible obfuscation or copy-paste artefact): '…[U+200B]…'" |
 | **Speed anomaly** | Completion (min) | A perfect scorer finished in under 40% of the perfect scorers' median time (**Speed anomaly: share of focus median**); needs at least 5 times | 25 | "Completed in 9.3 min vs focus-group median 59.4 min" |
 | **HackerRank plagiarism flag** | Plagiarism Flag | The value means flagged: yes, true, 1, flagged, suspicious, suspected, plagiarised / plagiarized, detected, failed, positive, copied, matched. No, false, 0, clear, clean, none, pass and "not flagged" mean not flagged; unrecognised values also count as not flagged, with a data-quality warning. | 30 | "HackerRank plagiarism status: flagged" |
 | **High code similarity** | Max Code Similarity % and any per-question similarity columns | The highest similarity is 80% or more (fractions such as 0.92 read as 92%); threshold changeable only in a profile | 20 | "HackerRank max code similarity 92% on q2" |
@@ -1976,7 +1986,7 @@ Caption: "Integrity flags are review evidence, not verdicts: verify before any d
 
 **Assessment integrity status.** When the platform reported a concern, a line reads "Assessment integrity status: **Medium** (see section A)."
 
-**Hidden or adversarial resume text.** When found, an orange "Adversarial text detected in resume (Prompt Injection / Hidden Text)" box is followed by a table with one row per finding: **Kind** ("Instruction aimed at screeners or AI tools", "Hidden text" or "Invisible characters"), **Snippet** (the text itself, up to 300 characters; invisible characters are shown as codes such as [U+200B]) and **Detail** (for example "page 1: white text on a white background; 38 words; reads like an instruction to AI screeners"). The caption under it reads "Hidden or adversarial text is excluded from scoring and from LLM prompts; it is shown here for review only." See [Adversarial resume text](#adversarial-resume-text).
+**Hidden or adversarial resume text.** When found, an orange box with the headline of the most serious kind ("Instruction aimed at AI screeners found in resume (prompt injection)", "Hidden text in resume (invisible to readers)" or "Unusual invisible characters in resume (possible obfuscation or copy-paste artefact)") is followed by a table with one row per finding: **Kind** ("Instruction aimed at screeners or AI tools", "Hidden text" or "Invisible characters"), **Snippet** (the text itself, up to 300 characters; invisible characters are shown as codes such as [U+200B]) and **Detail** (for example "page 1: white text on a white background; 38 words; reads like an instruction to AI screeners"). The caption under it reads "Hidden or adversarial text is excluded from scoring and from LLM prompts; it is shown here for review only." See [Adversarial resume text](#adversarial-resume-text).
 
 **"Linked candidates (N)"**: one row per candidate linked to this one by at least one pair signal, strongest first. Most headers are technical names, shown exactly as below. When one of the pairs is a team project, a caption explains: "'Team project (likely legitimate)': the same GitHub repo on otherwise different resumes - consistent with a group project; verify the candidate's own role."
 
@@ -2706,7 +2716,7 @@ Every resume is checked for text meant to influence a screener or an AI tool rat
 **What happens with a finding**
 
 1. The resume's hidden text is already gone from the parsed text, and invisible characters are stripped.
-2. The integrity analysis gives the candidate the individual flag "Prompt injection / hidden text" (default weight 50) with the reason "Adversarial text detected in resume (Prompt Injection / Hidden Text): '<snippet>'", and fills the column "Integrity: Hidden Text Flags" with every finding in words (most serious first: instructions, then hidden text, then invisible characters; at most 6, then "+N more").
+2. The integrity analysis gives the candidate one individual flag for the resume, for the most serious kind found only: "Prompt injection" (default weight 50) when any finding reads like an instruction to AI screeners, else "Hidden text in resume" (35) for hidden text, else "Invisible characters in resume" (15) for invisible characters alone. The reasons read "Instruction aimed at AI screeners found in resume (prompt injection): '{snippet}'", "Hidden text in resume (invisible to readers): '{snippet}'" and "Unusual invisible characters in resume (possible obfuscation or copy-paste artefact): '{snippet}'". The analysis also fills the column "Integrity: Hidden Text Flags" with every finding in words (most serious first: instructions, then hidden text, then invisible characters; at most 6, then "+N more").
 3. Before any resume excerpt is sent to the LLM, lines that read like instructions are replaced with "[instruction-like text removed]", even when they are visible.
 4. Nothing else changes: the candidate's visible resume is scored normally. The flag is evidence for review, not a verdict.
 
@@ -2978,7 +2988,7 @@ The team-project, resume-mill, code-similarity and prompt-injection candidates a
 | Team projects | 13 pairs (26 candidates) | Not High or Medium, and never linked | Teammates from one college list the same GitHub repository on otherwise different resumes |
 | Resume mills | 2 groups (6 and 5 candidates) | High, each group its own cluster | Students of different colleges in one city share two coaching-institute repositories and several identical project bullets |
 | Code similarity | 1 group of 2 | Medium | Assessment Comment "Integrity Issues: Medium" with "Integrity Summary: Detected Code Similarity With Other Submissions" |
-| Prompt injection | 5 resumes | At least Medium; the hidden keywords never count as skills | White hidden text (an instruction to rate the candidate highly, plus hidden skill keywords), zero-width characters, or a visible instruction line, in five combinations |
+| Hidden / adversarial resume text | 5 resumes | Medium, except the resume with only zero-width characters, which is Low; the hidden keywords never count as skills | White hidden text (an instruction to rate the candidate highly, plus hidden skill keywords), zero-width characters, or a visible instruction line, in five combinations |
 | Namesakes | 4 pairs | Never merged as duplicate applications | Different people with the same name, one pair even at the same college |
 | Boilerplate bullets | 145 resumes | Not flagged | Generic template phrases shared by many honest resumes (about 8% of resumes) |
 
@@ -3010,8 +3020,8 @@ Results on the default sample (seed 42, 2,133 applications, default configuratio
 | Time | Reading the export, splitting the packets, parsing and linking about 38 seconds (parsing about 37); scoring, integrity analysis and shortlisting under 1 second |
 | Resumes | 1,877 parsed and linked, all by "ID in file name"; 256 applications without a resume |
 | Shortlist | 300: 299 Shortlisted and 1 Shortlisted (Integrity Review); 1,825 Not Shortlisted; 8 Ineligible (7 Duplicate Application, 1 Assessment) |
-| Risk levels | High 11, Medium 7, Low 38, Clear 2,077 |
-| Integrity analysis | 1,360 perfect scorers; 2 clusters (the two resume mills, both High); 44 pairs, 13 of them team projects; individual flags: 5 prompt injection / hidden text, 2 proctoring integrity status, 2 proctoring flags. No commonality is significant, because about 64% of applications have a perfect score. |
+| Risk levels | High 11, Medium 6, Low 39, Clear 2,077 |
+| Integrity analysis | 1,360 perfect scorers; 2 clusters (the two resume mills, both High); 44 pairs, 13 of them team projects; individual flags: 4 prompt injection, 1 invisible characters in resume, 2 proctoring integrity status, 2 proctoring flags. No commonality is significant, because about 64% of applications have a perfect score. |
 | Data quality | 0 errors, 34 warnings (33 packet-split notes asking to verify the split, 1 missing assessment score), 267 info |
 
 **Ground-truth checks (13 of 13 passed)**
@@ -3026,7 +3036,7 @@ Results on the default sample (seed 42, 2,133 applications, default configuratio
 | Team projects not flagged | 0 members High or Medium, 0 pairs linked (all 26 are Low) |
 | Resume mills flagged | 11 of 11 (all High, clusters C01 and C02) |
 | Code-similarity rows flagged | 2 of 2 (Medium) |
-| Prompt injection flagged | 5 of 5 at Medium, all with hidden-text flags |
+| Hidden / adversarial resume text flagged | 5 of 5 at the expected level (the invisible-characters-only resume Low, the other four Medium), all with hidden-text flags |
 | Hidden keywords not counted as skills | None leaked |
 | Boilerplate-bullet resumes not flagged | 0 of 145 High or Medium |
 | Missing resumes | 256 observed, 256 planted |
@@ -3098,7 +3108,8 @@ Results on the default sample (seed 42, 2,133 applications, default configuratio
 
 | Evidence | Points |
 |---|---|
-| Hidden or adversarial text in the resume (for example left behind by a template) | 50 |
+| An instruction aimed at AI screeners in the resume ("Prompt injection") | 50 |
+| Hidden text in the resume without an instruction, for example stuffed keywords or text left behind by a template ("Hidden text in resume") | 35 |
 | A Workday comment "Integrity Issues: Medium" (20) with an Integrity Summary such as "Detected Code Similarity With Other Submissions" (15) | 35 |
 | "HackerRank plagiarism flag" (for example Plagiarism Status = Suspicious) on its own | 30 |
 | "Proctoring integrity status" Review (20) + a "Proctoring flags" note such as multiple faces (15) | 35 |
@@ -3115,7 +3126,7 @@ Medium candidates become "Shortlisted (Integrity Review)" by default: review the
 | A High-risk candidate is Not Shortlisted, with no integrity wording | Integrity Review and Integrity Hold apply only inside the cutoff | The evidence still applies; check the Deep-Dive |
 | A candidate has linked candidates but no Cluster badge | All of their pairs are below **Pair score to link candidates** (default 30) | Expected; weak pairs still raise the risk score |
 | Teammates are Low risk with "Team project (likely legitimate)" | They list the same GitHub repository on otherwise different resumes, which scores 15 instead of 35 | Expected; ask each one about their own part in the project. Switch on **Include team projects (likely legitimate)** to see them in the network. |
-| A resume is flagged for hidden text, but the candidate denies adding any | Resume templates and online resume tools can leave white or tiny text behind; a scanned page's own text layer is not reported | Open the original file and look at the snippet; set **Prompt injection / hidden text** to 0 if your drive should not flag it (the hidden text is still excluded from scoring) |
+| A resume is flagged for hidden text, but the candidate denies adding any | Resume templates and online resume tools can leave white or tiny text behind; a scanned page's own text layer is not reported | Open the original file and look at the snippet; set **Hidden text in resume** (or **Invisible characters in resume**) to 0 if your drive should not flag it (the hidden text is still excluded from scoring) |
 | Two applications of the same person are not in a cluster | Duplicate applications are never paired; the eligibility rule "Duplicate Application" handles them | Expected; see **Ineligible candidates** |
 | Most checks are listed under "Signals skipped (missing data)" | The export has no session telemetry; a Workday export has no IP addresses, times, tab switches or answer fingerprints | Expected; the evidence comes from the assessment comment, resume comparisons, shared contact details and the hidden-text checks |
 | **Significant traits** is 0 | No perfect scorers, or so many candidates are perfect scorers that no value is over-represented (as in the synthetic sample, where about 64% score 100%) | Expected |
@@ -3305,7 +3316,7 @@ The "Resume: Match method" values are "TA resume file", "ID in file name", "emai
 
 - "Top projects (n)": the first three projects, each with its title and up to eight technology chips ("No tech stack detected" when none was found); "No projects detected." when there are none.
 - "Internships (n)": up to four entries such as "Title - Organisation · 6 months"; "No internships detected." when there are none.
-- "Integrity signals": an orange "Adversarial text detected in resume (Prompt Injection / Hidden Text)" line when the resume holds hidden or adversarial text, then the candidate's integrity evidence, one line per signal (the same reasons shown in Individual Deep-Dive), or "No integrity signals recorded."
+- "Integrity signals": when the resume holds hidden or adversarial text, an orange line with the headline of the most serious kind ("Instruction aimed at AI screeners found in resume (prompt injection)", "Hidden text in resume (invisible to readers)" or "Unusual invisible characters in resume (possible obfuscation or copy-paste artefact)"), then the candidate's integrity evidence, one line per signal (the same reasons shown in Individual Deep-Dive), or "No integrity signals recorded."
 - For a candidate without a linked resume, the panel says "No resume is linked to this candidate." and still shows the integrity signals.
 
 If unexpected data stops the comparison, the tab shows "The comparison could not be shown (...). Try a different selection." and the rest of the app keeps working.

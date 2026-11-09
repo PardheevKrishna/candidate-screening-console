@@ -163,6 +163,13 @@ def _canonical(skill: str) -> str:
         return skill
 
 
+_LEVEL_ORDER = {S.RISK_CLEAR: 0, S.RISK_LOW: 1, S.RISK_MEDIUM: 2, S.RISK_HIGH: 3}
+
+
+def _at_least(level: str, minimum: str) -> bool:
+    return _LEVEL_ORDER.get(level, -1) >= _LEVEL_ORDER.get(minimum, 2)
+
+
 def check_injection(df: pd.DataFrame, groups: list[dict]) -> list[Check]:
     found = _of(groups, "prompt_injection")
     levels = _levels(df, [g["members"][0] for g in found])
@@ -172,7 +179,7 @@ def check_injection(df: pd.DataFrame, groups: list[dict]) -> list[Check]:
     leaks: list[str] = []
     for g in found:
         cid = g["members"][0]
-        flagged += levels[cid] in FLAGGED
+        flagged += _at_least(levels[cid], g.get("expected_min_level") or S.RISK_MEDIUM)
         with_flags += bool(flags.get(cid, "").strip())
         have = {s.strip().casefold() for s in str(skills.get(cid, "")).split(S.SEP_LIST) if s.strip()}
         leaked = [k for k in g["details"].get("hidden_keywords", []) if _canonical(k).casefold() in have]
@@ -181,10 +188,12 @@ def check_injection(df: pd.DataFrame, groups: list[dict]) -> list[Check]:
         print(f"    {g['key']} ({'+'.join(g['details'].get('kinds', []))}): level {levels[cid]}, "
               f"injection flags {'yes' if flags.get(cid, '').strip() else 'no'}, hidden keywords counted as skills "
               f"{len(leaked)}")
-    print(f"  Prompt injection: {len(found)} resumes; flagged High/Medium {flagged}; with injection flags {with_flags}")
+    print(f"  Hidden / adversarial resume text: {len(found)} resumes; at the expected level {flagged}; "
+          f"with injection flags {with_flags}")
     return [
-        Check("prompt injection flagged", bool(found) and flagged == with_flags == len(found),
-              f"{flagged}/{len(found)} High/Medium, {with_flags}/{len(found)} with injection flags"),
+        Check("hidden / adversarial resume text flagged", bool(found) and flagged == with_flags == len(found),
+              f"{flagged}/{len(found)} at the expected level (invisible characters only: Low; hidden text or "
+              f"instructions: Medium), {with_flags}/{len(found)} with injection flags"),
         Check("hidden keywords not counted as skills", not leaks, "; ".join(leaks) or "none leaked"),
     ]
 

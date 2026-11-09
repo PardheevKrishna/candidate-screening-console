@@ -363,8 +363,11 @@ def test_planted_cases_present(groups: dict, truth: dict) -> None:
                 assert labels.loc[cid, "label"] == pattern and labels.loc[cid, "group_key"] == g["key"]
                 if pattern not in (gen.BOILERPLATE,):
                     assert labels.loc[cid, "has_resume"] == "yes"
-    for g in groups[gen.MILL] + groups[gen.INJECTION] + groups[gen.CODE_SIMILARITY]:
+    for g in groups[gen.MILL] + groups[gen.CODE_SIMILARITY]:
         assert g["expected_min_level"] == "Medium"
+    for g in groups[gen.INJECTION]:   # invisible characters alone are a Low signal; hidden text / instructions Medium
+        only_invisible = g["details"]["kinds"] == ["invisible_chars"]
+        assert g["expected_min_level"] == ("Low" if only_invisible else "Medium")
     for g in groups[gen.TEAM]:
         assert g["must_not_exceed"] == "Low"
 
